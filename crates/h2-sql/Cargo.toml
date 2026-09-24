@@ -1,0 +1,12 @@
+[package]
+name = "h2-sql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2-types = { path = "../h2-types" }
+h2-mvstore = { path = "../h2-mvstore" }
+sqlparser = { workspace = true }
+thiserror = { workspace = true }

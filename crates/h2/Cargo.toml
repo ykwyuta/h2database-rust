@@ -1,0 +1,16 @@
+[package]
+name = "h2"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2-types = { path = "../h2-types" }
+h2-mvstore = { path = "../h2-mvstore" }
+h2-sql = { path = "../h2-sql" }
+h2-server = { path = "../h2-server", optional = true }
+
+[features]
+default = []
+server = ["dep:h2-server"]

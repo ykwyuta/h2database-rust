@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/h2-types",
+    "crates/h2-mvstore",
+    "crates/h2-sql",
+    "crates/h2-server",
+    "crates/h2-cli",
+    "crates/h2",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["h2database-rust contributors"]
+license = "MPL-2.0 OR Apache-2.0"
+
+[workspace.dependencies]
+thiserror = "2.0"
+anyhow = "1.0"
+bytes = "1.9"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+byteorder = "1.5"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = { version = "1.36", features = ["serde"] }
+parking_lot = "0.12"
+crc32fast = "1.4"
+tokio = { version = "1.42", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+sqlparser = "0.53"

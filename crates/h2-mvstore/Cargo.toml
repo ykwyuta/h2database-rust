@@ -1,0 +1,19 @@
+[package]
+name = "h2-mvstore"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2-types = { path = "../h2-types" }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+crc32fast = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.14"

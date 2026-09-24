@@ -1,0 +1,10 @@
+[package]
+name = "h2-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2 = { path = "../h2" }
+anyhow = { workspace = true }
