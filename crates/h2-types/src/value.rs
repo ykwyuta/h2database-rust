@@ -1,10 +1,15 @@
 use std::cmp::Ordering;
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
+
+
 use uuid::Uuid;
 
 use crate::data_type::DataType;
+use crate::error::{H2Error, H2Result};
+
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -56,7 +61,120 @@ impl Value {
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
+
+    pub fn to_decimal(&self) -> Option<Decimal> {
+        use rust_decimal::prelude::FromPrimitive;
+        match self {
+            Value::Decimal(d) => Some(*d),
+            Value::TinyInt(n) => Decimal::from_i8(*n),
+            Value::SmallInt(n) => Decimal::from_i16(*n),
+            Value::Integer(n) => Decimal::from_i32(*n),
+            Value::BigInt(n) => Decimal::from_i64(*n),
+            Value::Float(f) => Decimal::from_f32(*f),
+            Value::Double(d) => Decimal::from_f64(*d),
+            _ => None,
+        }
+    }
+
+    pub fn to_f64(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f as f64),
+            Value::Double(d) => Some(*d),
+            Value::Decimal(d) => d.to_f64(),
+            Value::TinyInt(n) => Some(*n as f64),
+            Value::SmallInt(n) => Some(*n as f64),
+            Value::Integer(n) => Some(*n as f64),
+            Value::BigInt(n) => Some(*n as f64),
+            _ => None,
+        }
+    }
+
+    pub fn to_i64(&self) -> Option<i64> {
+        match self {
+            Value::TinyInt(n) => Some(*n as i64),
+            Value::SmallInt(n) => Some(*n as i64),
+            Value::Integer(n) => Some(*n as i64),
+            Value::BigInt(n) => Some(*n),
+            Value::Decimal(d) => d.to_i64(),
+            Value::Float(f) => Some(*f as i64),
+            Value::Double(d) => Some(*d as i64),
+            _ => None,
+        }
+    }
+
+
+    pub fn cast_to(&self, target_type: &DataType) -> H2Result<Value> {
+        if self.is_null() {
+            return Ok(Value::Null);
+        }
+        match target_type {
+            DataType::TinyInt => {
+                if let Some(i) = self.to_i64() {
+                    Ok(Value::TinyInt(i as i8))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to TINYINT", self)))
+                }
+            }
+            DataType::SmallInt => {
+                if let Some(i) = self.to_i64() {
+                    Ok(Value::SmallInt(i as i16))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to SMALLINT", self)))
+                }
+            }
+            DataType::Integer => {
+                if let Some(i) = self.to_i64() {
+                    Ok(Value::Integer(i as i32))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to INTEGER", self)))
+                }
+            }
+            DataType::BigInt => {
+                if let Some(i) = self.to_i64() {
+                    Ok(Value::BigInt(i))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to BIGINT", self)))
+                }
+            }
+            DataType::Float => {
+                if let Some(f) = self.to_f64() {
+                    Ok(Value::Float(f as f32))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to FLOAT", self)))
+                }
+            }
+            DataType::Double => {
+                if let Some(f) = self.to_f64() {
+                    Ok(Value::Double(f))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to DOUBLE", self)))
+                }
+            }
+            DataType::Decimal(_, _) => {
+                if let Some(d) = self.to_decimal() {
+                    Ok(Value::Decimal(d))
+                } else {
+                    Err(H2Error::TypeError(format!("Cannot cast {:?} to DECIMAL", self)))
+                }
+            }
+            DataType::VarChar(_) | DataType::Char(_) => {
+                match self {
+                    Value::String(s) => Ok(Value::String(s.clone())),
+                    _ => Ok(Value::String(self.to_string())),
+                }
+            }
+            DataType::Boolean => {
+                match self {
+                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to BOOLEAN", self))),
+                }
+            }
+            _ => Ok(self.clone()),
+        }
+    }
 }
+
+
 
 /// インデックスキー比較用のPartialOrd実装
 impl PartialOrd for Value {
@@ -88,61 +206,26 @@ impl PartialOrd for Value {
 fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
     // どちらかがDecimalの場合
     if matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_)) {
-        let dec_a = to_decimal(a)?;
-        let dec_b = to_decimal(b)?;
+        let dec_a = a.to_decimal()?;
+        let dec_b = b.to_decimal()?;
         return dec_a.partial_cmp(&dec_b);
     }
 
     // どちらかが浮動小数点数の場合
     if matches!(a, Value::Float(_) | Value::Double(_)) || matches!(b, Value::Float(_) | Value::Double(_)) {
-        let f_a = to_f64(a)?;
-        let f_b = to_f64(b)?;
+        let f_a = a.to_f64()?;
+        let f_b = b.to_f64()?;
         return f_a.partial_cmp(&f_b);
     }
 
     // 整数同士の場合
-    if let (Some(i_a), Some(i_b)) = (to_i64(a), to_i64(b)) {
+    if let (Some(i_a), Some(i_b)) = (a.to_i64(), b.to_i64()) {
         return i_a.partial_cmp(&i_b);
     }
 
     None
 }
 
-fn to_decimal(v: &Value) -> Option<Decimal> {
-    use rust_decimal::prelude::FromPrimitive;
-    match v {
-        Value::Decimal(d) => Some(*d),
-        Value::TinyInt(n) => Decimal::from_i8(*n),
-        Value::SmallInt(n) => Decimal::from_i16(*n),
-        Value::Integer(n) => Decimal::from_i32(*n),
-        Value::BigInt(n) => Decimal::from_i64(*n),
-        Value::Float(f) => Decimal::from_f32(*f),
-        Value::Double(d) => Decimal::from_f64(*d),
-        _ => None,
-    }
-}
-
-fn to_f64(v: &Value) -> Option<f64> {
-    match v {
-        Value::Float(f) => Some(*f as f64),
-        Value::Double(d) => Some(*d),
-        Value::TinyInt(n) => Some(*n as f64),
-        Value::SmallInt(n) => Some(*n as f64),
-        Value::Integer(n) => Some(*n as f64),
-        Value::BigInt(n) => Some(*n as f64),
-        _ => None,
-    }
-}
-
-fn to_i64(v: &Value) -> Option<i64> {
-    match v {
-        Value::TinyInt(n) => Some(*n as i64),
-        Value::SmallInt(n) => Some(*n as i64),
-        Value::Integer(n) => Some(*n as i64),
-        Value::BigInt(n) => Some(*n),
-        _ => None,
-    }
-}
 
 impl std::fmt::Display for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

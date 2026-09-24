@@ -7,11 +7,82 @@ use crate::catalog::TableDef;
 use crate::fts::tokenizer::{get_tokenizer, TokenizerKind};
 use crate::row::Row;
 
+#[derive(Debug, Clone)]
+pub struct ColumnBinding {
+    pub table_name: Option<String>,
+    pub table_alias: Option<String>,
+    pub column_name: String,
+    pub index: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RowContext {
+    pub columns: Vec<ColumnBinding>,
+}
+
+impl RowContext {
+    pub fn new() -> Self {
+        Self { columns: Vec::new() }
+    }
+
+    pub fn from_table_def(table: &TableDef, alias: Option<&str>) -> Self {
+        let columns = table.columns.iter().enumerate().map(|(i, col)| ColumnBinding {
+            table_name: Some(table.name.clone()),
+            table_alias: alias.map(|s| s.to_string()),
+            column_name: col.name.clone(),
+            index: i,
+        }).collect();
+        Self { columns }
+    }
+
+    pub fn append_table(&mut self, table: &TableDef, alias: Option<&str>, base_idx: usize) {
+        for (i, col) in table.columns.iter().enumerate() {
+            self.columns.push(ColumnBinding {
+                table_name: Some(table.name.clone()),
+                table_alias: alias.map(|s| s.to_string()),
+                column_name: col.name.clone(),
+                index: base_idx + i,
+            });
+        }
+    }
+
+    pub fn resolve_column(&self, table_or_alias: Option<&str>, col_name: &str) -> Option<usize> {
+        for binding in &self.columns {
+            if binding.column_name.eq_ignore_ascii_case(col_name) {
+                if let Some(t) = table_or_alias {
+                    if binding.table_alias.as_deref().map(|a| a.eq_ignore_ascii_case(t)).unwrap_or(false)
+                        || binding.table_name.as_deref().map(|n| n.eq_ignore_ascii_case(t)).unwrap_or(false)
+                    {
+                        return Some(binding.index);
+                    }
+                } else {
+                    return Some(binding.index);
+                }
+            }
+        }
+        None
+    }
+}
+
 pub fn evaluate_expr(expr: &SqlExpr, table: &TableDef, row: &Row) -> H2Result<Value> {
+    let ctx = RowContext::from_table_def(table, None);
+    evaluate_expr_context(expr, &ctx, row)
+}
+
+pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2Result<Value> {
     match expr {
         SqlExpr::Value(val) => evaluate_sql_value(val),
+        SqlExpr::Nested(inner) => evaluate_expr_context(inner, ctx, row),
+        SqlExpr::IsNull(inner) => {
+            let v = evaluate_expr_context(inner, ctx, row)?;
+            Ok(Value::Boolean(matches!(v, Value::Null)))
+        }
+        SqlExpr::IsNotNull(inner) => {
+            let v = evaluate_expr_context(inner, ctx, row)?;
+            Ok(Value::Boolean(!matches!(v, Value::Null)))
+        }
         SqlExpr::UnaryOp { op, expr } => {
-            let inner = evaluate_expr(expr, table, row)?;
+            let inner = evaluate_expr_context(expr, ctx, row)?;
             match op {
                 sqlparser::ast::UnaryOperator::Minus => match inner {
                     Value::TinyInt(n) => Ok(Value::TinyInt(-n)),
@@ -32,20 +103,32 @@ pub fn evaluate_expr(expr: &SqlExpr, table: &TableDef, row: &Row) -> H2Result<Va
             }
         }
         SqlExpr::Identifier(ident) => {
-            let col_idx = table.column_index(&ident.value).ok_or_else(|| {
-                H2Error::Execution(format!("Column '{}' not found in table '{}'", ident.value, table.name))
+            let col_idx = ctx.resolve_column(None, &ident.value).ok_or_else(|| {
+                H2Error::Execution(format!("Column '{}' not found", ident.value))
             })?;
             Ok(row.get(col_idx).cloned().unwrap_or(Value::Null))
         }
+        SqlExpr::CompoundIdentifier(idents) => {
+            if idents.len() == 2 {
+                let tbl = &idents[0].value;
+                let col = &idents[1].value;
+                let col_idx = ctx.resolve_column(Some(tbl), col).ok_or_else(|| {
+                    H2Error::Execution(format!("Column '{}.{}' not found", tbl, col))
+                })?;
+                Ok(row.get(col_idx).cloned().unwrap_or(Value::Null))
+            } else {
+                Err(H2Error::Execution(format!("Unsupported compound identifier: {:?}", idents)))
+            }
+        }
         SqlExpr::BinaryOp { left, op, right } => {
-            let l_val = evaluate_expr(left, table, row)?;
-            let r_val = evaluate_expr(right, table, row)?;
+            let l_val = evaluate_expr_context(left, ctx, row)?;
+            let r_val = evaluate_expr_context(right, ctx, row)?;
             evaluate_binary_op(&l_val, op, &r_val)
         }
         // LIKE 演算子
         SqlExpr::Like { expr, pattern, .. } => {
-            let val = evaluate_expr(expr, table, row)?;
-            let pat = evaluate_expr(pattern, table, row)?;
+            let val = evaluate_expr_context(expr, ctx, row)?;
+            let pat = evaluate_expr_context(pattern, ctx, row)?;
             match (&val, &pat) {
                 (Value::String(s), Value::String(p)) => {
                     let matched = if p.starts_with('%') && p.ends_with('%') {
@@ -82,8 +165,8 @@ pub fn evaluate_expr(expr: &SqlExpr, table: &TableDef, row: &Row) -> H2Result<Va
                     return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name)));
                 }
 
-                let col_val = evaluate_func_arg(&args[0], table, row)?;
-                let query_val = evaluate_func_arg(&args[1], table, row)?;
+                let col_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let query_val = evaluate_func_arg_context(&args[1], ctx, row)?;
 
                 match (&col_val, &query_val) {
                     (Value::String(text), Value::String(query)) => {
@@ -99,19 +182,20 @@ pub fn evaluate_expr(expr: &SqlExpr, table: &TableDef, row: &Row) -> H2Result<Va
                     _ => Ok(Value::Boolean(false)),
                 }
             } else {
-                Err(H2Error::Execution(format!("Unsupported function: {}", func_name)))
+                Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
             }
         }
         _ => Err(H2Error::Execution(format!("Unsupported expression: {:?}", expr))),
     }
 }
 
-fn evaluate_func_arg(arg: &FunctionArg, table: &TableDef, row: &Row) -> H2Result<Value> {
+fn evaluate_func_arg_context(arg: &FunctionArg, ctx: &RowContext, row: &Row) -> H2Result<Value> {
     match arg {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => evaluate_expr(expr, table, row),
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => evaluate_expr_context(expr, ctx, row),
         _ => Err(H2Error::Execution("Invalid function argument".to_string())),
     }
 }
+
 
 pub fn evaluate_sql_value(val: &SqlValue) -> H2Result<Value> {
     match val {
@@ -167,7 +251,7 @@ pub fn evaluate_literal_or_unary(expr: &SqlExpr) -> H2Result<Value> {
     }
 }
 
-fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> H2Result<Value> {
+pub fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> H2Result<Value> {
     match op {
         BinaryOperator::Eq => Ok(Value::Boolean(left == right)),
         BinaryOperator::NotEq => Ok(Value::Boolean(left != right)),
@@ -211,6 +295,78 @@ fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> H2Res
             };
             Ok(Value::Boolean(l_bool || r_bool))
         }
+        BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide => {
+            evaluate_arithmetic_op(left, op, right)
+        }
         _ => Err(H2Error::Execution(format!("Unsupported operator: {:?}", op))),
     }
 }
+
+fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H2Result<Value> {
+    if left.is_null() || right.is_null() {
+        return Ok(Value::Null);
+    }
+    match (left, right) {
+        (Value::Integer(l), Value::Integer(r)) => match op {
+            BinaryOperator::Plus => Ok(Value::Integer(l.wrapping_add(*r))),
+            BinaryOperator::Minus => Ok(Value::Integer(l.wrapping_sub(*r))),
+            BinaryOperator::Multiply => Ok(Value::Integer(l.wrapping_mul(*r))),
+            BinaryOperator::Divide => {
+                if *r == 0 {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::Integer(l / r))
+                }
+            }
+            _ => unreachable!(),
+        },
+        (Value::BigInt(l), Value::BigInt(r)) => match op {
+            BinaryOperator::Plus => Ok(Value::BigInt(l.wrapping_add(*r))),
+            BinaryOperator::Minus => Ok(Value::BigInt(l.wrapping_sub(*r))),
+            BinaryOperator::Multiply => Ok(Value::BigInt(l.wrapping_mul(*r))),
+            BinaryOperator::Divide => {
+                if *r == 0 {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::BigInt(l / r))
+                }
+            }
+            _ => unreachable!(),
+        },
+        (Value::Double(l), Value::Double(r)) => match op {
+            BinaryOperator::Plus => Ok(Value::Double(l + r)),
+            BinaryOperator::Minus => Ok(Value::Double(l - r)),
+            BinaryOperator::Multiply => Ok(Value::Double(l * r)),
+            BinaryOperator::Divide => Ok(Value::Double(l / r)),
+            _ => unreachable!(),
+        },
+        (Value::Decimal(l), Value::Decimal(r)) => match op {
+            BinaryOperator::Plus => Ok(Value::Decimal(*l + *r)),
+            BinaryOperator::Minus => Ok(Value::Decimal(*l - *r)),
+            BinaryOperator::Multiply => Ok(Value::Decimal(*l * *r)),
+            BinaryOperator::Divide => {
+                if r.is_zero() {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::Decimal(*l / *r))
+                }
+            }
+            _ => unreachable!(),
+        },
+        // 数値の型が混在している場合は i64 / f64 に格上げ
+        (l, r) => {
+            if let (Some(lf), Some(rf)) = (l.to_f64(), r.to_f64()) {
+                match op {
+                    BinaryOperator::Plus => Ok(Value::Double(lf + rf)),
+                    BinaryOperator::Minus => Ok(Value::Double(lf - rf)),
+                    BinaryOperator::Multiply => Ok(Value::Double(lf * rf)),
+                    BinaryOperator::Divide => Ok(Value::Double(lf / rf)),
+                    _ => unreachable!(),
+                }
+            } else {
+                Err(H2Error::TypeError(format!("Cannot apply arithmetic operator {:?} to {:?} and {:?}", op, left, right)))
+            }
+        }
+    }
+}
+
