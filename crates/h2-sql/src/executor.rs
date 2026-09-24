@@ -1,7 +1,7 @@
 use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, Statement, TableFactor};
 use std::sync::Arc;
 
-use h2_mvstore::MVStore;
+use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
 use crate::catalog::Catalog;
 use crate::expression::{evaluate_expr, evaluate_sql_value};
@@ -17,27 +17,50 @@ pub enum ExecutionResult {
 
 pub struct SQLEngine {
     store: Arc<MVStore>,
+    tx_store: Arc<TransactionStore>,
     catalog: Arc<Catalog>,
 }
 
 impl SQLEngine {
     pub fn new(store: Arc<MVStore>) -> H2Result<Self> {
+        let tx_store = TransactionStore::new(Arc::clone(&store));
         let catalog = Arc::new(Catalog::new(Arc::clone(&store))?);
-        Ok(Self { store, catalog })
+        Ok(Self {
+            store,
+            tx_store,
+            catalog,
+        })
     }
 
+    pub fn tx_store(&self) -> &Arc<TransactionStore> {
+        &self.tx_store
+    }
+
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
+    }
+
+    /// 暗黙トランザクション（Auto-commit）でSQLを実行
     pub fn execute(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let tx = self.tx_store.begin();
+        let result = self.execute_with_tx(&tx, sql)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// 明示的トランザクションコンテキストでSQLを実行
+    pub fn execute_with_tx(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
         let statements = parse_sql(sql)?;
         let mut last_result = ExecutionResult::Ddl;
 
         for stmt in statements {
-            last_result = self.execute_statement(stmt)?;
+            last_result = self.execute_statement(tx, stmt)?;
         }
 
         Ok(last_result)
     }
 
-    fn execute_statement(&self, stmt: Statement) -> H2Result<ExecutionResult> {
+    fn execute_statement(&self, tx: &Transaction, stmt: Statement) -> H2Result<ExecutionResult> {
         match stmt {
             Statement::CreateTable(create_table) => {
                 let table_def = extract_create_table(
@@ -56,7 +79,6 @@ impl SQLEngine {
                 })?;
 
                 let map_name = format!("tbl_{}", table_name.to_lowercase());
-                let table_map = self.store.open_map(&map_name);
 
                 let mut affected_rows = 0;
                 if let Some(source) = insert.source {
@@ -80,21 +102,20 @@ impl SQLEngine {
 
                             let row_id = self.catalog.allocate_row_id(&table_name)?;
                             let row = Row::new(row_values);
-                            table_map.put(row_id.to_le_bytes().to_vec(), row.to_bytes()?);
+                            tx.put(&map_name, row_id.to_le_bytes().to_vec(), row.to_bytes()?)?;
                             affected_rows += 1;
                         }
                     }
                 }
 
-                self.store.commit()?;
                 Ok(ExecutionResult::Dml { affected_rows })
             }
-            Statement::Query(query) => self.execute_query(*query),
+            Statement::Query(query) => self.execute_query(tx, *query),
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }
     }
 
-    fn execute_query(&self, query: Query) -> H2Result<ExecutionResult> {
+    fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
         let SetExpr::Select(select) = *query.body else {
             return Err(H2Error::Execution("Only simple SELECT queries are supported".to_string()));
         };
@@ -114,14 +135,13 @@ impl SQLEngine {
         })?;
 
         let map_name = format!("tbl_{}", table_name.to_lowercase());
-        let table_map = self.store.open_map(&map_name);
 
-        // テーブルフルスキャン
-        let entries = table_map.scan_all();
+        // トランザクションのスナップショットに可視なエントリのみ走査
+        let entries = tx.scan_visible(&map_name)?;
         let mut matched_rows = Vec::new();
 
-        for entry in entries {
-            let row = Row::from_bytes(&entry.value)?;
+        for (_key, val_bytes) in entries {
+            let row = Row::from_bytes(&val_bytes)?;
 
             // WHERE 句のフィルタリング
             let matches = if let Some(selection) = &select.selection {

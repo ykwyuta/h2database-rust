@@ -60,4 +60,33 @@ mod tests {
             panic!("Expected Query result");
         }
     }
+
+    #[test]
+    fn test_sql_transaction_rollback_and_isolation() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+
+        engine.execute("CREATE TABLE accounts (id INTEGER, owner VARCHAR, amount INTEGER)").unwrap();
+        engine.execute("INSERT INTO accounts VALUES (1, 'Alice', 1000)").unwrap();
+
+        // トランザクション開始
+        let tx = engine.tx_store().begin();
+        engine.execute_with_tx(&tx, "INSERT INTO accounts VALUES (2, 'Bob', 500)").unwrap();
+
+        // 別トランザクション（暗黙）からは、未コミットのBobは見えない
+        let res_before = engine.execute("SELECT * FROM accounts").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res_before {
+            assert_eq!(rows.len(), 1);
+        }
+
+        // ロールバック
+        tx.rollback().unwrap();
+
+        // ロールバック後もAliceのみ
+        let res_after = engine.execute("SELECT * FROM accounts").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res_after {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
+        }
+    }
 }

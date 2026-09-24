@@ -4,6 +4,7 @@ pub mod map;
 pub mod page;
 pub mod store;
 pub mod tree;
+pub mod tx;
 
 pub use chunk::{ChunkMeta, ChunkPayload};
 pub use file_store::FileStore;
@@ -11,10 +12,12 @@ pub use map::MVMap;
 pub use page::{Entry, Page, PageRef};
 pub use store::MVStore;
 pub use tree::MVTree;
+pub use tx::{Transaction, TransactionStatus, TransactionStore, VersionedValue};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     #[test]
@@ -85,5 +88,67 @@ mod tests {
             assert_eq!(users_map.get(b"user:3"), Some(b"Charlie".to_vec()));
             assert_eq!(users_map.scan_all().len(), 3);
         }
+    }
+
+    #[test]
+    fn test_mvcc_transaction_isolation_and_rollback() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let tx_store = TransactionStore::new(store);
+
+        // 1. 初期コミット
+        {
+            let tx1 = tx_store.begin();
+            tx1.put("accounts", b"alice".to_vec(), b"100".to_vec()).unwrap();
+            tx1.put("accounts", b"bob".to_vec(), b"50".to_vec()).unwrap();
+            tx1.commit().unwrap();
+        }
+
+        // 2. スナップショット分離（tx2実行中にtx3がコミットしても、tx2にはtx3の変更が見えない）
+        let tx2 = tx_store.begin();
+        {
+            let tx3 = tx_store.begin();
+            tx3.put("accounts", b"alice".to_vec(), b"150".to_vec()).unwrap();
+            tx3.commit().unwrap();
+        }
+
+        // tx2 から見ると alice はまだ 100 のまま（スナップショット分離）
+        assert_eq!(tx2.get("accounts", b"alice").unwrap(), Some(b"100".to_vec()));
+        tx2.commit().unwrap();
+
+        // 新規トランザクション tx4 からは 150 が見える
+        let tx4 = tx_store.begin();
+        assert_eq!(tx4.get("accounts", b"alice").unwrap(), Some(b"150".to_vec()));
+
+        // 3. ロールバックの検証
+        tx4.put("accounts", b"alice".to_vec(), b"999".to_vec()).unwrap();
+        assert_eq!(tx4.get("accounts", b"alice").unwrap(), Some(b"999".to_vec()));
+        tx4.rollback().unwrap();
+
+        // ロールバック後は 150 のまま
+        let tx5 = tx_store.begin();
+        assert_eq!(tx5.get("accounts", b"alice").unwrap(), Some(b"150".to_vec()));
+    }
+
+    #[test]
+    fn test_mvcc_write_conflict() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let tx_store = TransactionStore::new(store);
+
+        let tx1 = tx_store.begin();
+        let tx2 = tx_store.begin();
+
+        tx1.put("test", b"key1".to_vec(), b"val1".to_vec()).unwrap();
+
+        // tx1が未コミットのままtx2が同じキーを変更しようとすると競合エラーになる
+        let conflict_res = tx2.put("test", b"key1".to_vec(), b"val2".to_vec());
+        assert!(conflict_res.is_err());
+
+        // tx1 をコミット
+        tx1.commit().unwrap();
+
+        // その後の tx3 は変更可能
+        let tx3 = tx_store.begin();
+        tx3.put("test", b"key1".to_vec(), b"val3".to_vec()).unwrap();
+        tx3.commit().unwrap();
     }
 }
