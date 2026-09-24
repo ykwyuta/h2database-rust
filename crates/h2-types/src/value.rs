@@ -112,8 +112,68 @@ impl PartialOrd for Value {
             (Value::Time(a), Value::Time(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
-            _ => None,
+            // 異なる数値型同士の比較 (Cross-type numeric comparison)
+            _ => compare_numeric(self, other),
         }
+    }
+}
+
+fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
+    // どちらかがDecimalの場合
+    if matches!(a, Value::Decimal(_)) || matches!(b, Value::Decimal(_)) {
+        let dec_a = to_decimal(a)?;
+        let dec_b = to_decimal(b)?;
+        return dec_a.partial_cmp(&dec_b);
+    }
+
+    // どちらかが浮動小数点数の場合
+    if matches!(a, Value::Float(_) | Value::Double(_)) || matches!(b, Value::Float(_) | Value::Double(_)) {
+        let f_a = to_f64(a)?;
+        let f_b = to_f64(b)?;
+        return f_a.partial_cmp(&f_b);
+    }
+
+    // 整数同士の場合
+    if let (Some(i_a), Some(i_b)) = (to_i64(a), to_i64(b)) {
+        return i_a.partial_cmp(&i_b);
+    }
+
+    None
+}
+
+fn to_decimal(v: &Value) -> Option<Decimal> {
+    use rust_decimal::prelude::FromPrimitive;
+    match v {
+        Value::Decimal(d) => Some(*d),
+        Value::TinyInt(n) => Decimal::from_i8(*n),
+        Value::SmallInt(n) => Decimal::from_i16(*n),
+        Value::Integer(n) => Decimal::from_i32(*n),
+        Value::BigInt(n) => Decimal::from_i64(*n),
+        Value::Float(f) => Decimal::from_f32(*f),
+        Value::Double(d) => Decimal::from_f64(*d),
+        _ => None,
+    }
+}
+
+fn to_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f as f64),
+        Value::Double(d) => Some(*d),
+        Value::TinyInt(n) => Some(*n as f64),
+        Value::SmallInt(n) => Some(*n as f64),
+        Value::Integer(n) => Some(*n as f64),
+        Value::BigInt(n) => Some(*n as f64),
+        _ => None,
+    }
+}
+
+fn to_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::TinyInt(n) => Some(*n as i64),
+        Value::SmallInt(n) => Some(*n as i64),
+        Value::Integer(n) => Some(*n as i64),
+        Value::BigInt(n) => Some(*n),
+        _ => None,
     }
 }
 

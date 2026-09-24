@@ -222,6 +222,7 @@ dependencies = [
  "h2-server",
  "h2-sql",
  "h2-types",
+ "tempfile",
 ]
 
 [[package]]
@@ -264,6 +265,10 @@ version = "0.1.0"
 dependencies = [
  "h2-mvstore",
  "h2-types",
+ "parking_lot",
+ "rust_decimal",
+ "serde",
+ "serde_json",
  "sqlparser",
  "thiserror",
 ]
