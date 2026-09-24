@@ -18,6 +18,14 @@
   - [3.2 カタログとマップ命名規則](#32-カタログとマップ命名規則)
   - [3.3 セカンダリインデックス & IndexScan 最適化](#33-セカンダリインデックス--indexscan-最適化)
   - [3.4 全文検索エンジン (FTS)](#34-全文検索エンジン-fts)
+  - [3.5 スキーマ変更 (ALTER TABLE) & TRUNCATE TABLE & 診断構文](#35-スキーマ変更-alter-table--truncate-table--診断構文)
+  - [3.6 高度なクエリ実行パイプライン (FROM句なしSELECT, サブクエリ展開, 派生テーブル, UNION)](#36-高度なクエリ実行パイプライン-from句なしselect-サブクエリ展開-派生テーブル-union)
+  - [3.7 外部キー制約の検証とカスケード連動処理メカニズム](#37-外部キー制約の検証とカスケード連動処理メカニズム)
+  - [3.8 共通テーブル式 (CTE: WITH 句) と INSERT INTO ... SELECT](#38-共通テーブル式-cte-with-句-と-insert-into--select)
+  - [3.9 集合演算 (UNION, INTERSECT, EXCEPT) の処理機構](#39-集合演算-union-intersect-except-の処理機構)
+  - [3.10 ウィンドウ関数の事前計算・射影置換パイプライン](#310-ウィンドウ関数の事前計算射影置換パイプライン)
+  - [3.11 仮想ビュー (VIEW) のカタログ永続化と動的展開](#311-仮想ビュー-view-のカタログ永続化と動的展開)
+  - [3.12 セーブポイント (SAVEPOINT) を非採用とするアーキテクチャ上の決定理由](#312-セーブポイント-savepoint-を非採用とするアーキテクチャ上の決定理由)
 - [4. サーバー層 (`h2-server`) の内部仕様](#4-サーバー層-h2-server-の内部仕様)
 - [5. 最上位ファサード (`h2`) と API 設計](#5-最上位ファサード-h2-と-api-設計)
 - [6. 新機能追加の手順 (How-to Guides)](#6-新機能追加の手順-how-to-guides)
@@ -204,6 +212,89 @@ SQL文字列 ──► parse_sql() ──► Statement ──► SQLEngine::exec
   - `TableFactor::Derived` を検知すると、内部サブクエリを再帰的に `execute_query` で実行。得られた列メタデータからインメモリ一時 `TableDef` を構築し、結果行を `current_rows` または `join_rows` にバインドして透過的に結合・集約・ソートを行います。
 - **集合演算 (`UNION` / `UNION ALL`)**:
   - `SetExpr::SetOperation` をインターセプトし、左右のクエリを並行実行して結果をマージ。`UNION`（デフォルト）の場合は重複行を `O(N)` で排除。
+
+### 3.7 外部キー制約の検証とカスケード連動処理メカニズム
+
+- **ファイル**: [`crates/h2-sql/src/catalog.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/catalog.rs), [`crates/h2-sql/src/parser.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/parser.rs), [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **データ構造 (`ForeignKeyDef`, `ForeignKeyAction`)**:
+  - `TableDef` に `foreign_keys: Vec<ForeignKeyDef>` を保持。
+  - カタログの `get_tables_referencing(parent_table)` により、親テーブル名から逆引きで被参照子テーブル群を一括取得可能。
+- **挿入・更新時の参照整合性検証 (`validate_foreign_keys_for_row`)**:
+  - INSERT または UPDATE 時に子テーブルの各外部キーを走査。値が `NULL` でない場合、親テーブルのマップ `tbl_<parent>` をスキャンし、一致する親キーが存在しない場合は `H2Error::Execution("Foreign key constraint violation: ...")` を即座に返却。
+- **削除時・更新時の連動アクション (`handle_foreign_keys_on_delete`, `handle_foreign_keys_on_update`)**:
+  - 親テーブルからレコードが削除される際、子テーブルを探索：
+    - `Restrict` / `NoAction`: 子レコードが存在すればエラーを発生させ削除を阻止。
+    - `Cascade`: 子レコードを自動削除し、関連インデックスからもキーを除去。さらに子テーブルが別のテーブルの親となっている場合は再帰的に連動削除。
+    - `SetNull`: 子レコードの外部キー列を `Value::Null` に更新し、インデックスキーを更新。
+- **スキーマ保護**:
+  - 他テーブルから参照されているテーブルに対する `DROP TABLE` および `TRUNCATE TABLE` は、子テーブルが存在・データ保持している場合に安全に拒絶。
+
+### 3.8 共通テーブル式 (CTE: WITH 句) と INSERT INTO ... SELECT
+
+- **ファイル**: [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **CTE の再帰的スコープ解決 (`execute_query_with_ctes`)**:
+  - `Query.with` を検知すると、各 `Cte` を先行 CTE を引き継いだコンテキスト `current_ctes: HashMap<String, (TableDef, Vec<Row>)>` 上で順次評価。
+  - 後続の CTE やメインクエリ、JOIN 句、派生テーブル内の `TableFactor::Table` において、ストレージマップよりも優先して `current_ctes` を探索・インメモリテーブルとして解決。
+- **`INSERT INTO ... SELECT ...` のパイプライン**:
+  - `Statement::Insert` の `insert.source` が `Values` 以外のクエリ（`Select`、`SetOperation`、`WITH ... SELECT`）である場合、`execute_query` でクエリを実行。
+  - 生成された各結果行について、列インデックス対応付け、データ型キャスト、外部キー参照整合性検証、一意インデックス検証、インデックス登録、CoW B-Tree への `tx.put` を透過的に実行。
+
+### 3.9 集合演算 (UNION, INTERSECT, EXCEPT) の処理機構
+
+- **ファイル**: [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **`SetExpr::SetOperation` の統合パイプライン**:
+  - `left` クエリおよび `right` クエリを `execute_query_with_ctes` で並行/順次実行し、それぞれの行リスト（`l_rows`, `r_rows`）を取得。
+  - `SetOperator` に応じた集合処理:
+    - **`Union`**:
+      - `DISTINCT`: 重複行（`r.values`）を排除してマージ。
+      - `ALL`: 全行をそのまま連結。
+    - **`Intersect`**:
+      - `DISTINCT`: `l_rows` のユニーク行のうち、`r_rows` にも存在する行を抽出。
+      - `ALL`: `l_rows` と `r_rows` の双方に存在する個数の最小値（$\min(N_l, N_r)$）分だけ出力。
+    - **`Except`**:
+      - `DISTINCT`: `l_rows` のユニーク行のうち、`r_rows` に存在しない行を抽出。
+      - `ALL`: `l_rows` の個数から `r_rows` の個数を減算（$\max(0, N_l - N_r)$）して出力。
+  - 集合演算後の結果行セットに対して、外側の `ORDER BY` および `LIMIT/OFFSET` を一貫して適用。
+
+### 3.10 ウィンドウ関数の事前計算・射影置換パイプライン
+
+- **ファイル**: [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **非破壊的 2 フェーズ評価アーキテクチャ**:
+  1. **解析フェーズ (`collect_window_functions`)**:
+     - 射影リスト（`select.projection`）を構文走査し、`func.over.is_some()` を持つウィンドウ関数ノードを抽出。
+  2. **事前計算フェーズ (`compute_window_functions`)**:
+     - `WHERE` 適用後の `filtered_rows` に対し、`PARTITION BY` 式の評価値キーごとにグループ（パーティション）を分割。
+     - 各グループ内で `ORDER BY` 式の昇順・降順に基づいて行インデックスを安定ソート。
+     - 関数種別に応じた値の割り当て:
+       - `ROW_NUMBER`: 各行に $1, 2, 3...$ を割り当て。
+       - `RANK`: ソートキーが直前行と等しい場合は同一順位を割り当て、タイ発生時はインデックス番号でスキップ ($1, 1, 3...$)。
+       - `DENSE_RANK`: 同一順位割り当て後もスキップせず連番を付与 ($1, 1, 2...$)。
+     - 各行に対する計算結果を `HashMap<String, Vec<Value>>`（関数シグネチャ $\to$ 行ごとの値配列）として保持。
+  3. **リライト＆射影フェーズ (`replace_window_function`)**:
+     - 各行の射影式を評価する際、式木内の対象ウィンドウ関数ノードを計算済みリテラルノード（`value_to_sql_expr`）へ置換。
+     - これにより、`ROW_NUMBER() OVER (...) + 1` や `CASE WHEN RANK() OVER (...) = 1 THEN ...` のような複合式・条件式内でも、既存の式評価エンジンを変更することなく 100% 透過的・安全に動作。
+
+### 3.11 仮想ビュー (VIEW) のカタログ永続化と動的展開
+
+- **ファイル**: [`crates/h2-sql/src/catalog.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/catalog.rs), [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **カタログ永続化 (`ViewDef`)**:
+  - ビュー名、定義 SQL 文字列、明示的カラム名リストを `_catalog` マップ内に `view:<name>` キーで JSON シリアライズ永続化。
+  - テーブル作成時およびビュー作成時における相互の名前重複チェック（同一名のテーブルとビューの共存を阻止）。
+- **クエリ実行時動的展開 (`resolve_view_query`)**:
+  - クエリの `FROM` 句および `JOIN` 句における `TableFactor::Table` の探索順序:
+    1. CTE (`current_ctes`)
+    2. システムテーブル (`information_schema.tables`, `columns`)
+    3. 実テーブル (`catalog.get_table`)
+    4. **仮想ビュー (`catalog.get_view`)**
+  - ビューがヒットした場合、保存された定義 SQL を内部パースし、現在のトランザクションスナップショット上で `execute_query_with_ctes` を再帰実行。
+  - 得られた行と列メタデータから透過的に `TableDef` を動的構築し、通常のテーブルや派生テーブル（Derived Table）と全く同じパイプラインで結合・射影・集約を実行。
+
+### 3.12 セーブポイント (SAVEPOINT) を非採用とするアーキテクチャ上の決定理由
+
+- **設計方針 (Design Rationale)**:
+  - 本エンジンのストレージアーキテクチャは、**追記型 CoW B-Tree によるスナップショット分離**と、トランザクション開始バージョンへの**逆順 Undo Log 再生**を基礎としています。
+  - トランザクション内部での任意時点への部分巻き戻し（`SAVEPOINT`）を実装する場合、Undo ログの階層的セグメント化、アクティブページ変更セットの部分破棄、追記ログのインデックス管理など、ストレージ層とトランザクション層の双方で複雑性が指数関数的に増大し、最も重要な「極小のフットプリントと高速なインメモリ/組み込み実行」を損なう要因となります。
+  - したがって、PostgreSQL 互換機能の中でも `SAVEPOINT` は明確に**実装対象外（No Support by Design）**とし、トランザクションの失敗時は `ROLLBACK` による全体巻き戻しを基本設計としています。
 
 ---
 

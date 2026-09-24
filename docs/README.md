@@ -8,6 +8,8 @@
   PostgreSQL 公式ドキュメントの構成をベースに体系化した、データベース利用者向けの実践的総合マニュアル。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順などを網羅。
 - 🛠️ **[開発者・メンテナー向けガイド (DEVELOPER_GUIDE.md)](./DEVELOPER_GUIDE.md)**:
   プロジェクトの保守・拡張を行う開発者向けガイド。内部アーキテクチャ、CoW B-Tree、MVCC・UndoLog、新規型・構文の追加手順、ロック階層とデッドロック防止ルール、テスト方針を解説。
+- ⚖️ **[SQL 標準規格 適合状況と機能比較 (SQL_STANDARDS_COMPLIANCE.md)](./SQL_STANDARDS_COMPLIANCE.md)**:
+  ISO/IEC 9075 SQL標準規格（SQL-92, SQL:1999, SQL:2003, SQL:2016 等）と対比し、何が実装できていて何が未実装・制限事項かを網羅した適合性マトリクス。
 
 ### アーキテクチャ・設計仕様書
 

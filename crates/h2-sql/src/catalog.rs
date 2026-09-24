@@ -15,12 +15,34 @@ pub struct ColumnDef {
     pub is_primary_key: bool,
 }
 
+/// 外部キーアクション
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignKeyAction {
+    Restrict,
+    Cascade,
+    SetNull,
+    NoAction,
+}
+
+/// 外部キー定義
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForeignKeyDef {
+    pub name: Option<String>,
+    pub column: String,
+    pub foreign_table: String,
+    pub foreign_column: String,
+    pub on_delete: ForeignKeyAction,
+    pub on_update: ForeignKeyAction,
+}
+
 /// テーブル定義
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     pub columns: Vec<ColumnDef>,
     pub next_row_id: u64,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableDef {
@@ -29,6 +51,7 @@ impl TableDef {
             name: name.into(),
             columns,
             next_row_id: 1,
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -46,12 +69,21 @@ pub struct IndexDef {
     pub is_unique: bool,
 }
 
+/// ビュー定義
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewDef {
+    pub name: String,
+    pub query_sql: String,
+    pub columns: Vec<String>,
+}
+
 /// カタログ管理
 pub struct Catalog {
     store: Arc<MVStore>,
     catalog_map: MVMap,
     tables: Arc<RwLock<HashMap<String, TableDef>>>,
     indexes: Arc<RwLock<HashMap<String, IndexDef>>>,
+    views: Arc<RwLock<HashMap<String, ViewDef>>>,
 }
 
 impl Catalog {
@@ -59,6 +91,7 @@ impl Catalog {
         let catalog_map = store.open_map("_catalog");
         let mut tables = HashMap::new();
         let mut indexes = HashMap::new();
+        let mut views = HashMap::new();
 
         // 永続化されたカタログ情報をロード
         for entry in catalog_map.scan_all() {
@@ -73,6 +106,11 @@ impl Catalog {
                 if let Ok(index_def) = serde_json::from_slice::<IndexDef>(&entry.value) {
                     indexes.insert(index_name.to_lowercase(), index_def);
                 }
+            } else if key_str.starts_with("view:") {
+                let view_name = &key_str[5..];
+                if let Ok(view_def) = serde_json::from_slice::<ViewDef>(&entry.value) {
+                    views.insert(view_name.to_lowercase(), view_def);
+                }
             } else {
                 // 以前の形式（tbl:プレフィックスなし）との互換性
                 if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
@@ -86,6 +124,7 @@ impl Catalog {
             catalog_map,
             tables: Arc::new(RwLock::new(tables)),
             indexes: Arc::new(RwLock::new(indexes)),
+            views: Arc::new(RwLock::new(views)),
         })
     }
 
@@ -96,6 +135,12 @@ impl Catalog {
 
     pub fn create_table(&self, table_def: TableDef) -> H2Result<()> {
         let name_key = table_def.name.to_lowercase();
+        if self.views.read().contains_key(&name_key) {
+            return Err(H2Error::Catalog(format!(
+                "Cannot create table '{}': view with same name exists",
+                table_def.name
+            )));
+        }
         let mut tables = self.tables.write();
 
         if tables.contains_key(&name_key) {
@@ -120,6 +165,19 @@ impl Catalog {
 
     pub fn all_tables(&self) -> Vec<TableDef> {
         self.tables.read().values().cloned().collect()
+    }
+
+    pub fn get_tables_referencing(&self, parent_table: &str) -> Vec<(TableDef, ForeignKeyDef)> {
+        let parent_lower = parent_table.to_lowercase();
+        let mut res = Vec::new();
+        for table in self.tables.read().values() {
+            for fk in &table.foreign_keys {
+                if fk.foreign_table.to_lowercase() == parent_lower {
+                    res.push((table.clone(), fk.clone()));
+                }
+            }
+        }
+        res
     }
 
     pub fn drop_table(&self, name: &str) -> H2Result<Vec<String>> {
@@ -265,6 +323,53 @@ impl Catalog {
         self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
 
         Ok(id)
+    }
+
+    pub fn create_view(&self, view_def: ViewDef, or_replace: bool) -> H2Result<()> {
+        let name_key = view_def.name.to_lowercase();
+        if self.tables.read().contains_key(&name_key) {
+            return Err(H2Error::Catalog(format!(
+                "Cannot create view '{}': table with same name exists",
+                view_def.name
+            )));
+        }
+        let mut views = self.views.write();
+        if views.contains_key(&name_key) && !or_replace {
+            return Err(H2Error::Catalog(format!(
+                "View '{}' already exists",
+                view_def.name
+            )));
+        }
+
+        let serialized = serde_json::to_vec(&view_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("view:{}", name_key).into_bytes(), serialized);
+        views.insert(name_key, view_def);
+
+        Ok(())
+    }
+
+    pub fn drop_view(&self, name: &str, if_exists: bool) -> H2Result<()> {
+        let name_key = name.to_lowercase();
+        let mut views = self.views.write();
+        if views.remove(&name_key).is_none() {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(H2Error::Catalog(format!("View '{}' not found", name)));
+        }
+
+        self.catalog_map.remove(format!("view:{}", name_key).as_bytes());
+        Ok(())
+    }
+
+    pub fn get_view(&self, name: &str) -> Option<ViewDef> {
+        let name_key = name.to_lowercase();
+        self.views.read().get(&name_key).cloned()
+    }
+
+    pub fn all_views(&self) -> Vec<ViewDef> {
+        self.views.read().values().cloned().collect()
     }
 }
 

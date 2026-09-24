@@ -11,7 +11,7 @@ use crate::data_type::DataType;
 use crate::error::{H2Error, H2Result};
 
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Boolean(bool),
@@ -60,6 +60,19 @@ impl Value {
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
+    }
+
+    pub fn is_numeric(&self) -> bool {
+        matches!(
+            self,
+            Value::TinyInt(_)
+                | Value::SmallInt(_)
+                | Value::Integer(_)
+                | Value::BigInt(_)
+                | Value::Float(_)
+                | Value::Double(_)
+                | Value::Decimal(_)
+        )
     }
 
     pub fn to_decimal(&self) -> Option<Decimal> {
@@ -177,13 +190,145 @@ impl Value {
                 },
                 _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to JSON", self))),
             },
+            DataType::Timestamp | DataType::TimestampTz => match self {
+                Value::Timestamp(ts) => Ok(Value::Timestamp(*ts)),
+                Value::String(s) => {
+                    if let Some(ts) = parse_timestamp(s) {
+                        Ok(Value::Timestamp(ts))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot parse '{}' as TIMESTAMP / TIMESTAMPTZ", s)))
+                    }
+                }
+                Value::Date(d) => {
+                    if let Some(ndt) = d.and_hms_opt(0, 0, 0) {
+                        Ok(Value::Timestamp(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc)))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot cast date {:?} to TIMESTAMP", d)))
+                    }
+                }
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to TIMESTAMP / TIMESTAMPTZ", self))),
+            },
+            DataType::Date => match self {
+                Value::Date(d) => Ok(Value::Date(*d)),
+                Value::Timestamp(ts) => Ok(Value::Date(ts.date_naive())),
+                Value::String(s) => {
+                    if let Ok(d) = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d") {
+                        Ok(Value::Date(d))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot parse '{}' as DATE", s)))
+                    }
+                }
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to DATE", self))),
+            },
+            DataType::Time => match self {
+                Value::Time(t) => Ok(Value::Time(*t)),
+                Value::Timestamp(ts) => Ok(Value::Time(ts.time())),
+                Value::String(s) => {
+                    if let Ok(t) = chrono::NaiveTime::parse_from_str(s.trim(), "%H:%M:%S") {
+                        Ok(Value::Time(t))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot parse '{}' as TIME", s)))
+                    }
+                }
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to TIME", self))),
+            },
+            DataType::Uuid => match self {
+                Value::Uuid(u) => Ok(Value::Uuid(*u)),
+                Value::String(s) => {
+                    if let Ok(u) = uuid::Uuid::parse_str(s.trim()) {
+                        Ok(Value::Uuid(u))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot parse '{}' as UUID", s)))
+                    }
+                }
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to UUID", self))),
+            },
             _ => Ok(self.clone()),
-
         }
     }
 }
 
+fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    let trimmed = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let formats_with_tz = [
+        "%Y-%m-%d %H:%M:%S%z",
+        "%Y-%m-%d %H:%M:%S %#z",
+        "%Y-%m-%d %H:%M:%S%:z",
+        "%Y-%m-%dT%H:%M:%S%:z",
+    ];
+    for fmt in &formats_with_tz {
+        if let Ok(dt) = DateTime::parse_from_str(trimmed, fmt) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+    let naive_formats = [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+    for fmt in &naive_formats {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+        }
+    }
+    if let Ok(nd) = chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
+        if let Some(ndt) = nd.and_hms_opt(0, 0, 0) {
+            return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+        }
+    }
+    None
+}
 
+
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::TinyInt(a), Value::TinyInt(b)) => a == b,
+            (Value::SmallInt(a), Value::SmallInt(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::BigInt(a), Value::BigInt(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            (Value::Double(a), Value::Double(b)) => a == b,
+            (Value::Decimal(a), Value::Decimal(b)) => a == b,
+            (Value::String(a), Value::String(b)) => a == b,
+            (Value::Bytes(a), Value::Bytes(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
+            (Value::Time(a), Value::Time(b)) => a == b,
+            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Json(a), Value::Json(b)) => a == b,
+            (Value::Array(a), Value::Array(b)) => a == b,
+            // 異なる数値型同士の等価判定
+            (a, b) if a.is_numeric() && b.is_numeric() => {
+                compare_numeric(a, b) == Some(Ordering::Equal)
+            }
+            // Timestamp と String のクロス等価判定
+            (Value::Timestamp(a), Value::String(s)) | (Value::String(s), Value::Timestamp(a)) => {
+                if let Some(b) = parse_timestamp(s) {
+                    *a == b
+                } else {
+                    false
+                }
+            }
+            // Date と String のクロス等価判定
+            (Value::Date(a), Value::String(s)) | (Value::String(s), Value::Date(a)) => {
+                if let Ok(b) = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d") {
+                    *a == b
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+}
 
 /// インデックスキー比較用のPartialOrd実装
 impl PartialOrd for Value {
@@ -206,6 +351,24 @@ impl PartialOrd for Value {
             (Value::Time(a), Value::Time(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
+            // Timestamp と String のクロス比較
+            (Value::Timestamp(a), Value::String(s)) => {
+                let b = parse_timestamp(s)?;
+                a.partial_cmp(&b)
+            }
+            (Value::String(s), Value::Timestamp(b)) => {
+                let a = parse_timestamp(s)?;
+                a.partial_cmp(b)
+            }
+            // Date と String のクロス比較
+            (Value::Date(a), Value::String(s)) => {
+                let b = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
+                a.partial_cmp(&b)
+            }
+            (Value::String(s), Value::Date(b)) => {
+                let a = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()?;
+                a.partial_cmp(b)
+            }
             // 異なる数値型同士の比較 (Cross-type numeric comparison)
             _ => compare_numeric(self, other),
         }

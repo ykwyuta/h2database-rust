@@ -3,6 +3,10 @@
 PostgreSQL の公式ドキュメント構成をベースに体系化した、`h2database-rust` の総合利用者向けガイドです。
 SQLite のような手軽な組み込み利用から、PostgreSQL 互換サーバーとしての運用、高度な SQL 機能や日本語全文検索（FTS）、非同期 Rust アプリケーションへの統合までを網羅しています。
 
+> [!NOTE]
+> **SQL 標準規格との詳細な対比**:
+> 国際標準（ISO/IEC 9075: SQL-92, SQL:1999, SQL:2003, SQL:2016 等）に対する「何が実装できていて、何が未実装・制限事項か」の完全な適合性マトリクスは [SQL 標準規格 適合状況と機能比較 (SQL_STANDARDS_COMPLIANCE.md)](./SQL_STANDARDS_COMPLIANCE.md) をご覧ください。
+
 ---
 
 ## 📚 目次 (Table of Contents)
@@ -19,8 +23,8 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [4. UUID & 高精度数値 (Decimal)](#4-uuid--高精度数値-decimal)
   - [5. JSON / JSONB 構造化データ](#5-json--jsonb-構造化データ)
 - [Part III. SQL 言語ガイド (The SQL Language)](#part-iii-sql-言語ガイド-the-sql-language)
-  - [1. テーブルとインデックスの定義 (DDL)](#1-テーブルとインデックスの定義-ddl)
-  - [2. データ操作 (DML: INSERT, UPDATE, DELETE)](#2-データ操作-dml-insert-update-delete)
+  - [1. テーブルとインデックスの定義 (DDL: 外部キー制約・CASCADE対応)](#1-テーブルとインデックスの定義-ddl-外部キー制約cascade対応)
+  - [2. データ操作 (DML: INSERT, INSERT SELECT, UPDATE, DELETE)](#2-データ操作-dml-insert-insert-select-update-delete)
   - [3. クエリと検索 (SELECT, WHERE, ORDER BY, LIMIT/OFFSET)](#3-クエリと検索-select-where-order-by-limitoffset)
   - [4. テーブル結合 (JOIN: INNER, LEFT JOIN)](#4-テーブル結合-join-inner-left-join)
   - [5. 集約関数とグループ化 (GROUP BY, HAVING)](#5-集約関数とグループ化-group-by-having)
@@ -28,11 +32,13 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [7. メタデータ調査 (INFORMATION_SCHEMA)](#7-メタデータ調査-information_schema)
   - [8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE)](#8-テーブル構造の変更全削除-alter-table--truncate-table)
   - [9. 実行計画の確認とスキーマ照会 (EXPLAIN, SHOW TABLES, SHOW COLUMNS)](#9-実行計画の確認とスキーマ照会-explain-show-tables-show-columns)
-  - [10. 高度なクエリ演算 (FROM句なしSELECT, サブクエリ, DISTINCT, UNION)](#10-高度なクエリ演算-from句なしselect-サブクエリ-distinct-union)
+  - [10. 高度なクエリ演算 (FROM句なしSELECT, CTE/WITH句, サブクエリ, DISTINCT, 集合演算 UNION/INTERSECT/EXCEPT, ウィンドウ関数)](#10-高度なクエリ演算-from句なしselect-ctewith句-サブクエリ-distinct-union)
+  - [11. 仮想ビューの定義と管理 (CREATE VIEW, DROP VIEW)](#11-仮想ビューの定義と管理-create-view-drop-view)
 - [Part IV. トランザクションと並行性制御 (Transactions & Concurrency)](#part-iv-トランザクションと並行性制御-transactions--concurrency)
   - [1. MVCC (マルチバージョン並行性制御) の特徴](#1-mvcc-マルチバージョン並行性制御-の特徴)
   - [2. Rust API によるトランザクション (RAII 管理)](#2-rust-api-によるトランザクション-raii-管理)
   - [3. SQL 文による明示的トランザクション (BEGIN, COMMIT, ROLLBACK)](#3-sql-文による明示的トランザクション-begin-commit-rollback)
+  - [4. セーブポイント (SAVEPOINT) についての設計方針](#4-セーブポイント-savepoint-についての設計方針)
 - [Part V. クライアント & 組み込み API ガイド (Client / Embedded APIs)](#part-v-クライアント--組み込み-api-ガイド-client--embedded-apis)
   - [1. パラメータ付きクエリと SQL インジェクション対策](#1-パラメータ付きクエリと-sql-インジェクション対策)
   - [2. 型安全なクエリ結果の走査 (`FromSql` & `Row::get_as`)](#2-型安全なクエリ結果の走査-fromsql--rowget_as)
@@ -177,14 +183,33 @@ async fn main() -> H2Result<()> {
 | `TEXT` | `String` | 無制限の長文テキスト（全文検索対象に推奨） |
 | `BINARY`, `BYTEA`, `BLOB`| `Vec<u8>` | 任意のバイナリバイト列 |
 
-## 3. 日付・時刻型 (Date/Time)
+## 3. 日付・時刻型 (Date/Time & TIMESTAMPTZ)
 
 | SQL データ型 | Rust 対応型 (`chrono`) | 例 / フォーマット |
 | :--- | :--- | :--- |
 | `DATE` | `chrono::NaiveDate` | `'2026-09-24'` |
 | `TIME` | `chrono::NaiveTime` | `'20:30:00'` |
 | `TIMESTAMP` | `chrono::DateTime<Utc>` / `NaiveDateTime` | `'2026-09-24 20:30:00'` |
-| `TIMESTAMP WITH TIME ZONE` | `chrono::DateTime<Utc>` | UTC 基準タイムゾーン付き日時 |
+| `TIMESTAMPTZ`, `TIMESTAMP WITH TIME ZONE` | `chrono::DateTime<Utc>` | `'2026-09-24T12:00:00+09:00'`, `'2026-09-24 03:00:00Z'` |
+
+> [!TIP]
+> **タイムゾーンの自動正規化とクロス比較**:
+> `TIMESTAMPTZ` 型の列に格納される値は、指定されたタイムゾーンオフセット（例: `+09:00`, `-05:00`, `Z` 等）を正確に解釈し、内部で協定世界時（UTC）へ正規化されます。
+> そのため、`'2026-09-24T12:00:00+09:00'` と `'2026-09-24 03:00:00Z'` は等値（`=`）として判定され、タイムゾーンを跨ぐ監査ログやグローバルなイベント時刻比較を安全に行えます。
+
+```sql
+CREATE TABLE audit_events (
+    id INT PRIMARY KEY,
+    event_name VARCHAR NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL
+);
+
+-- JST (+09:00) の正午を挿入
+INSERT INTO audit_events VALUES (1, 'UserLogin', '2026-09-24 12:00:00+09:00');
+
+-- UTC (Z) 03:00 として検索（同じ絶対時刻のため一致する）
+SELECT * FROM audit_events WHERE occurred_at = '2026-09-24 03:00:00Z';
+```
 
 ## 4. UUID & 高精度数値 (Decimal)
 
@@ -240,21 +265,55 @@ WHERE attributes -> 'settings' ->> 'theme' = 'dark';
 
 # Part III. SQL 言語ガイド (The SQL Language)
 
-## 1. テーブルとインデックスの定義 (DDL)
+## 1. テーブルとインデックスの定義 (DDL: 外部キー制約・CASCADE対応)
 
 ### テーブルの作成と削除
 ```sql
--- テーブルの作成
-CREATE TABLE IF NOT EXISTS users (
+-- 親テーブルの作成
+CREATE TABLE IF NOT EXISTS departments (
     id INT PRIMARY KEY,
-    email VARCHAR(255) NOT NULL,
-    age INT,
-    created_at TIMESTAMP
+    name VARCHAR(50) NOT NULL
 );
 
 -- テーブルの削除 (IF EXISTS 対応)
 DROP TABLE IF EXISTS old_users;
 ```
+
+### 外部キー制約 (FOREIGN KEY & 参照整合性)
+親子テーブル間の参照整合性を強制し、親行の削除・更新に伴う連動アクション（`CASCADE`、`SET NULL`、`RESTRICT`）をサポートしています。
+
+```sql
+-- ① カラムレベルの参照制約 (デフォルト RESTRICT)
+CREATE TABLE employees (
+    id INT PRIMARY KEY,
+    name VARCHAR(50) NOT NULL,
+    dept_id INT REFERENCES departments(id)
+);
+
+-- ② テーブル制約レベル & 連動削除 (ON DELETE CASCADE)
+CREATE TABLE projects (
+    id INT PRIMARY KEY,
+    title VARCHAR(100) NOT NULL,
+    dept_id INT,
+    FOREIGN KEY (dept_id) REFERENCES departments(id) ON DELETE CASCADE
+);
+
+-- ③ 連動 NULL 化 (ON DELETE SET NULL) および連動更新 (ON UPDATE CASCADE)
+CREATE TABLE audit_logs (
+    id INT PRIMARY KEY,
+    action VARCHAR(100) NOT NULL,
+    dept_id INT,
+    FOREIGN KEY (dept_id) REFERENCES departments(id) 
+        ON DELETE SET NULL 
+        ON UPDATE CASCADE
+);
+```
+
+- **整合性バリデーション**: 子テーブルへ存在しない `dept_id` を INSERT / UPDATE しようとすると制約エラーとなります（`NULL` 値は SQL 標準通り許容）。
+- **RESTRICT / NO ACTION**: 子テーブルから参照されている親行の DELETE や更新は自動的に拒絶されます。
+- **CASCADE**: 親行を DELETE すると参照する子行も自動削除され、親キーを UPDATE すると子行の外部キー列も自動更新されます。
+- **SET NULL**: 親行を DELETE / UPDATE すると、参照する子行の該当列が自動的に `NULL` に更新されます。
+- **被参照テーブル保護**: 子行が存在する状態で親テーブルを `DROP TABLE` または `TRUNCATE TABLE` しようとすると拒絶されます。
 
 ### インデックスの作成と削除
 本データベースは追記型 B-Tree 上にセカンダリインデックスおよび一意（UNIQUE）インデックスを作成できます。
@@ -274,16 +333,42 @@ DROP INDEX IF EXISTS idx_users_age;
 > **自動 IndexScan 最適化**:
 > `WHERE email = 'alice@example.com'` のような検索を実行すると、オプティマイザが自動的にインデックスの存在を検知し、テーブル全件走査（SeqScan）をスキップしてインデックス走査（IndexScan）を行い、O(log N) で高速取得します。
 
-## 2. データ操作 (DML: INSERT, UPDATE, DELETE)
+## 2. データ操作 (DML: INSERT, INSERT SELECT, UPDATE, DELETE)
 
-### INSERT
+### INSERT (単行・複数行挿入)
 ```sql
 INSERT INTO users (id, email, age) VALUES (1, 'alice@example.com', 25);
 INSERT INTO users VALUES (2, 'bob@example.com', 30, CURRENT_TIMESTAMP);
 ```
 
+### INSERT INTO ... SELECT ... (クエリ結果の直接挿入)
+別テーブルからのデータ移行、集約集計テーブルの自動生成、CTE（共通テーブル式）からの直接挿入に対応しています。
+
+```sql
+-- 全カラム直接転送
+INSERT INTO user_archive SELECT * FROM users WHERE age >= 60;
+
+-- 特定カラム指定 & 式計算の転送
+INSERT INTO user_bonuses (user_id, bonus_amount) 
+SELECT id, age * 100 FROM users WHERE age >= 20;
+
+-- GROUP BY 集約結果をサマリテーブルに保存
+INSERT INTO department_stats (dept_id, employee_count, avg_salary)
+SELECT dept_id, COUNT(*), AVG(salary) FROM employees GROUP BY dept_id;
+
+-- CTE (WITH 句) と組み合わせた挿入
+INSERT INTO vip_customers
+WITH high_spenders AS (
+    SELECT customer_id, SUM(amount) AS total 
+    FROM orders 
+    GROUP BY customer_id 
+    HAVING SUM(amount) >= 100000
+)
+SELECT customer_id, total FROM high_spenders;
+```
+
 ### UPDATE
-自己参照式（`age = age + 1`）や複数カラムの更新に対応しています。
+自己参照式（`age = age + 1`）や複数カラムの更新に対応しています。外部キー整合性も自動検証されます。
 ```sql
 UPDATE users 
 SET age = age + 1, email = 'alice_new@example.com' 
@@ -291,6 +376,7 @@ WHERE id = 1;
 ```
 
 ### DELETE
+親行削除時の連動アクション（CASCADE / SET NULL）および参照保護（RESTRICT）が機能します。
 ```sql
 DELETE FROM users WHERE age < 18;
 ```
@@ -444,7 +530,7 @@ SHOW TABLES;
 SHOW COLUMNS FROM users;
 ```
 
-## 10. 高度なクエリ演算 (FROM句なしSELECT, サブクエリ, DISTINCT, UNION)
+## 10. 高度なクエリ演算 (FROM句なしSELECT, CTE/WITH句, サブクエリ, DISTINCT, UNION)
 
 複雑なデータ抽出や計算処理に対応するモダンな SQL 構文を豊富にサポートしています。
 
@@ -455,7 +541,42 @@ SHOW COLUMNS FROM users;
 SELECT 1 + 1 AS result, UPPER('hello') AS greeting, NOW() AS current_time;
 ```
 
-### ② 条件分岐式 (`CASE WHEN ... THEN ... ELSE ... END`)
+### ② 共通テーブル式 (CTE: `WITH` 句 / SQL:1999)
+複雑な多段サブクエリをモジュール化し、可読性の高いクエリ構造を作成できます。単一 CTE、先行 CTE を参照するチェイン CTE、テーブルとの JOIN、`INSERT INTO ... SELECT` との組み合わせに対応しています。
+
+```sql
+-- 1. 単一 CTE
+WITH high_scorers AS (
+    SELECT id, name, score 
+    FROM students 
+    WHERE score >= 80
+)
+SELECT name, score FROM high_scorers ORDER BY score DESC;
+
+-- 2. 複数 CTE の順次定義 (チェイン CTE)
+WITH regional_sales AS (
+    SELECT region, SUM(amount) AS total_sales
+    FROM orders
+    GROUP BY region
+),
+top_regions AS (
+    SELECT region, total_sales
+    FROM regional_sales
+    WHERE total_sales > 1000000
+)
+SELECT * FROM top_regions ORDER BY total_sales DESC;
+
+-- 3. CTE と実テーブルの JOIN
+WITH active_users AS (
+    SELECT id, name FROM users WHERE is_active = TRUE
+)
+SELECT u.name, o.item_name, o.amount
+FROM active_users u
+JOIN orders o ON u.id = o.user_id
+ORDER BY o.amount DESC;
+```
+
+### ③ 条件分岐式 (`CASE WHEN ... THEN ... ELSE ... END`)
 行ごとの動的な値変換やラベル付けが可能です。
 
 ```sql
@@ -468,7 +589,7 @@ SELECT name,
 FROM students;
 ```
 
-### ③ `IN` および `BETWEEN` 式
+### ④ `IN` および `BETWEEN` 式
 複数の候補値や範囲指定による簡潔な絞り込みに対応しています。
 
 ```sql
@@ -476,7 +597,7 @@ SELECT * FROM products WHERE category_id IN (1, 3, 5);
 SELECT * FROM orders WHERE amount BETWEEN 100 AND 500;
 ```
 
-### ④ 派生テーブル (FROM 句 / JOIN 句のサブクエリ)
+### ⑤ 派生テーブル (FROM 句 / JOIN 句のサブクエリ)
 集約クエリや複雑な中間結果をインメモリの派生テーブル（Derived Table）として扱い、さらにフィルタや結合を行えます。
 
 ```sql
@@ -499,7 +620,7 @@ JOIN (
 ) AS sub ON u.id = sub.user_id;
 ```
 
-### ⑤ `IN` / `EXISTS` サブクエリ & スカラサブクエリ
+### ⑥ `IN` / `EXISTS` サブクエリ & スカラサブクエリ
 WHERE 句での動的条件判定や、列定義でのスカラサブクエリを利用できます。
 
 ```sql
@@ -513,21 +634,112 @@ SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id =
 SELECT name, (SELECT MAX(amount) FROM orders) AS max_order FROM users;
 ```
 
-### ⑥ 重複排除 (`SELECT DISTINCT`)
+### ⑦ 重複排除 (`SELECT DISTINCT`)
 抽出結果から完全に重複する行を除去します。
 
 ```sql
 SELECT DISTINCT department FROM employees ORDER BY department;
 ```
 
-### ⑦ クエリ結果の統合 (`UNION` / `UNION ALL`)
-複数のクエリ結果を縦方向に結合します。`UNION` は重複行を自動排除し、`UNION ALL` は全行をそのまま保持します。
+### ⑧ 集合演算 (`UNION`, `INTERSECT`, `EXCEPT` / SQL-92)
+複数のクエリ結果を集合演算として統合・抽出します。デフォルトは重複排除（DISTINCT）、`ALL` 指定時は重複保持となります。
+
+- **`UNION` / `UNION ALL` (和集合)**: 両クエリの行を統合。
+- **`INTERSECT` / `INTERSECT ALL` (積集合)**: 両クエリの双方に存在する共通行のみを抽出。
+- **`EXCEPT` / `EXCEPT ALL` (差集合)**: 左クエリの結果から右クエリの結果を除外。
 
 ```sql
+-- 1. 和集合 (重複排除)
 SELECT name, email FROM internal_users
 UNION
 SELECT name, email FROM external_partners
 ORDER BY name;
+
+-- 2. 積集合 (両方の部署に所属しているユーザー)
+SELECT user_id FROM sales_members
+INTERSECT
+SELECT user_id FROM dev_members
+ORDER BY user_id;
+
+-- 3. 差集合 (注文履歴のないユーザー)
+SELECT id FROM users
+EXCEPT
+SELECT user_id FROM orders
+ORDER BY id;
+```
+
+### ⑨ ウィンドウ関数 (Window Functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK` / SQL:2003)
+行をグループに縮約（集約）することなく、現在行に関連する行セット（ウィンドウ）に基づいて順位や連番を計算します。
+`OVER` 句内で `PARTITION BY`（グループ分割）および `ORDER BY`（順序付け）を指定できます。
+
+- **`ROW_NUMBER()`**: 各行に 1 から始まる一意の連番を割り当てます。
+- **`RANK()`**: 値が同一の場合は同じ順位を割り当て、タイの個数分だけ後続の順位をスキップします（例: 1, 2, 2, 4...）。
+- **`DENSE_RANK()`**: 値が同一の場合は同じ順位を割り当てますが、後続の順位をスキップせず連番を保ちます（例: 1, 2, 2, 3...）。
+
+```sql
+-- 部門ごとの給与ランキングクエリ
+SELECT 
+    id, 
+    dept, 
+    salary,
+    ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS row_num,
+    RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS rank,
+    DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS dense_rank
+FROM employees
+ORDER BY dept, row_num;
+
+-- 全体ソートでの連番ナンバリング
+SELECT id, title, ROW_NUMBER() OVER (ORDER BY created_at DESC) AS seq_no
+FROM articles;
+```
+
+## 11. 仮想ビューの定義と管理 (CREATE VIEW, DROP VIEW)
+
+複雑な結合や集約クエリを名前付きの「仮想テーブル」として保存し、通常のテーブルと同様に SELECT や JOIN の対象として透過的に再利用できます。
+ビュー定義はカタログに永続化され、クエリ実行時に自動的に動的展開されます。
+
+### ① ビューの作成 (`CREATE VIEW` / `CREATE OR REPLACE VIEW`)
+```sql
+-- 1. 基本ビューの作成
+CREATE VIEW active_customers AS
+SELECT id, name, email
+FROM users
+WHERE is_active = TRUE AND role = 'customer';
+
+-- 2. 列名を明示的に指定したビュー
+CREATE VIEW monthly_sales_summary (month_str, total_amount) AS
+SELECT order_month, SUM(amount)
+FROM orders
+GROUP BY order_month;
+
+-- 3. 既存ビューの置換 (CREATE OR REPLACE VIEW)
+CREATE OR REPLACE VIEW active_customers AS
+SELECT id, name, email, updated_at
+FROM users
+WHERE is_active = TRUE;
+```
+
+### ② ビューの利用 (SELECT & テーブル結合)
+ビューは実テーブルと全く同様に、`WHERE` フィルタ、テーブルとの `JOIN`、CTE との併用が可能です。
+
+```sql
+-- ビューからのデータ抽出
+SELECT name, email FROM active_customers WHERE name LIKE 'A%' ORDER BY name;
+
+-- ビューと実テーブルの結合 (JOIN)
+SELECT c.name, o.amount, o.ordered_at
+FROM active_customers c
+JOIN orders o ON c.id = o.user_id
+WHERE o.amount >= 10000
+ORDER BY o.amount DESC;
+```
+
+### ③ ビューの削除 (`DROP VIEW`)
+```sql
+DROP VIEW active_customers;
+
+-- 存在しない場合のエラー抑止
+DROP VIEW IF EXISTS active_customers;
 ```
 
 ---
@@ -572,6 +784,17 @@ BEGIN TRANSACTION;
 UPDATE inventory SET qty = qty - 1 WHERE item = 'Keyboard';
 COMMIT;
 ```
+
+## 4. セーブポイント (SAVEPOINT) についての設計方針
+
+> [!IMPORTANT]
+> **SAVEPOINT は設計方針として実装対象外（No Support by Design）です**:
+> 本エンジンは、追記型 B-Tree（MVStore）による**高速な MVCC スナップショット分離**と、トランザクション単位の**逆順 Undo Log 再生**による簡潔かつ堅牢な整合性復元をコアアーキテクチャとしています。
+> トランザクション途中での部分巻き戻し（`SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name`）を導入することは、内部 Undo ログ構造の過度な複雑化と実行時オーバーヘッドを招くため、設計上サポート対象外（明確なスコープ外）としています。
+> 
+> - **推奨されるベストプラクティス**:
+>   - エラー発生時は `ROLLBACK` を発行してトランザクション全体を安全に破棄する。
+>   - 大量データ処理において部分的な失敗を許容したい場合は、一連の処理を複数の小さなトランザクションに分割して逐次コミットする。
 
 ---
 

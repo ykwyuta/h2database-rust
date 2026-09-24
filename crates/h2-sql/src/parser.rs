@@ -5,7 +5,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use h2_types::{DataType, H2Error, H2Result};
-use crate::catalog::{ColumnDef, TableDef};
+use crate::catalog::{ColumnDef, ForeignKeyAction, ForeignKeyDef, TableDef};
 
 pub fn parse_sql(sql: &str) -> H2Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
@@ -59,9 +59,22 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
         SqlDataType::JSON => Ok(DataType::Json),
         SqlDataType::Custom(name, _) => {
             let type_name = name.to_string().to_uppercase();
-            Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
+            if type_name == "TIMESTAMPTZ" {
+                Ok(DataType::TimestampTz)
+            } else {
+                Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
+            }
         }
         _ => Err(H2Error::TypeError(format!("Unsupported SQL data type: {:?}", sql_type))),
+    }
+}
+
+fn convert_referential_action(action: &Option<sqlparser::ast::ReferentialAction>) -> ForeignKeyAction {
+    match action {
+        Some(sqlparser::ast::ReferentialAction::Cascade) => ForeignKeyAction::Cascade,
+        Some(sqlparser::ast::ReferentialAction::SetNull) => ForeignKeyAction::SetNull,
+        Some(sqlparser::ast::ReferentialAction::Restrict) => ForeignKeyAction::Restrict,
+        _ => ForeignKeyAction::NoAction,
     }
 }
 
@@ -73,13 +86,29 @@ pub fn extract_create_table(
 ) -> H2Result<TableDef> {
     let table_name = name.to_string();
     let mut col_defs = Vec::new();
-
     let mut pk_columns: Vec<String> = Vec::new();
+    let mut foreign_keys = Vec::new();
+
     for constraint in constraints {
-        if let TableConstraint::PrimaryKey { columns, .. } = constraint {
-            for col in columns {
-                pk_columns.push(col.value.clone());
+        match constraint {
+            TableConstraint::PrimaryKey { columns, .. } => {
+                for col in columns {
+                    pk_columns.push(col.value.clone());
+                }
             }
+            TableConstraint::ForeignKey { name, columns, foreign_table, referred_columns, on_delete, on_update, .. } => {
+                if let (Some(col), Some(ref_col)) = (columns.first(), referred_columns.first()) {
+                    foreign_keys.push(ForeignKeyDef {
+                        name: name.as_ref().map(|n| n.value.clone()),
+                        column: col.value.clone(),
+                        foreign_table: foreign_table.to_string(),
+                        foreign_column: ref_col.value.clone(),
+                        on_delete: convert_referential_action(on_delete),
+                        on_update: convert_referential_action(on_update),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -99,6 +128,17 @@ pub fn extract_create_table(
                 sqlparser::ast::ColumnOption::NotNull => {
                     is_nullable = false;
                 }
+                sqlparser::ast::ColumnOption::ForeignKey { foreign_table, referred_columns, on_delete, on_update, .. } => {
+                    let ref_col = referred_columns.first().map(|c| c.value.clone()).unwrap_or_else(|| "id".to_string());
+                    foreign_keys.push(ForeignKeyDef {
+                        name: opt.name.as_ref().map(|n| n.value.clone()),
+                        column: col_name.clone(),
+                        foreign_table: foreign_table.to_string(),
+                        foreign_column: ref_col,
+                        on_delete: convert_referential_action(on_delete),
+                        on_update: convert_referential_action(on_update),
+                    });
+                }
                 _ => {}
             }
         }
@@ -111,5 +151,8 @@ pub fn extract_create_table(
         });
     }
 
-    Ok(TableDef::new(table_name, col_defs))
+    let mut t_def = TableDef::new(table_name, col_defs);
+    t_def.foreign_keys = foreign_keys;
+    Ok(t_def)
 }
+
