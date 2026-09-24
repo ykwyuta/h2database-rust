@@ -19,12 +19,4 @@ mod tests {
         let d2 = Value::Decimal(rust_decimal::Decimal::new(10075, 2));
         assert!(d1 < d2);
     }
-
-    #[test]
-    fn test_vector_cosine_similarity() {
-        let vec1 = Value::Vector(vec![1.0, 0.0, 0.0]);
-        let vec2 = Value::Vector(vec![0.5, 0.5, 0.0]);
-        let sim = vec1.cosine_similarity(&vec2).unwrap();
-        assert!((sim - 0.7071).abs() < 0.001);
-    }
 }

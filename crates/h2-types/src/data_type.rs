@@ -28,7 +28,6 @@ pub enum DataType {
     Uuid,
     Json,
     Array(Box<DataType>),
-    Vector(usize), // 次元数
 }
 
 impl std::fmt::Display for DataType {
@@ -55,7 +54,6 @@ impl std::fmt::Display for DataType {
             DataType::Uuid => write!(f, "UUID"),
             DataType::Json => write!(f, "JSON"),
             DataType::Array(inner) => write!(f, "{}[]", inner),
-            DataType::Vector(dim) => write!(f, "VECTOR({})", dim),
         }
     }
 }

@@ -61,6 +61,11 @@ impl Connection {
         self.store.current_version()
     }
 
+    /// ストレージのコンパクション（Vacuum）を実行し、古い死にチャンクを破棄してファイルを縮小
+    pub fn vacuum(&self) -> H2Result<()> {
+        self.store.compact()
+    }
+
     #[cfg(feature = "server")]
     /// バックグラウンドで PostgreSQL 互換ワイヤプロトコルサーバーを起動し、リッスンアドレスを返却
     pub async fn start_pg_server(&self, addr: std::net::SocketAddr) -> H2Result<std::net::SocketAddr> {
@@ -335,6 +340,38 @@ mod tests {
         let rows = conn.query("SELECT * FROM products").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].get(1), Some(&Value::String("Smartphone".to_string())));
+    }
+
+    #[test]
+    fn test_compaction_and_vacuum() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE records (id INTEGER, content VARCHAR)").unwrap();
+
+        // 1. 200件のデータを挿入（チャンク追記書き込みが発生）
+        for i in 1..=200 {
+            let sql = format!("INSERT INTO records VALUES ({}, 'This is a long record content number {}')", i, i);
+            conn.execute(&sql).unwrap();
+        }
+
+        let pre_delete_size = std::fs::metadata(&path).unwrap().len();
+
+        // 2. 180件を削除（死にページが発生）
+        conn.execute("DELETE FROM records WHERE id > 20").unwrap();
+
+        // 3. VACUUM を実行してコンパクション
+        conn.vacuum().unwrap();
+
+        let post_vacuum_size = std::fs::metadata(&path).unwrap().len();
+
+        // コンパクションによりファイルサイズが縮小していることを検証
+        assert!(post_vacuum_size < pre_delete_size, "Expected {} < {}", post_vacuum_size, pre_delete_size);
+
+        // 残り20件が正確に読み出せることを検証
+        let remaining = conn.query("SELECT * FROM records").unwrap();
+        assert_eq!(remaining.len(), 20);
     }
 }
 

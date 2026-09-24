@@ -57,14 +57,9 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
         }
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Json),
-        SqlDataType::Custom(name, args) => {
+        SqlDataType::Custom(name, _) => {
             let type_name = name.to_string().to_uppercase();
-            if type_name == "VECTOR" {
-                let dim = args.first().and_then(|a| a.parse::<usize>().ok()).unwrap_or(1536);
-                Ok(DataType::Vector(dim))
-            } else {
-                Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
-            }
+            Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
         }
         _ => Err(H2Error::TypeError(format!("Unsupported SQL data type: {:?}", sql_type))),
     }

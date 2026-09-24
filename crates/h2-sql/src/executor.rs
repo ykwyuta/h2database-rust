@@ -4,7 +4,7 @@ use std::sync::Arc;
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
 use crate::catalog::Catalog;
-use crate::expression::{evaluate_expr, evaluate_sql_value};
+use crate::expression::{evaluate_expr, evaluate_literal_or_unary};
 use crate::parser::{extract_create_table, parse_sql};
 use crate::row::Row;
 
@@ -32,6 +32,10 @@ impl SQLEngine {
         })
     }
 
+    pub fn store(&self) -> &Arc<MVStore> {
+        &self.store
+    }
+
     pub fn tx_store(&self) -> &Arc<TransactionStore> {
         &self.tx_store
     }
@@ -42,6 +46,12 @@ impl SQLEngine {
 
     /// 暗黙トランザクション（Auto-commit）でSQLを実行
     pub fn execute(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if trimmed.eq_ignore_ascii_case("VACUUM") {
+            self.store.compact()?;
+            return Ok(ExecutionResult::Ddl);
+        }
+
         let tx = self.tx_store.begin();
         let result = self.execute_with_tx(&tx, sql)?;
         tx.commit()?;
@@ -50,6 +60,12 @@ impl SQLEngine {
 
     /// 明示的トランザクションコンテキストでSQLを実行
     pub fn execute_with_tx(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if trimmed.eq_ignore_ascii_case("VACUUM") {
+            self.store.compact()?;
+            return Ok(ExecutionResult::Ddl);
+        }
+
         let statements = parse_sql(sql)?;
         let mut last_result = ExecutionResult::Ddl;
 
@@ -94,10 +110,7 @@ impl SQLEngine {
 
                             let mut row_values = Vec::with_capacity(row_exprs.len());
                             for expr in row_exprs {
-                                match expr {
-                                    Expr::Value(v) => row_values.push(evaluate_sql_value(&v)?),
-                                    _ => return Err(H2Error::Execution("Expressions in VALUES not fully supported yet".to_string())),
-                                }
+                                row_values.push(evaluate_literal_or_unary(&expr)?);
                             }
 
                             let row_id = self.catalog.allocate_row_id(&table_name)?;
@@ -105,6 +118,43 @@ impl SQLEngine {
                             tx.put(&map_name, row_id.to_le_bytes().to_vec(), row.to_bytes()?)?;
                             affected_rows += 1;
                         }
+                    }
+                }
+
+                Ok(ExecutionResult::Dml { affected_rows })
+            }
+            Statement::Delete(delete) => {
+                let from_table = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables) => &tables[0],
+                    sqlparser::ast::FromTable::WithoutKeyword(tables) => &tables[0],
+                };
+                let table_name = match &from_table.relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
+                };
+
+                let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
+                    H2Error::Catalog(format!("Table '{}' not found", table_name))
+                })?;
+
+                let map_name = format!("tbl_{}", table_name.to_lowercase());
+                let entries = tx.scan_visible(&map_name)?;
+                let mut affected_rows = 0;
+
+                for (key, val_bytes) in entries {
+                    let row = Row::from_bytes(&val_bytes)?;
+                    let matches = if let Some(selection) = &delete.selection {
+                        match evaluate_expr(selection, &table_def, &row)? {
+                            Value::Boolean(b) => b,
+                            _ => false,
+                        }
+                    } else {
+                        true
+                    };
+
+                    if matches {
+                        tx.remove(&map_name, &key)?;
+                        affected_rows += 1;
                     }
                 }
 

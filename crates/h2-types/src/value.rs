@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::data_type::DataType;
-use crate::error::{H2Error, H2Result};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -26,7 +25,6 @@ pub enum Value {
     Uuid(Uuid),
     Json(serde_json::Value),
     Array(Vec<Value>),
-    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -52,42 +50,11 @@ impl Value {
                 let inner = items.first().and_then(|v| v.data_type()).unwrap_or(DataType::Integer);
                 Some(DataType::Array(Box::new(inner)))
             }
-            Value::Vector(v) => Some(DataType::Vector(v.len())),
         }
     }
 
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
-    }
-
-    /// ベクトル同士のコサイン類似度計算
-    pub fn cosine_similarity(&self, other: &Value) -> H2Result<f32> {
-        match (self, other) {
-            (Value::Vector(v1), Value::Vector(v2)) => {
-                if v1.len() != v2.len() {
-                    return Err(H2Error::TypeError(format!(
-                        "Vector dimensions mismatch: {} vs {}",
-                        v1.len(),
-                        v2.len()
-                    )));
-                }
-                let mut dot_product = 0.0f32;
-                let mut norm_a = 0.0f32;
-                let mut norm_b = 0.0f32;
-                for (&a, &b) in v1.iter().zip(v2.iter()) {
-                    dot_product += a * b;
-                    norm_a += a * a;
-                    norm_b += b * b;
-                }
-                let denom = norm_a.sqrt() * norm_b.sqrt();
-                if denom == 0.0 {
-                    Ok(0.0)
-                } else {
-                    Ok(dot_product / denom)
-                }
-            }
-            _ => Err(H2Error::TypeError("Cosine similarity requires Vector values".to_string())),
-        }
     }
 }
 
@@ -212,7 +179,6 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "]")
             }
-            Value::Vector(v) => write!(f, "{:?}", v),
         }
     }
 }

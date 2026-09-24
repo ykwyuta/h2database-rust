@@ -1,11 +1,13 @@
 pub mod catalog;
 pub mod executor;
 pub mod expression;
+pub mod fts;
 pub mod parser;
 pub mod row;
 
 pub use catalog::{Catalog, ColumnDef, TableDef};
 pub use executor::{ExecutionResult, SQLEngine};
+pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
 pub use row::Row;
 
 #[cfg(test)]
@@ -87,6 +89,46 @@ mod tests {
         if let ExecutionResult::Query { rows, .. } = res_after {
             assert_eq!(rows.len(), 1);
             assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
+        }
+    }
+
+    #[test]
+    fn test_fulltext_search_ngram_and_morph() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+
+        engine.execute("CREATE TABLE articles (id INTEGER, title VARCHAR, content VARCHAR)").unwrap();
+        engine.execute("INSERT INTO articles VALUES (1, 'Rust言語入門', 'Rustは高速でメモリ安全な言語です')").unwrap();
+        engine.execute("INSERT INTO articles VALUES (2, 'H2 Database解説', 'H2は軽量な組み込みJavaリレーショナルデータベースです')").unwrap();
+        engine.execute("INSERT INTO articles VALUES (3, 'データベースの歴史', 'リレーショナルモデルとデータベースとSQLの進化について')").unwrap();
+
+        // 1. FT_SEARCH (N-Gram / Bigram) による日本語部分一致検索
+        let res1 = engine.execute("SELECT id, title FROM articles WHERE FT_SEARCH(content, 'データベース')").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res1 {
+            assert_eq!(rows.len(), 2);
+            let titles: Vec<String> = rows.iter().map(|r| r.get(1).unwrap().to_string()).collect();
+            assert!(titles.contains(&"'H2 Database解説'".to_string()));
+            assert!(titles.contains(&"'データベースの歴史'".to_string()));
+        } else {
+            panic!("Expected Query result");
+        }
+
+        // 2. FT_SEARCH_MORPH (形態素解析) による単語検索
+        let res2 = engine.execute("SELECT id, title FROM articles WHERE FT_SEARCH_MORPH(content, 'メモリ安全')").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res2 {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(1), Some(&Value::String("Rust言語入門".to_string())));
+        } else {
+            panic!("Expected Query result");
+        }
+
+        // 3. FT_SEARCH による単語部分一致検索
+        let res3 = engine.execute("SELECT id, title FROM articles WHERE FT_SEARCH(content, '高速')").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res3 {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(1), Some(&Value::String("Rust言語入門".to_string())));
+        } else {
+            panic!("Expected Query result");
         }
     }
 }

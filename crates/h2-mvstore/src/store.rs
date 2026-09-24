@@ -107,4 +107,29 @@ impl MVStore {
     pub fn current_version(&self) -> u64 {
         *self.version.read()
     }
+
+    /// ストレージのコンパクション（Vacuum）を実行し、古い死にチャンクを回収
+    pub fn compact(&self) -> H2Result<()> {
+        let current_ver = *self.version.read();
+
+        // 生存マップの最新ルートページのみを抽出してメタデータツリーを作成
+        let mut metadata_tree = MVTree::default();
+        let maps = self.maps.read();
+        for (name, map) in maps.iter() {
+            let tree_guard = map.tree.read();
+            let root_bytes = serde_json::to_vec(&*tree_guard.root)
+                .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+            metadata_tree.put(name.as_bytes().to_vec(), root_bytes);
+        }
+
+        let payload = ChunkPayload::new(1, current_ver, (*metadata_tree.root).clone());
+
+        let mut fs = self.file_store.write();
+        fs.compact_and_rewrite(&payload)?;
+
+        // チャンクIDカウンタをリセット
+        *self.chunk_id_counter.write() = 1;
+
+        Ok(())
+    }
 }

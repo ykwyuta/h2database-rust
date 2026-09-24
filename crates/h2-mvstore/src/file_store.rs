@@ -167,4 +167,66 @@ impl FileStore {
         let payload = ChunkPayload::deserialize(&buffer)?;
         Ok(Some(payload))
     }
+
+    /// 生存データのみを新しいファイルに書き出して古い死にチャンクを完全に回収 (Vacuum)
+    pub fn compact_and_rewrite(&mut self, payload: &ChunkPayload) -> H2Result<()> {
+        let Some(path) = &self.path else {
+            // インメモリ時は何もしない
+            return Ok(());
+        };
+
+        let temp_path = path.with_extension("compact_tmp");
+
+        // 一時ファイルの作成と初期化
+        let mut temp_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)?;
+
+        // 一時ファイルにヘッダ初期化
+        let dummy_header = Header {
+            version: payload.meta.version,
+            last_chunk_offset: 0,
+            last_chunk_length: 0,
+        };
+        temp_file.seek(SeekFrom::Start(0))?;
+        temp_file.write_all(&dummy_header.serialize())?;
+
+        // チャンクデータの書き出し
+        let chunk_bytes = payload.serialize()?;
+        let chunk_len = chunk_bytes.len() as u32;
+        let offset = temp_file.seek(SeekFrom::End(0))?;
+        temp_file.write_all(&chunk_bytes)?;
+        temp_file.sync_data()?;
+
+        // ヘッダの確定
+        let final_header = Header {
+            version: payload.meta.version,
+            last_chunk_offset: offset,
+            last_chunk_length: chunk_len,
+        };
+        temp_file.seek(SeekFrom::Start(0))?;
+        temp_file.write_all(&final_header.serialize())?;
+        temp_file.sync_all()?;
+
+        // ハンドルを閉じて置換準備
+        drop(temp_file);
+        self.file = None;
+
+        // Windowsでも安全なファイル置換
+        std::fs::rename(&temp_path, path)?;
+
+        // 置換後のファイルを再オープン
+        let reopened = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        self.file = Some(reopened);
+        self.header = final_header;
+
+        Ok(())
+    }
 }
