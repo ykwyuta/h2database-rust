@@ -13,6 +13,97 @@ pub struct Connection {
     engine: Arc<SQLEngine>,
 }
 
+/// エルゴノミックなパラメータ構築マクロ
+#[macro_export]
+macro_rules! params {
+    ($($x:expr),* $(,)?) => {
+        vec![$($crate::Value::from($x)),*]
+    };
+}
+
+/// SQL文内のプレースホルダー ($1, ?1, ?) にパラメータをバインド
+pub fn bind_params(sql: &str, params: &[Value]) -> H2Result<String> {
+    if params.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    let mut result = String::with_capacity(sql.len() + params.len() * 16);
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    let mut auto_idx = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' {
+            result.push(ch);
+            i += 1;
+            while i < chars.len() {
+                let c = chars[i];
+                result.push(c);
+                if c == '\'' {
+                    if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                        i += 1;
+                        result.push(chars[i]);
+                    } else {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == '$' || ch == '?' {
+            let mut num_str = String::new();
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                num_str.push(chars[j]);
+                j += 1;
+            }
+
+            let param_idx = if !num_str.is_empty() {
+                let parsed: usize = num_str.parse().map_err(|_| {
+                    H2Error::Execution(format!("Invalid parameter placeholder: {}{}", ch, num_str))
+                })?;
+                if parsed == 0 || parsed > params.len() {
+                    return Err(H2Error::Execution(format!(
+                        "Parameter index {} out of range (expected 1..={})",
+                        parsed,
+                        params.len()
+                    )));
+                }
+                i = j;
+                parsed - 1
+            } else if ch == '?' {
+                if auto_idx >= params.len() {
+                    return Err(H2Error::Execution(format!(
+                        "Too few parameters provided: expected more than {}",
+                        auto_idx
+                    )));
+                }
+                let idx = auto_idx;
+                auto_idx += 1;
+                i += 1;
+                idx
+            } else {
+                result.push(ch);
+                i += 1;
+                continue;
+            };
+
+            let val = &params[param_idx];
+            result.push_str(&val.to_string());
+            continue;
+        }
+
+        result.push(ch);
+        i += 1;
+    }
+
+    Ok(result)
+}
+
 impl Connection {
     /// ファイルベースのデータベースを開く（存在しない場合は自動生成）
     pub fn open<P: AsRef<Path>>(path: P) -> H2Result<Self> {
@@ -39,6 +130,12 @@ impl Connection {
         }
     }
 
+    /// パラメータ付きで DDL/DML 文を実行
+    pub fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
+        let bound = bind_params(sql, params)?;
+        self.execute(&bound)
+    }
+
     /// クエリ（SELECT）文を実行し、行リストを返す
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
         match self.engine.execute(sql)? {
@@ -46,6 +143,13 @@ impl Connection {
             _ => Err(H2Error::Execution("Use execute() for DDL/DML statements".to_string())),
         }
     }
+
+    /// パラメータ付きでクエリを実行
+    pub fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
+        let bound = bind_params(sql, params)?;
+        self.query(&bound)
+    }
+
 
     /// 新規トランザクションを開始（スナップショット分離）
     pub fn transaction(&self) -> H2Result<Transaction> {
@@ -100,6 +204,12 @@ impl Transaction {
         }
     }
 
+    /// トランザクション内でパラメータ付き DDL/DML 文を実行
+    pub fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
+        let bound = bind_params(sql, params)?;
+        self.execute(&bound)
+    }
+
     /// トランザクション内でクエリ（SELECT）を実行
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
         let tx = self.inner.as_ref().ok_or_else(|| {
@@ -111,6 +221,13 @@ impl Transaction {
             _ => Err(H2Error::Execution("Use execute() for DDL/DML statements".to_string())),
         }
     }
+
+    /// トランザクション内でパラメータ付きクエリを実行
+    pub fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
+        let bound = bind_params(sql, params)?;
+        self.query(&bound)
+    }
+
 
     /// トランザクションをコミットして変更を確定
     pub fn commit(mut self) -> H2Result<()> {

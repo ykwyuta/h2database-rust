@@ -1,19 +1,37 @@
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, JoinOperator,
-    Query, SelectItem, SetExpr, Statement, TableFactor,
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, GroupByExpr,
+    JoinConstraint, JoinOperator, Query, SelectItem, SetExpr, Statement, TableFactor,
 };
+
 
 use std::sync::Arc;
 
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, IndexDef};
 use crate::expression::{
     evaluate_expr, evaluate_expr_context, evaluate_literal_or_unary, ColumnBinding, RowContext,
 };
 use crate::parser::{extract_create_table, parse_sql};
 use crate::row::Row;
 
+pub(crate) fn encode_index_key(val: &Value, row_id: u64) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(val).unwrap_or_default();
+    bytes.push(0x00);
+    bytes.extend_from_slice(&row_id.to_be_bytes());
+    bytes
+}
+
+pub(crate) fn decode_index_key(bytes: &[u8]) -> Option<(Value, u64)> {
+    if bytes.len() < 9 {
+        return None;
+    }
+    let val_bytes = &bytes[..bytes.len() - 9];
+    let row_id_bytes = &bytes[bytes.len() - 8..];
+    let row_id = u64::from_be_bytes(row_id_bytes.try_into().ok()?);
+    let val = serde_json::from_slice(val_bytes).ok()?;
+    Some((val, row_id))
+}
 
 #[derive(Debug, Clone)]
 pub enum ExecutionResult {
@@ -21,6 +39,7 @@ pub enum ExecutionResult {
     Dml { affected_rows: u64 },
     Query { columns: Vec<String>, rows: Vec<Row> },
 }
+
 
 pub struct SQLEngine {
     store: Arc<MVStore>,
@@ -95,6 +114,71 @@ impl SQLEngine {
                 self.store.commit()?;
                 Ok(ExecutionResult::Ddl)
             }
+            Statement::CreateIndex(create_index) => {
+                let table_name = create_index.table_name.to_string();
+                let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
+                    H2Error::Catalog(format!("Table '{}' not found", table_name))
+                })?;
+
+                let index_name = create_index.name.map(|n| n.to_string()).unwrap_or_else(|| {
+                    let first_col = create_index.columns.first().map(|c| c.expr.to_string()).unwrap_or_else(|| "col".to_string());
+                    format!("idx_{}_{}", table_name, first_col)
+                });
+
+                let mut col_names = Vec::new();
+                for col in &create_index.columns {
+                    let col_name = match &col.expr {
+                        Expr::Identifier(ident) => ident.value.clone(),
+                        _ => return Err(H2Error::Execution("Only simple column names supported in index".to_string())),
+                    };
+                    if table_def.column_index(&col_name).is_none() {
+                        return Err(H2Error::Catalog(format!("Column '{}' not found in table '{}'", col_name, table_name)));
+                    }
+                    col_names.push(col_name);
+                }
+
+                let is_unique = create_index.unique;
+                let index_def = IndexDef {
+                    name: index_name.clone(),
+                    table_name: table_name.clone(),
+                    columns: col_names.clone(),
+                    is_unique,
+                };
+
+                self.catalog.create_index(index_def)?;
+
+                // 既存行をインデックスにロード
+                let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), index_name.to_lowercase());
+                let tbl_map_name = format!("tbl_{}", table_name.to_lowercase());
+                let entries = tx.scan_visible(&tbl_map_name)?;
+
+                let first_col_idx = table_def.column_index(&col_names[0]).unwrap();
+                let mut seen_keys = Vec::new();
+
+                for (k, val_bytes) in entries {
+                    let row = Row::from_bytes(&val_bytes)?;
+                    let col_val = row.get(first_col_idx).cloned().unwrap_or(Value::Null);
+                    let row_id = if k.len() == 8 {
+                        u64::from_le_bytes(k.as_slice().try_into().unwrap())
+                    } else {
+                        0
+                    };
+
+                    if is_unique && !col_val.is_null() {
+                        if seen_keys.contains(&col_val) {
+                            return Err(H2Error::Execution(format!("Unique constraint violation on creating index '{}'", index_name)));
+                        }
+                        seen_keys.push(col_val.clone());
+                    }
+
+
+                    let idx_key = encode_index_key(&col_val, row_id);
+                    tx.put(&idx_map_name, idx_key, vec![])?;
+                }
+
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
             Statement::Insert(insert) => {
                 let table_name = insert.table_name.to_string();
                 let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
@@ -102,6 +186,7 @@ impl SQLEngine {
                 })?;
 
                 let map_name = format!("tbl_{}", table_name.to_lowercase());
+                let indexes = self.catalog.get_table_indexes(&table_name);
 
                 let mut affected_rows = 0;
                 if let Some(source) = insert.source {
@@ -122,9 +207,32 @@ impl SQLEngine {
                                 row_values.push(casted);
                             }
 
-
                             let row_id = self.catalog.allocate_row_id(&table_name)?;
                             let row = Row::new(row_values);
+
+                            // インデックス登録 & 一意性検証
+                            for idx in &indexes {
+                                if let Some(c_idx) = table_def.column_index(&idx.columns[0]) {
+                                    let col_val = &row.values[c_idx];
+                                    let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                    if idx.is_unique && !col_val.is_null() {
+                                        let existing = tx.scan_visible(&idx_map_name)?;
+                                        for (k, _) in existing {
+                                            if let Some((v, _)) = decode_index_key(&k) {
+                                                if &v == col_val {
+                                                    return Err(H2Error::Execution(format!(
+                                                        "Unique constraint violation on index '{}': duplicate value {:?}",
+                                                        idx.name, col_val
+                                                    )));
+                                                }
+                                            }
+                                        }
+                                    }
+                                    let idx_key = encode_index_key(col_val, row_id);
+                                    tx.put(&idx_map_name, idx_key, vec![])?;
+                                }
+                            }
+
                             tx.put(&map_name, row_id.to_le_bytes().to_vec(), row.to_bytes()?)?;
                             affected_rows += 1;
                         }
@@ -148,6 +256,7 @@ impl SQLEngine {
                 })?;
 
                 let map_name = format!("tbl_{}", table_name.to_lowercase());
+                let indexes = self.catalog.get_table_indexes(&table_name);
                 let entries = tx.scan_visible(&map_name)?;
                 let mut affected_rows = 0;
 
@@ -163,6 +272,22 @@ impl SQLEngine {
                     };
 
                     if matches {
+                        let row_id = if key.len() == 8 {
+                            u64::from_le_bytes(key.as_slice().try_into().unwrap())
+                        } else {
+                            0
+                        };
+
+                        // インデックスからキー削除
+                        for idx in &indexes {
+                            if let Some(c_idx) = table_def.column_index(&idx.columns[0]) {
+                                let col_val = &row.values[c_idx];
+                                let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                let idx_key = encode_index_key(col_val, row_id);
+                                tx.remove(&idx_map_name, &idx_key)?;
+                            }
+                        }
+
                         tx.remove(&map_name, &key)?;
                         affected_rows += 1;
                     }
@@ -181,6 +306,7 @@ impl SQLEngine {
                 })?;
 
                 let map_name = format!("tbl_{}", table_name.to_lowercase());
+                let indexes = self.catalog.get_table_indexes(&table_name);
                 let entries = tx.scan_visible(&map_name)?;
                 let mut affected_rows = 0;
 
@@ -196,6 +322,13 @@ impl SQLEngine {
                     };
 
                     if matches {
+                        let row_id = if key.len() == 8 {
+                            u64::from_le_bytes(key.as_slice().try_into().unwrap())
+                        } else {
+                            0
+                        };
+                        let old_row = row.clone();
+
                         for assignment in &assignments {
                             let col_name = match &assignment.target {
                                 sqlparser::ast::AssignmentTarget::ColumnName(object_name) => object_name.to_string(),
@@ -207,7 +340,34 @@ impl SQLEngine {
                             let new_val = evaluate_expr(&assignment.value, &table_def, &row)?;
                             let casted = new_val.cast_to(&table_def.columns[col_idx].data_type)?;
                             row.values[col_idx] = casted;
+                        }
 
+                        // インデックス更新
+                        for idx in &indexes {
+                            if let Some(c_idx) = table_def.column_index(&idx.columns[0]) {
+                                let old_val = &old_row.values[c_idx];
+                                let new_val = &row.values[c_idx];
+                                let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+
+                                if idx.is_unique && !new_val.is_null() && old_val != new_val {
+                                    let existing = tx.scan_visible(&idx_map_name)?;
+                                    for (k, _) in existing {
+                                        if let Some((v, r_id)) = decode_index_key(&k) {
+                                            if &v == new_val && r_id != row_id {
+                                                return Err(H2Error::Execution(format!(
+                                                    "Unique constraint violation on index '{}': duplicate value {:?}",
+                                                    idx.name, new_val
+                                                )));
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let old_key = encode_index_key(old_val, row_id);
+                                tx.remove(&idx_map_name, &old_key)?;
+                                let new_key = encode_index_key(new_val, row_id);
+                                tx.put(&idx_map_name, new_key, vec![])?;
+                            }
                         }
 
                         tx.put(&map_name, key, row.to_bytes()?)?;
@@ -221,6 +381,7 @@ impl SQLEngine {
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }
     }
+
 
     fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
         let SetExpr::Select(select) = *query.body else {
@@ -240,18 +401,135 @@ impl SQLEngine {
             _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
         };
 
-        let base_table_def = self.catalog.get_table(&base_table_name).ok_or_else(|| {
-            H2Error::Catalog(format!("Table '{}' not found", base_table_name))
-        })?;
+        let is_info_tables = base_table_name.eq_ignore_ascii_case("information_schema.tables")
+            || base_table_name.eq_ignore_ascii_case("tables");
+        let is_info_columns = base_table_name.eq_ignore_ascii_case("information_schema.columns")
+            || base_table_name.eq_ignore_ascii_case("columns");
 
-        let map_name = format!("tbl_{}", base_table_name.to_lowercase());
-        let entries = tx.scan_visible(&map_name)?;
-        let mut current_rows = Vec::with_capacity(entries.len());
-        for (_k, val_bytes) in entries {
-            current_rows.push(Row::from_bytes(&val_bytes)?);
-        }
+        let (base_table_def, mut current_rows) = if is_info_tables {
+            let t_def = crate::catalog::TableDef::new(
+                base_table_name.clone(),
+                vec![
+                    crate::catalog::ColumnDef {
+                        name: "table_name".to_string(),
+                        data_type: h2_types::DataType::VarChar(None),
+                        is_nullable: false,
+                        is_primary_key: true,
+                    },
+                    crate::catalog::ColumnDef {
+                        name: "columns_count".to_string(),
+                        data_type: h2_types::DataType::Integer,
+                        is_nullable: false,
+                        is_primary_key: false,
+                    },
+                ],
+            );
+            let tables = self.catalog.all_tables();
+            let mut rows = Vec::new();
+            for t in tables {
+                rows.push(Row::new(vec![
+                    Value::String(t.name.clone()),
+                    Value::Integer(t.columns.len() as i32),
+                ]));
+            }
+            (t_def, rows)
+        } else if is_info_columns {
+            let t_def = crate::catalog::TableDef::new(
+                base_table_name.clone(),
+                vec![
+                    crate::catalog::ColumnDef {
+                        name: "table_name".to_string(),
+                        data_type: h2_types::DataType::VarChar(None),
+                        is_nullable: false,
+                        is_primary_key: false,
+                    },
+                    crate::catalog::ColumnDef {
+                        name: "column_name".to_string(),
+                        data_type: h2_types::DataType::VarChar(None),
+                        is_nullable: false,
+                        is_primary_key: false,
+                    },
+                    crate::catalog::ColumnDef {
+                        name: "data_type".to_string(),
+                        data_type: h2_types::DataType::VarChar(None),
+                        is_nullable: false,
+                        is_primary_key: false,
+                    },
+                    crate::catalog::ColumnDef {
+                        name: "is_nullable".to_string(),
+                        data_type: h2_types::DataType::Boolean,
+                        is_nullable: false,
+                        is_primary_key: false,
+                    },
+                ],
+            );
+            let tables = self.catalog.all_tables();
+            let mut rows = Vec::new();
+            for t in tables {
+                for c in &t.columns {
+                    rows.push(Row::new(vec![
+                        Value::String(t.name.clone()),
+                        Value::String(c.name.clone()),
+                        Value::String(c.data_type.to_string()),
+                        Value::Boolean(c.is_nullable),
+                    ]));
+                }
+            }
+            (t_def, rows)
+        } else {
+            let table_def = self.catalog.get_table(&base_table_name).ok_or_else(|| {
+                H2Error::Catalog(format!("Table '{}' not found", base_table_name))
+            })?;
+
+            let map_name = format!("tbl_{}", base_table_name.to_lowercase());
+
+            // IndexScan の最適化
+            let mut index_scanned: Option<Vec<Row>> = None;
+            if from_table.joins.is_empty() {
+                if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = &select.selection {
+                    if let Expr::Identifier(ident) = left.as_ref() {
+                        let col_name = &ident.value;
+                        let indexes = self.catalog.get_table_indexes(&base_table_name);
+                        if let Some(target_idx) = indexes.iter().find(|i| i.columns[0].eq_ignore_ascii_case(col_name)) {
+                            if let Ok(search_val) = evaluate_literal_or_unary(right) {
+                                let idx_map_name = format!("idx_{}_{}", base_table_name.to_lowercase(), target_idx.name.to_lowercase());
+                                let idx_entries = tx.scan_visible(&idx_map_name)?;
+                                let mut matched_row_ids = Vec::new();
+                                for (k, _) in idx_entries {
+                                    if let Some((v, r_id)) = decode_index_key(&k) {
+                                        if v == search_val {
+                                            matched_row_ids.push(r_id);
+                                        }
+                                    }
+                                }
+                                let mut fetched = Vec::new();
+                                for r_id in matched_row_ids {
+                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                        fetched.push(Row::from_bytes(&val_bytes)?);
+                                    }
+                                }
+                                index_scanned = Some(fetched);
+                            }
+                        }
+                    }
+                }
+            }
+
+            let rows = if let Some(r) = index_scanned {
+                r
+            } else {
+                let entries = tx.scan_visible(&map_name)?;
+                let mut current_rows = Vec::with_capacity(entries.len());
+                for (_k, val_bytes) in entries {
+                    current_rows.push(Row::from_bytes(&val_bytes)?);
+                }
+                current_rows
+            };
+            (table_def, rows)
+        };
 
         let mut ctx = RowContext::from_table_def(&base_table_def, base_table_alias.as_deref());
+
 
         // JOIN の処理
         for join in &from_table.joins {

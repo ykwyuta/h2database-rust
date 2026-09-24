@@ -15,14 +15,20 @@ Java版 [H2 Database](https://github.com/h2database/h2database) の先進的な�
   - 外部プロセスの起動や設定ファイルは不要。`h2::Connection::open("mydb.h2")?` または `h2::Connection::open_in_memory()?` の1行で利用可能。
 - **⚡ MVCC による高い並行書き込み性能**:
   - SQLiteのシングルライター制約（WAL時でも同時書き込みトランザクションは1つのみ）を打破。CoW B-Tree によるスナップショット分離と高速コミットを実現。
-- **📊 高度なSQL実行エンジン**:
-  - `UPDATE`（複数列更新・自己参照式計算）、`ORDER BY` / `LIMIT` / `OFFSET`（昇順降順・エイリアス対応）、集約関数（`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`）＆ `GROUP BY` / `HAVING`、テーブル結合（`INNER JOIN` / `LEFT OUTER JOIN`）を標準搭載。
-- **🛡️ 厳格でモダンな型システム**:
+- **📊 高度なSQL実行エンジン & インデックス**:
+  - `UPDATE`（複数列更新・自己参照式計算）、`ORDER BY` / `LIMIT` / `OFFSET`（昇順降順・エイリアス対応）、集約関数（`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`）＆ `GROUP BY` / `HAVING`、テーブル結合（`INNER JOIN` / `LEFT OUTER JOIN`）。
+  - セカンダリインデックス（`CREATE INDEX`, `CREATE UNIQUE INDEX`）、一意性制約の実行時バリデーション、**IndexScan** 高速化。
+- **📦 JSONB / ネイティブ JSON ＆ 抽出オペレータ**:
+  - `JSON` 型への保存とバリデーション、`JSON_EXTRACT` 関数、`->`（JSON抽出）および `->>`（テキスト抽出）演算子を標準サポート。
+- **🛡️ 厳格でモダンな型システム & パラメータ化クエリ**:
   - 動的型付け（Type Affinity）による不整合を防止。任意精度 `Decimal`、タイムゾーン付き `Timestamp`、ネイティブ `UUID`、`JSON` を完備。
+  - `params![...]` マクロおよび `execute_params` / `query_params` による SQL インジェクション防止と型安全なバインド。
 - **🔍 日本語対応 N-Gram & 形態素解析 全文検索 (FTS)**:
   - 外部拡張不要で、N-Gram（バイグラム）および文字種境界解析による形態素トークナイザーを内蔵。日本語テキストのインデックス作成と高速な全文検索をサポート。
-- **🔌 内蔵 PostgreSQL 互換ワイヤプロトコル (PG-Wire)**:
+- **🔌 内蔵 PostgreSQL 互換ワイヤプロトコル (PG-Wire) & INFORMATION_SCHEMA**:
   - アプリ内で組み込み動作させながら、オプションでポート5432を開放。稼働中のアプリを停止させずに **DBeaver, DataGrip, VS Code拡張, psql** から直接クエリを発行してデバッグ・管理可能。
+  - `information_schema.tables`, `information_schema.columns` システムビューを提供。
+
 
 
 ---

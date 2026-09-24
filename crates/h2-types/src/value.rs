@@ -169,7 +169,16 @@ impl Value {
                     _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to BOOLEAN", self))),
                 }
             }
+            DataType::Json => match self {
+                Value::Json(j) => Ok(Value::Json(j.clone())),
+                Value::String(s) => match serde_json::from_str(s) {
+                    Ok(j) => Ok(Value::Json(j)),
+                    Err(e) => Err(H2Error::TypeError(format!("Invalid JSON string: {}", e))),
+                },
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to JSON", self))),
+            },
             _ => Ok(self.clone()),
+
         }
     }
 }
@@ -265,3 +274,70 @@ impl std::fmt::Display for Value {
         }
     }
 }
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Value::Boolean(b)
+    }
+}
+
+impl From<i8> for Value {
+    fn from(n: i8) -> Self {
+        Value::TinyInt(n)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(n: i16) -> Self {
+        Value::SmallInt(n)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(n: i32) -> Self {
+        Value::Integer(n)
+    }
+}
+
+impl From<i64> for Value {
+    fn from(n: i64) -> Self {
+        Value::BigInt(n)
+    }
+}
+
+impl From<f32> for Value {
+    fn from(f: f32) -> Self {
+        Value::Float(f)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(f: f64) -> Self {
+        Value::Double(f)
+    }
+}
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::String(s.to_string())
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::String(s)
+    }
+}
+
+impl From<Decimal> for Value {
+    fn from(d: Decimal) -> Self {
+        Value::Decimal(d)
+    }
+}
+
+impl From<serde_json::Value> for Value {
+    fn from(j: serde_json::Value) -> Self {
+        Value::Json(j)
+    }
+}
+

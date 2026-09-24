@@ -9,7 +9,10 @@ pub mod row;
 
 
 
-pub use catalog::{Catalog, ColumnDef, TableDef};
+pub use catalog::{Catalog, ColumnDef, IndexDef, TableDef};
+
+
+
 pub use executor::{ExecutionResult, SQLEngine};
 pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
 pub use row::Row;

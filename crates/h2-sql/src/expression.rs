@@ -181,9 +181,40 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                     }
                     _ => Ok(Value::Boolean(false)),
                 }
+            } else if func_name == "JSON_EXTRACT" || func_name == "JSON_VALUE" {
+                let args = match &func.args {
+                    sqlparser::ast::FunctionArguments::List(arg_list) => &arg_list.args,
+                    _ => return Err(H2Error::Execution("Invalid function args".to_string())),
+                };
+                if args.len() < 2 {
+                    return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name)));
+                }
+                let json_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let path_val = evaluate_func_arg_context(&args[1], ctx, row)?;
+
+                let path_str = match &path_val {
+                    Value::String(s) => s.as_str(),
+                    _ => return Err(H2Error::Execution("JSON path must be a string".to_string())),
+                };
+
+                let serde_val = match &json_val {
+                    Value::Json(j) => j.clone(),
+                    Value::String(s) => match serde_json::from_str(s) {
+                        Ok(j) => j,
+                        Err(_) => return Ok(Value::Null),
+                    },
+                    _ => return Ok(Value::Null),
+                };
+
+                if let Some(target) = extract_json_path(&serde_val, path_str) {
+                    Ok(json_to_value(target))
+                } else {
+                    Ok(Value::Null)
+                }
             } else {
                 Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
             }
+
         }
         _ => Err(H2Error::Execution(format!("Unsupported expression: {:?}", expr))),
     }
@@ -298,9 +329,51 @@ pub fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
         BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide => {
             evaluate_arithmetic_op(left, op, right)
         }
+        BinaryOperator::Arrow | BinaryOperator::LongArrow => {
+            let serde_val = match left {
+                Value::Json(j) => j.clone(),
+                Value::String(s) => match serde_json::from_str(s) {
+                    Ok(j) => j,
+                    Err(_) => return Ok(Value::Null),
+                },
+                _ => return Ok(Value::Null),
+            };
+            let key = match right {
+                Value::String(s) => s.as_str(),
+                Value::Integer(i) => {
+                    if let Some(target) = serde_val.get(*i as usize) {
+                        return if matches!(op, BinaryOperator::LongArrow) {
+                            match target {
+                                serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+                                _ => Ok(Value::String(target.to_string())),
+                            }
+                        } else {
+                            Ok(Value::Json(target.clone()))
+                        };
+                    } else {
+                        return Ok(Value::Null);
+                    }
+                }
+                _ => return Ok(Value::Null),
+            };
+
+            if let Some(target) = extract_json_path(&serde_val, key) {
+                if matches!(op, BinaryOperator::LongArrow) {
+                    match target {
+                        serde_json::Value::String(s) => Ok(Value::String(s.clone())),
+                        _ => Ok(Value::String(target.to_string())),
+                    }
+                } else {
+                    Ok(Value::Json(target.clone()))
+                }
+            } else {
+                Ok(Value::Null)
+            }
+        }
         _ => Err(H2Error::Execution(format!("Unsupported operator: {:?}", op))),
     }
 }
+
 
 fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H2Result<Value> {
     if left.is_null() || right.is_null() {
@@ -369,4 +442,51 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
         }
     }
 }
+
+fn extract_json_path<'a>(json: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let clean_path = path.trim_start_matches('$').trim_start_matches('.');
+    if clean_path.is_empty() {
+        return Some(json);
+    }
+    let parts: Vec<&str> = clean_path.split('.').collect();
+    let mut curr = json;
+    for part in parts {
+        if let Some(open_bracket) = part.find('[') {
+            let key = &part[..open_bracket];
+            if !key.is_empty() {
+                curr = curr.get(key)?;
+            }
+            let close_bracket = part.find(']')?;
+            let idx_str = &part[open_bracket + 1..close_bracket];
+            let idx: usize = idx_str.parse().ok()?;
+            curr = curr.get(idx)?;
+        } else {
+            curr = curr.get(part)?;
+        }
+    }
+    Some(curr)
+}
+
+fn json_to_value(j: &serde_json::Value) -> Value {
+    match j {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    Value::Integer(i as i32)
+                } else {
+                    Value::BigInt(i)
+                }
+            } else if let Some(f) = n.as_f64() {
+                Value::Double(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s.clone()),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(j.clone()),
+    }
+}
+
 
