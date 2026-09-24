@@ -37,6 +37,8 @@ Java版 [H2 Database](https://github.com/h2database/h2database) の先進的な�
 
 - 📖 **[利用者向け公式ガイド (User's Guide)](./docs/USER_GUIDE.md)**:
   PostgreSQL 公式ドキュメント構成をベースにした網羅的ガイド。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順までを解説。
+- 🛠️ **[開発者・メンテナー向けガイド (Developer Guide)](./docs/DEVELOPER_GUIDE.md)**:
+  プロジェクトの保守・拡張を行う開発者向けガイド。内部アーキテクチャ、CoW B-Tree、MVCC・UndoLog、新規型・構文の追加手順、ロック階層とデッドロック防止ルール、テスト方針を解説。
 - 🏛️ **アーキテクチャ設計・仕様ドキュメント**:
   1. [プロジェクトビジョンと技術比較](./docs/01_overview_and_vision.md)
   2. [全体アーキテクチャ設計](./docs/02_architecture_overview.md)
