@@ -26,6 +26,8 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [5. 集約関数とグループ化 (GROUP BY, HAVING)](#5-集約関数とグループ化-group-by-having)
   - [6. 日本語対応 全文検索 (Full-Text Search: N-Gram & 形態素解析)](#6-日本語対応-全文検索-full-text-search-n-gram--形態素解析)
   - [7. メタデータ調査 (INFORMATION_SCHEMA)](#7-メタデータ調査-information_schema)
+  - [8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE)](#8-テーブル構造の変更全削除-alter-table--truncate-table)
+  - [9. 実行計画の確認とスキーマ照会 (EXPLAIN, SHOW TABLES, SHOW COLUMNS)](#9-実行計画の確認とスキーマ照会-explain-show-tables-show-columns)
 - [Part IV. トランザクションと並行性制御 (Transactions & Concurrency)](#part-iv-トランザクションと並行性制御-transactions--concurrency)
   - [1. MVCC (マルチバージョン並行性制御) の特徴](#1-mvcc-マルチバージョン並行性制御-の特徴)
   - [2. Rust API によるトランザクション (RAII 管理)](#2-rust-api-によるトランザクション-raii-管理)
@@ -373,6 +375,74 @@ WHERE table_name = 'users'
 ORDER BY ordinal_position;
 ```
 
+## 8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE)
+
+稼働中のテーブルに対するスキーマ変更（列の追加・削除、テーブル名変更）や、大量データの高速な一括削除に対応しています。
+
+### ① テーブル名の変更 (`ALTER TABLE ... RENAME TO`)
+データおよび関連インデックスを保持したままテーブル名を変更します。
+
+```sql
+ALTER TABLE customers RENAME TO clients;
+```
+
+### ② カラムの追加 (`ALTER TABLE ... ADD COLUMN`)
+既存テーブルに新しい列を追加します。既存レコードには自動的に `NULL` が補完されます。
+
+```sql
+ALTER TABLE employees ADD COLUMN department VARCHAR(50);
+```
+
+### ③ カラムの削除 (`ALTER TABLE ... DROP COLUMN`)
+テーブル定義および既存レコードから対象列のデータを安全に削除します。
+
+```sql
+ALTER TABLE users DROP COLUMN temp_token;
+```
+
+### ④ テーブルデータの全削除 (`TRUNCATE TABLE`)
+テーブルの定義およびスキーマ構造を維持したまま、格納されている全レコードおよび関連インデックスを即座に破棄し、自動採番カウンタ（Row ID）を初期化します。
+
+```sql
+TRUNCATE TABLE logs;
+```
+
+## 9. 実行計画の確認とスキーマ照会 (EXPLAIN, SHOW TABLES, SHOW COLUMNS)
+
+データベースのパフォーマンスチューニングや対話型シェルでの探索を支援する診断構文をサポートしています。
+
+### ① 実行計画の表示 (`EXPLAIN`)
+SQL クエリがどのようにスキャン（`IndexScan` vs `TableScan`）、結合（`NestedLoopJoin`）、集約、ソートされるかをテキスト形式で出力します。
+
+```sql
+EXPLAIN SELECT * FROM users WHERE email = 'test@example.com';
+```
+
+**出力例**:
+```text
++----------------------------------------------------+
+| PLAN                                               |
++----------------------------------------------------+
+| IndexScan: users on index idx_users_email          |
+| Filter: email = 'test@example.com'                 |
+| Projection: *                                      |
++----------------------------------------------------+
+```
+
+### ② テーブル一覧の照会 (`SHOW TABLES`)
+現在定義されているテーブル名を一覧表示します。
+
+```sql
+SHOW TABLES;
+```
+
+### ③ テーブルカラム定義の照会 (`SHOW COLUMNS FROM <table>`)
+指定したテーブルのカラム一覧、データ型、NULL 許可、主キー情報を取得します。
+
+```sql
+SHOW COLUMNS FROM users;
+```
+
 ---
 
 # Part IV. トランザクションと並行性制御 (Transactions & Concurrency)
@@ -589,13 +659,18 @@ async_conn.vacuum().await?;
 | コマンド | 構文例 | 概要 |
 | :--- | :--- | :--- |
 | `CREATE TABLE` | `CREATE TABLE [IF NOT EXISTS] tbl (col type, ...)` | テーブル作成（主キー、NOT NULL、デフォルト値） |
+| `ALTER TABLE` | `ALTER TABLE tbl RENAME TO new_tbl` / `ADD [COLUMN] col_def` / `DROP [COLUMN] col_name` | テーブル定義の変更（リネーム、列追加、列削除） |
 | `DROP TABLE` | `DROP TABLE [IF EXISTS] tbl` | テーブルおよび関連インデックス・マップの削除 |
+| `TRUNCATE TABLE` | `TRUNCATE TABLE tbl` | 全行およびインデックスの高速一括削除・Row ID リセット |
 | `CREATE INDEX` | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON tbl (col)` | セカンダリ・一意インデックスの作成 |
 | `DROP INDEX` | `DROP INDEX [IF EXISTS] idx` | インデックスの削除 |
 | `INSERT` | `INSERT INTO tbl [(cols)] VALUES (vals), ...` | 行の挿入 |
 | `UPDATE` | `UPDATE tbl SET col = expr, ... [WHERE cond]` | 行の更新（自己参照式、複数列対応） |
 | `DELETE` | `DELETE FROM tbl [WHERE cond]` | 行の削除 |
 | `SELECT` | `SELECT expr [AS alias], ... FROM tbl [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... OFFSET ...]` | データの問い合わせ・集計・結合 |
+| `EXPLAIN` | `EXPLAIN SELECT ...` | クエリ実行計画の確認（IndexScan / TableScan / NestedLoopJoin など） |
+| `SHOW TABLES` | `SHOW TABLES;` | 定義されている全テーブル名の一覧照会 |
+| `SHOW COLUMNS` | `SHOW COLUMNS FROM tbl;` | テーブルのカラム名・データ型・制約情報の一覧照会 |
 | `BEGIN` | `BEGIN;` / `START TRANSACTION;` | トランザクションの開始 |
 | `COMMIT` | `COMMIT;` / `END;` | トランザクションのコミット確定 |
 | `ROLLBACK` | `ROLLBACK;` | トランザクションのロールバック破棄 |

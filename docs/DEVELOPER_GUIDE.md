@@ -176,6 +176,22 @@ SQL文字列 ──► parse_sql() ──► Statement ──► SQLEngine::exec
 - **`MorphTokenizer`**: 漢字・ひらがな・カタカナ・アルファベットの文字種変化境界（Unicode Block境界）で分割し、意味のある単語トークンを抽出。
 - **転置インデックス**: 各トークンをキーとし、出現行 ID の集合（`HashSet<u64>`）を B-Tree に保持。クエリ時は複数トークンの積集合（AND 演算）で高速絞り込み。
 
+### 3.5 スキーマ変更 (ALTER TABLE) & TRUNCATE TABLE & 診断構文
+
+- **ファイル**: [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- **`ALTER TABLE ... RENAME TO`**:
+  - `tbl_<old>` から `tbl_<new>` へレコードを移行し、関連する `idx_<old>_<idx>` も `idx_<new>_<idx>` へ移行して古いマップを `store.remove_map` で破棄。カタログのテーブル定義およびインデックス定義を更新します。
+- **`ALTER TABLE ... ADD COLUMN`**:
+  - カタログの `TableDef` に新カラムを追加。既存レコードの末尾に `Value::Null` を補完して保存します。
+- **`ALTER TABLE ... DROP COLUMN`**:
+  - カタログの `TableDef` からカラムを削除。既存レコードから該当位置の値を削除して保存します。
+- **`TRUNCATE TABLE`**:
+  - テーブルマップおよび関連インデックスマップ内のキーを全件削除し、カタログの `next_row_id` を 1 にリセットします。
+- **`EXPLAIN`**:
+  - クエリ AST を解析し、スキャン種別（`IndexScan` vs `TableScan`）、結合アルゴリズム（`NestedLoopJoin`）、Filter 条件、Aggregate、Sort、Limit/Offset を分かりやすいツリー構造で出力します。
+- **`SHOW TABLES` / `SHOW COLUMNS`**:
+  - カタログ情報を走査し、対話型 CLI や GUI ツールで扱いやすい結果セット形式（Table 列、Field/Type/Null/Key 列）で返却します。
+
 ---
 
 ## 4. サーバー層 (`h2-server`) の内部仕様

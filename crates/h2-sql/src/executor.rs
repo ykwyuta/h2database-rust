@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
-use crate::catalog::{Catalog, IndexDef};
+use crate::catalog::{Catalog, ColumnDef, IndexDef};
 use crate::expression::{
     evaluate_expr, evaluate_expr_context, evaluate_literal_or_unary, ColumnBinding, RowContext,
 };
-use crate::parser::{extract_create_table, parse_sql};
+use crate::parser::{convert_data_type, extract_create_table, parse_sql};
 use crate::row::Row;
 
 pub(crate) fn encode_index_key(val: &Value, row_id: u64) -> Vec<u8> {
@@ -423,10 +423,299 @@ impl SQLEngine {
                 Ok(ExecutionResult::Ddl)
             }
             Statement::Query(query) => self.execute_query(tx, *query),
+            Statement::Truncate { table_names, .. } => {
+                for target in table_names {
+                    let table_name = target.name.to_string();
+                    let mut table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
+                        H2Error::Catalog(format!("Table '{}' not found", table_name))
+                    })?;
+
+                    let map_name = format!("tbl_{}", table_name.to_lowercase());
+                    let keys: Vec<Vec<u8>> = tx.scan_visible(&map_name)?
+                        .into_iter()
+                        .map(|(k, _)| k)
+                        .collect();
+                    for k in keys {
+                        tx.remove(&map_name, &k)?;
+                    }
+
+                    // 関連インデックスマップも全件削除
+                    let indexes = self.catalog.get_table_indexes(&table_name);
+                    for idx in indexes {
+                        let idx_map = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                        let idx_keys: Vec<Vec<u8>> = tx.scan_visible(&idx_map)?
+                            .into_iter()
+                            .map(|(k, _)| k)
+                            .collect();
+                        for k in idx_keys {
+                            tx.remove(&idx_map, &k)?;
+                        }
+                    }
+
+                    // next_row_id リセット
+                    table_def.next_row_id = 1;
+                    self.catalog.update_table(table_def)?;
+                }
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            Statement::AlterTable { name, if_exists, operations, .. } => {
+                let table_name = name.to_string();
+                if self.catalog.get_table(&table_name).is_none() {
+                    if if_exists {
+                        return Ok(ExecutionResult::Ddl);
+                    }
+                    return Err(H2Error::Catalog(format!("Table '{}' not found", table_name)));
+                }
+
+                for op in operations {
+                    match op {
+                        sqlparser::ast::AlterTableOperation::RenameTable { table_name: new_table_name } => {
+                            let new_name = new_table_name.to_string();
+                            let old_map = format!("tbl_{}", table_name.to_lowercase());
+                            let new_map = format!("tbl_{}", new_name.to_lowercase());
+
+                            let rows = tx.scan_visible(&old_map)?;
+                            for (k, v) in rows {
+                                tx.put(&new_map, k.clone(), v)?;
+                                tx.remove(&old_map, &k)?;
+                            }
+                            self.store.remove_map(&old_map);
+
+                            let indexes = self.catalog.get_table_indexes(&table_name);
+                            for idx in indexes {
+                                let old_idx_map = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                let new_idx_map = format!("idx_{}_{}", new_name.to_lowercase(), idx.name.to_lowercase());
+                                let idx_entries = tx.scan_visible(&old_idx_map)?;
+                                for (k, v) in idx_entries {
+                                    tx.put(&new_idx_map, k.clone(), v)?;
+                                    tx.remove(&old_idx_map, &k)?;
+                                }
+                                self.store.remove_map(&old_idx_map);
+                            }
+
+                            self.catalog.rename_table(&table_name, &new_name)?;
+                        }
+                        sqlparser::ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                            let mut table_def = self.catalog.get_table(&table_name).unwrap();
+                            let col_name = column_def.name.value.clone();
+                            if table_def.column_index(&col_name).is_some() {
+                                return Err(H2Error::Catalog(format!(
+                                    "Column '{}' already exists in table '{}'",
+                                    col_name, table_name
+                                )));
+                            }
+                            let dt = convert_data_type(&column_def.data_type)?;
+                            let mut is_nullable = true;
+                            for opt in &column_def.options {
+                                if matches!(opt.option, sqlparser::ast::ColumnOption::NotNull) {
+                                    is_nullable = false;
+                                }
+                            }
+                            table_def.columns.push(ColumnDef {
+                                name: col_name,
+                                data_type: dt,
+                                is_nullable,
+                                is_primary_key: false,
+                            });
+
+                            let map_name = format!("tbl_{}", table_name.to_lowercase());
+                            let entries = tx.scan_visible(&map_name)?;
+                            for (k, v) in entries {
+                                if let Ok(mut row) = Row::from_bytes(&v) {
+                                    row.values.push(Value::Null);
+                                    tx.put(&map_name, k, row.to_bytes()?)?;
+                                }
+                            }
+
+                            self.catalog.update_table(table_def)?;
+                        }
+                        sqlparser::ast::AlterTableOperation::DropColumn { column_name, if_exists: col_if_exists, .. } => {
+                            let mut table_def = self.catalog.get_table(&table_name).unwrap();
+                            let col_name = column_name.value.clone();
+                            let Some(col_idx) = table_def.column_index(&col_name) else {
+                                if col_if_exists {
+                                    continue;
+                                }
+                                return Err(H2Error::Catalog(format!(
+                                    "Column '{}' not found in table '{}'",
+                                    col_name, table_name
+                                )));
+                            };
+
+                            table_def.columns.remove(col_idx);
+
+                            let map_name = format!("tbl_{}", table_name.to_lowercase());
+                            let entries = tx.scan_visible(&map_name)?;
+                            for (k, v) in entries {
+                                if let Ok(mut row) = Row::from_bytes(&v) {
+                                    if col_idx < row.values.len() {
+                                        row.values.remove(col_idx);
+                                    }
+                                    tx.put(&map_name, k, row.to_bytes()?)?;
+                                }
+                            }
+
+                            self.catalog.update_table(table_def)?;
+                        }
+                        _ => {
+                            return Err(H2Error::Execution(format!(
+                                "Unsupported ALTER TABLE operation: {:?}",
+                                op
+                            )));
+                        }
+                    }
+                }
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            Statement::Explain { statement, .. } => {
+                let plan_str = self.explain_statement(tx, *statement)?;
+                let row = Row::new(vec![Value::String(plan_str)]);
+                Ok(ExecutionResult::Query {
+                    columns: vec!["PLAN".to_string()],
+                    rows: vec![row],
+                })
+            }
+            Statement::ShowTables { .. } => {
+                let tables = self.catalog.all_tables();
+                let rows: Vec<Row> = tables
+                    .into_iter()
+                    .map(|t| Row::new(vec![Value::String(t.name)]))
+                    .collect();
+                Ok(ExecutionResult::Query {
+                    columns: vec!["Table".to_string()],
+                    rows,
+                })
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                let table_name = if let Some(ref in_opt) = show_options.show_in {
+                    if let Some(ref parent) = in_opt.parent_name {
+                        parent.to_string()
+                    } else {
+                        return Err(H2Error::Execution("Expected table name in SHOW COLUMNS FROM <table>".to_string()));
+                    }
+                } else {
+                    return Err(H2Error::Execution("Expected table name in SHOW COLUMNS FROM <table>".to_string()));
+                };
+
+                let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
+                    H2Error::Catalog(format!("Table '{}' not found", table_name))
+                })?;
+
+                let rows: Vec<Row> = table_def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        Row::new(vec![
+                            Value::String(c.name.clone()),
+                            Value::String(c.data_type.to_string()),
+                            Value::String(if c.is_nullable { "YES".to_string() } else { "NO".to_string() }),
+                            Value::String(if c.is_primary_key { "PRI".to_string() } else { "".to_string() }),
+                        ])
+                    })
+                    .collect();
+
+                Ok(ExecutionResult::Query {
+                    columns: vec![
+                        "Field".to_string(),
+                        "Type".to_string(),
+                        "Null".to_string(),
+                        "Key".to_string(),
+                    ],
+                    rows,
+                })
+            }
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }
     }
 
+    fn explain_statement(&self, _tx: &Transaction, stmt: Statement) -> H2Result<String> {
+        match stmt {
+            Statement::Query(query) => {
+                let SetExpr::Select(select) = *query.body else {
+                    return Ok(format!("EXPLAIN: {:?}", query.body));
+                };
+
+                let mut lines = Vec::new();
+
+                // Table / Scan
+                if !select.from.is_empty() {
+                    let from_table = &select.from[0];
+                    let base_table_name = match &from_table.relation {
+                        TableFactor::Table { name, .. } => name.to_string(),
+                        _ => "unknown".to_string(),
+                    };
+
+                    let mut scan_type = format!("TableScan: {}", base_table_name);
+                    if from_table.joins.is_empty() {
+                        if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, .. }) = &select.selection {
+                            if let Expr::Identifier(ident) = left.as_ref() {
+                                let col_name = &ident.value;
+                                let indexes = self.catalog.get_table_indexes(&base_table_name);
+                                if let Some(target_idx) = indexes.iter().find(|i| i.columns[0].eq_ignore_ascii_case(col_name)) {
+                                    scan_type = format!("IndexScan: {} on index {}", base_table_name, target_idx.name);
+                                }
+                            }
+                        }
+                    }
+                    lines.push(scan_type);
+
+                    for join in &from_table.joins {
+                        let join_tbl = match &join.relation {
+                            TableFactor::Table { name, .. } => name.to_string(),
+                            _ => "unknown".to_string(),
+                        };
+                        lines.push(format!("NestedLoopJoin: {}", join_tbl));
+                    }
+                }
+
+                // Filter
+                if let Some(selection) = &select.selection {
+                    lines.push(format!("Filter: {}", selection));
+                }
+
+                // Group By
+                match &select.group_by {
+                    sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+                        let cols: Vec<String> = exprs.iter().map(|e| e.to_string()).collect();
+                        lines.push(format!("Aggregate (Group By: {})", cols.join(", ")));
+                    }
+                    _ => {}
+                }
+
+                // Having
+                if let Some(having) = &select.having {
+                    lines.push(format!("Having: {}", having));
+                }
+
+                // Order By
+                if let Some(order_by) = &query.order_by {
+                    let items: Vec<String> = order_by.exprs.iter().map(|e| e.to_string()).collect();
+                    lines.push(format!("Sort: {}", items.join(", ")));
+                }
+
+                // Limit / Offset
+                if query.limit.is_some() || query.offset.is_some() {
+                    lines.push(format!(
+                        "Limit / Offset: limit={:?}, offset={:?}",
+                        query.limit.as_ref().map(|l| l.to_string()),
+                        query.offset.as_ref().map(|o| o.value.to_string())
+                    ));
+                }
+
+                // Projection
+                let projs: Vec<String> = select.projection.iter().map(|p| p.to_string()).collect();
+                lines.push(format!("Projection: {}", projs.join(", ")));
+
+                Ok(lines.join("\n"))
+            }
+            Statement::Insert(insert) => Ok(format!("Insert into {}", insert.table_name)),
+            Statement::Update { table, .. } => Ok(format!("Update {}", table.relation)),
+            Statement::Delete(_) => Ok("Delete".to_string()),
+            _ => Ok(format!("Statement: {:?}", stmt)),
+        }
+    }
 
     fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
         let SetExpr::Select(select) = *query.body else {

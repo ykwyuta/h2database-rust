@@ -151,6 +151,56 @@ impl Catalog {
         Ok(dropped_maps)
     }
 
+    pub fn update_table(&self, table_def: TableDef) -> H2Result<()> {
+        let name_key = table_def.name.to_lowercase();
+        let mut tables = self.tables.write();
+        if !tables.contains_key(&name_key) {
+            return Err(H2Error::Catalog(format!("Table '{}' not found", table_def.name)));
+        }
+
+        let serialized = serde_json::to_vec(&table_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
+        tables.insert(name_key, table_def);
+
+        Ok(())
+    }
+
+    pub fn rename_table(&self, old_name: &str, new_name: &str) -> H2Result<()> {
+        let old_key = old_name.to_lowercase();
+        let new_key = new_name.to_lowercase();
+        let mut tables = self.tables.write();
+
+        let mut table_def = tables.remove(&old_key).ok_or_else(|| {
+            H2Error::Catalog(format!("Table '{}' not found", old_name))
+        })?;
+
+        if tables.contains_key(&new_key) {
+            return Err(H2Error::Catalog(format!("Table '{}' already exists", new_name)));
+        }
+
+        self.catalog_map.remove(format!("tbl:{}", old_key).as_bytes());
+        table_def.name = new_name.to_string();
+
+        let serialized = serde_json::to_vec(&table_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("tbl:{}", new_key).into_bytes(), serialized);
+        tables.insert(new_key.clone(), table_def);
+
+        // 関連インデックスの table_name も更新
+        let mut indexes = self.indexes.write();
+        for (_, idx) in indexes.iter_mut() {
+            if idx.table_name.eq_ignore_ascii_case(&old_key) {
+                idx.table_name = new_name.to_string();
+                let serialized_idx = serde_json::to_vec(&*idx)
+                    .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                self.catalog_map.put(format!("idx:{}", idx.name.to_lowercase()).into_bytes(), serialized_idx);
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn create_index(&self, index_def: IndexDef) -> H2Result<()> {
         let name_key = index_def.name.to_lowercase();
         let mut indexes = self.indexes.write();
