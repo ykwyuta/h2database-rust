@@ -377,6 +377,51 @@ impl SQLEngine {
 
                 Ok(ExecutionResult::Dml { affected_rows })
             }
+            Statement::Drop {
+                object_type,
+                names,
+                if_exists,
+                ..
+            } => {
+                match object_type {
+                    sqlparser::ast::ObjectType::Table => {
+                        for name in names {
+                            let table_name = name.to_string();
+                            if self.catalog.get_table(&table_name).is_none() {
+                                if if_exists {
+                                    continue;
+                                }
+                                return Err(H2Error::Catalog(format!("Table '{}' not found", table_name)));
+                            }
+                            let dropped_maps = self.catalog.drop_table(&table_name)?;
+                            for map_name in dropped_maps {
+                                self.store.remove_map(&map_name);
+                            }
+                        }
+                    }
+                    sqlparser::ast::ObjectType::Index => {
+                        for name in names {
+                            let index_name = name.to_string();
+                            if self.catalog.get_index(&index_name).is_none() {
+                                if if_exists {
+                                    continue;
+                                }
+                                return Err(H2Error::Catalog(format!("Index '{}' not found", index_name)));
+                            }
+                            let map_name = self.catalog.drop_index(&index_name)?;
+                            self.store.remove_map(&map_name);
+                        }
+                    }
+                    _ => {
+                        return Err(H2Error::Execution(format!(
+                            "Unsupported DROP object type: {:?}",
+                            object_type
+                        )));
+                    }
+                }
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
             Statement::Query(query) => self.execute_query(tx, *query),
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use h2_types::{H2Error, H2Result, Value};
+use h2_types::{FromSql, H2Error, H2Result, Value};
 
 /// データベース内の1行
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -14,6 +14,18 @@ impl Row {
 
     pub fn get(&self, index: usize) -> Option<&Value> {
         self.values.get(index)
+    }
+
+    /// 指定したカラムの値を型安全にデシリアライズして取得
+    pub fn get_as<T: FromSql>(&self, index: usize) -> H2Result<T> {
+        let val = self.values.get(index).ok_or_else(|| {
+            H2Error::Execution(format!(
+                "Column index {} out of range (row has {} columns)",
+                index,
+                self.values.len()
+            ))
+        })?;
+        T::from_sql(val)
     }
 
     pub fn len(&self) -> usize {

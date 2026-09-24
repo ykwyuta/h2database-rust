@@ -4,13 +4,48 @@ use std::sync::Arc;
 
 pub use h2_mvstore::{MVStore, TransactionStatus};
 pub use h2_sql::{ExecutionResult, Row, SQLEngine};
-pub use h2_types::{DataType, H2Error, H2Result, Value};
+pub use h2_types::{DataType, FromSql, H2Error, H2Result, Value};
+
+#[cfg(feature = "async")]
+pub mod async_conn;
+#[cfg(feature = "async")]
+pub use async_conn::{AsyncConnection, AsyncTransaction};
 
 /// エルゴノミックなデータベース接続ハンドル
 #[derive(Clone)]
 pub struct Connection {
     store: Arc<MVStore>,
     engine: Arc<SQLEngine>,
+    current_tx: Arc<parking_lot::Mutex<Option<h2_mvstore::Transaction>>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TxCommand {
+    Begin,
+    Commit,
+    Rollback,
+    Other,
+}
+
+fn parse_tx_command(sql: &str) -> TxCommand {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.eq_ignore_ascii_case("BEGIN")
+        || trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+        || trimmed.eq_ignore_ascii_case("START TRANSACTION")
+    {
+        TxCommand::Begin
+    } else if trimmed.eq_ignore_ascii_case("COMMIT")
+        || trimmed.eq_ignore_ascii_case("COMMIT TRANSACTION")
+        || trimmed.eq_ignore_ascii_case("END")
+    {
+        TxCommand::Commit
+    } else if trimmed.eq_ignore_ascii_case("ROLLBACK")
+        || trimmed.eq_ignore_ascii_case("ROLLBACK TRANSACTION")
+    {
+        TxCommand::Rollback
+    } else {
+        TxCommand::Other
+    }
 }
 
 /// エルゴノミックなパラメータ構築マクロ
@@ -93,7 +128,7 @@ pub fn bind_params(sql: &str, params: &[Value]) -> H2Result<String> {
             };
 
             let val = &params[param_idx];
-            result.push_str(&val.to_string());
+            result.push_str(&value_to_sql_literal(val));
             continue;
         }
 
@@ -104,28 +139,97 @@ pub fn bind_params(sql: &str, params: &[Value]) -> H2Result<String> {
     Ok(result)
 }
 
+fn value_to_sql_literal(val: &Value) -> String {
+    match val {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+        Value::TinyInt(n) => n.to_string(),
+        Value::SmallInt(n) => n.to_string(),
+        Value::Integer(n) => n.to_string(),
+        Value::BigInt(n) => n.to_string(),
+        Value::Float(n) => n.to_string(),
+        Value::Double(n) => n.to_string(),
+        Value::Decimal(d) => d.to_string(),
+        Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Uuid(u) => format!("'{}'", u),
+        Value::Date(d) => format!("'{}'", d),
+        Value::Time(t) => format!("'{}'", t),
+        Value::Timestamp(dt) => format!("'{}'", dt),
+        Value::Json(j) => format!("'{}'", j.to_string().replace('\'', "''")),
+        Value::Bytes(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
+        Value::Array(arr) => format!(
+            "[{}]",
+            arr.iter().map(value_to_sql_literal).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
 impl Connection {
     /// ファイルベースのデータベースを開く（存在しない場合は自動生成）
     pub fn open<P: AsRef<Path>>(path: P) -> H2Result<Self> {
         let store = Arc::new(MVStore::open(path)?);
         let engine = Arc::new(SQLEngine::new(Arc::clone(&store))?);
-        Ok(Self { store, engine })
+        Ok(Self {
+            store,
+            engine,
+            current_tx: Arc::new(parking_lot::Mutex::new(None)),
+        })
     }
 
     /// インメモリデータベースを開く
     pub fn open_in_memory() -> H2Result<Self> {
         let store = Arc::new(MVStore::open_in_memory());
         let engine = Arc::new(SQLEngine::new(Arc::clone(&store))?);
-        Ok(Self { store, engine })
+        Ok(Self {
+            store,
+            engine,
+            current_tx: Arc::new(parking_lot::Mutex::new(None)),
+        })
     }
 
-    /// DDLやDML（INSERT/UPDATE/DELETE）文を実行し、影響行数を返す
+    /// DDLやDML文、または明示的トランザクション制御文（BEGIN/COMMIT/ROLLBACK）を実行
     pub fn execute(&self, sql: &str) -> H2Result<u64> {
-        match self.engine.execute(sql)? {
-            ExecutionResult::Ddl => Ok(0),
-            ExecutionResult::Dml { affected_rows } => Ok(affected_rows),
-            ExecutionResult::Query { .. } => {
-                Err(H2Error::Execution("Use query() for SELECT statements".to_string()))
+        match parse_tx_command(sql) {
+            TxCommand::Begin => {
+                let mut guard = self.current_tx.lock();
+                if guard.is_some() {
+                    return Err(H2Error::Transaction(
+                        "Transaction is already in progress".to_string(),
+                    ));
+                }
+                *guard = Some(self.engine.tx_store().begin());
+                Ok(0)
+            }
+            TxCommand::Commit => {
+                let mut guard = self.current_tx.lock();
+                let tx = guard.take().ok_or_else(|| {
+                    H2Error::Transaction("No active transaction to commit".to_string())
+                })?;
+                tx.commit()?;
+                Ok(0)
+            }
+            TxCommand::Rollback => {
+                let mut guard = self.current_tx.lock();
+                let tx = guard.take().ok_or_else(|| {
+                    H2Error::Transaction("No active transaction to rollback".to_string())
+                })?;
+                tx.rollback()?;
+                Ok(0)
+            }
+            TxCommand::Other => {
+                let guard = self.current_tx.lock();
+                let res = if let Some(ref tx) = *guard {
+                    self.engine.execute_with_tx(tx, sql)?
+                } else {
+                    self.engine.execute(sql)?
+                };
+                match res {
+                    ExecutionResult::Ddl => Ok(0),
+                    ExecutionResult::Dml { affected_rows } => Ok(affected_rows),
+                    ExecutionResult::Query { .. } => {
+                        Err(H2Error::Execution("Use query() for SELECT statements".to_string()))
+                    }
+                }
             }
         }
     }
@@ -138,10 +242,21 @@ impl Connection {
 
     /// クエリ（SELECT）文を実行し、行リストを返す
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
-        match self.engine.execute(sql)? {
+        let guard = self.current_tx.lock();
+        let res = if let Some(ref tx) = *guard {
+            self.engine.execute_with_tx(tx, sql)?
+        } else {
+            self.engine.execute(sql)?
+        };
+        match res {
             ExecutionResult::Query { rows, .. } => Ok(rows),
             _ => Err(H2Error::Execution("Use execute() for DDL/DML statements".to_string())),
         }
+    }
+
+    /// 現在明示的トランザクション中（BEGIN実行後、未COMMIT/ROLLBACK）であるか確認
+    pub fn in_transaction(&self) -> bool {
+        self.current_tx.lock().is_some()
     }
 
     /// パラメータ付きでクエリを実行

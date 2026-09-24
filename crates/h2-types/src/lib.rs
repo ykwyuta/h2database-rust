@@ -4,7 +4,7 @@ pub mod value;
 
 pub use data_type::DataType;
 pub use error::{H2Error, H2Result};
-pub use value::Value;
+pub use value::{FromSql, Value};
 
 #[cfg(test)]
 mod tests {

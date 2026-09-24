@@ -76,6 +76,11 @@ impl MVStore {
         }
     }
 
+    /// 名前付きマップを削除
+    pub fn remove_map(&self, name: &str) -> bool {
+        self.maps.write().remove(name).is_some()
+    }
+
     /// 現在の全マップの変更をファイルに追記コミット
     pub fn commit(&self) -> H2Result<u64> {
         let mut ver_guard = self.version.write();

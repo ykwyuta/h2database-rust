@@ -11,11 +11,15 @@ h2-mvstore = { path = "../h2-mvstore" }
 h2-sql = { path = "../h2-sql" }
 h2-server = { path = "../h2-server", optional = true }
 tokio = { workspace = true, optional = true }
+parking_lot = { workspace = true }
 
 [features]
-default = ["server"]
+default = ["server", "async"]
 server = ["dep:h2-server", "dep:tokio"]
+async = ["dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3.14"
 tokio = { workspace = true, features = ["full"] }
+rust_decimal = { workspace = true }
+uuid = { workspace = true }

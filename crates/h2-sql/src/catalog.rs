@@ -122,6 +122,35 @@ impl Catalog {
         self.tables.read().values().cloned().collect()
     }
 
+    pub fn drop_table(&self, name: &str) -> H2Result<Vec<String>> {
+        let name_key = name.to_lowercase();
+        let mut tables = self.tables.write();
+        if !tables.contains_key(&name_key) {
+            return Err(H2Error::Catalog(format!("Table '{}' not found", name)));
+        }
+
+        tables.remove(&name_key);
+        self.catalog_map.remove(format!("tbl:{}", name_key).as_bytes());
+
+        let mut dropped_maps = vec![format!("tbl_{}", name_key)];
+
+        let mut indexes = self.indexes.write();
+        let idx_keys_to_remove: Vec<String> = indexes
+            .iter()
+            .filter(|(_, idx)| idx.table_name.eq_ignore_ascii_case(&name_key))
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for idx_key in idx_keys_to_remove {
+            if let Some(idx_def) = indexes.remove(&idx_key) {
+                self.catalog_map.remove(format!("idx:{}", idx_key).as_bytes());
+                dropped_maps.push(format!("idx_{}_{}", name_key, idx_def.name.to_lowercase()));
+            }
+        }
+
+        Ok(dropped_maps)
+    }
+
     pub fn create_index(&self, index_def: IndexDef) -> H2Result<()> {
         let name_key = index_def.name.to_lowercase();
         let mut indexes = self.indexes.write();
@@ -158,6 +187,17 @@ impl Catalog {
 
     pub fn all_indexes(&self) -> Vec<IndexDef> {
         self.indexes.read().values().cloned().collect()
+    }
+
+    pub fn drop_index(&self, name: &str) -> H2Result<String> {
+        let name_key = name.to_lowercase();
+        let mut indexes = self.indexes.write();
+        let idx_def = indexes.remove(&name_key).ok_or_else(|| {
+            H2Error::Catalog(format!("Index '{}' not found", name))
+        })?;
+
+        self.catalog_map.remove(format!("idx:{}", name_key).as_bytes());
+        Ok(format!("idx_{}_{}", idx_def.table_name.to_lowercase(), idx_def.name.to_lowercase()))
     }
 
     pub fn allocate_row_id(&self, table_name: &str) -> H2Result<u64> {

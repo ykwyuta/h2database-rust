@@ -222,8 +222,11 @@ dependencies = [
  "h2-server",
  "h2-sql",
  "h2-types",
+ "parking_lot",
+ "rust_decimal",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
