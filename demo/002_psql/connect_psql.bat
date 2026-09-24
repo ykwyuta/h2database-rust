@@ -1,0 +1,3 @@
+@echo off
+echo Connecting to H2 PostgreSQL wire server via psql...
+psql -h 127.0.0.1 -p 5432 -U postgres -d mydb

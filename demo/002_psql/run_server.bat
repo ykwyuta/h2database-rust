@@ -1,0 +1,3 @@
+@echo off
+echo Starting PostgreSQL Wire Protocol Demo Server...
+cargo run --manifest-path ..\..\Cargo.toml -p demo-psql-server

@@ -1,0 +1,10 @@
+[package]
+name = "demo-embedded-async"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+h2 = { path = "../../crates/h2", features = ["async"] }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

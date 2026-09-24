@@ -6,6 +6,9 @@ members = [
     "crates/h2-server",
     "crates/h2-cli",
     "crates/h2",
+    "demo/002_psql",
+    "demo/003_embedded_sync",
+    "demo/004_embedded_async",
 ]
 resolver = "2"
 

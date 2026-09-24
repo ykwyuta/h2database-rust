@@ -341,6 +341,12 @@ impl From<serde_json::Value> for Value {
     }
 }
 
+impl From<Uuid> for Value {
+    fn from(u: Uuid) -> Self {
+        Value::Uuid(u)
+    }
+}
+
 /// SQL クエリ結果の Value から Rust のネイティブ型へ型安全にデシリアライズするトレイト
 pub trait FromSql: Sized {
     fn from_sql(val: &Value) -> H2Result<Self>;
