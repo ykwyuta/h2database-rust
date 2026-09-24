@@ -11,12 +11,15 @@ pub mod async_conn;
 #[cfg(feature = "async")]
 pub use async_conn::{AsyncConnection, AsyncTransaction};
 
+use std::time::Duration;
+
 /// エルゴノミックなデータベース接続ハンドル
 #[derive(Clone)]
 pub struct Connection {
     store: Arc<MVStore>,
     engine: Arc<SQLEngine>,
     current_tx: Arc<parking_lot::Mutex<Option<h2_mvstore::Transaction>>>,
+    default_query_timeout: Arc<parking_lot::RwLock<Option<Duration>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,6 +27,7 @@ enum TxCommand {
     Begin,
     Commit,
     Rollback,
+    SetStatementTimeout(u64),
     Other,
 }
 
@@ -43,10 +47,30 @@ fn parse_tx_command(sql: &str) -> TxCommand {
         || trimmed.eq_ignore_ascii_case("ROLLBACK TRANSACTION")
     {
         TxCommand::Rollback
+    } else if let Some(ms) = parse_set_timeout(trimmed) {
+        TxCommand::SetStatementTimeout(ms)
     } else {
         TxCommand::Other
     }
 }
+
+fn parse_set_timeout(sql: &str) -> Option<u64> {
+    let parts: Vec<&str> = sql.split_whitespace().collect();
+    if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("SET") {
+        let var = parts[1].to_ascii_lowercase();
+        if var == "statement_timeout" || var == "query_timeout" {
+            let val_str = parts.iter().skip(2)
+                .filter(|&&s| s != "=" && !s.eq_ignore_ascii_case("TO"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join("");
+            let val_clean = val_str.trim_matches('\'').trim_end_matches("ms");
+            return val_clean.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
 
 /// エルゴノミックなパラメータ構築マクロ
 #[macro_export]
@@ -173,6 +197,7 @@ impl Connection {
             store,
             engine,
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
+            default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -184,6 +209,7 @@ impl Connection {
             store,
             engine,
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
+            default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -193,6 +219,7 @@ impl Connection {
             store: Arc::clone(&self.store),
             engine: Arc::clone(&self.engine),
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
+            default_query_timeout: Arc::new(parking_lot::RwLock::new(*self.default_query_timeout.read())),
         }
     }
 
@@ -201,9 +228,34 @@ impl Connection {
         self.engine.tx_store().set_lock_timeout_ms(ms);
     }
 
+    /// セッション全体のデフォルトクエリタイムアウトを設定（None または 0 で無制限）
+    pub fn set_query_timeout(&self, timeout: Option<Duration>) {
+        *self.default_query_timeout.write() = timeout;
+    }
 
-    /// DDLやDML文、または明示的トランザクション制御文（BEGIN/COMMIT/ROLLBACK）を実行
+    /// セッション全体のデフォルトクエリタイムアウトをミリ秒単位で設定（0 で無制限）
+    pub fn set_query_timeout_ms(&self, ms: u64) {
+        let timeout = if ms == 0 { None } else { Some(Duration::from_millis(ms)) };
+        self.set_query_timeout(timeout);
+    }
+
+    /// 現在設定されているデフォルトクエリタイムアウトを取得
+    pub fn query_timeout_duration(&self) -> Option<Duration> {
+        *self.default_query_timeout.read()
+    }
+
+    fn setup_timeout_guard(&self) -> Option<h2_types::TimeoutGuard> {
+        if h2_types::remaining_query_timeout().is_none() {
+            if let Some(timeout) = *self.default_query_timeout.read() {
+                return Some(h2_types::set_query_timeout(Some(timeout)));
+            }
+        }
+        None
+    }
+
+    /// DDLやDML文、または明示的トランザクション制御文（BEGIN/COMMIT/ROLLBACK/SET）を実行
     pub fn execute(&self, sql: &str) -> H2Result<u64> {
+        let _guard = self.setup_timeout_guard();
         match parse_tx_command(sql) {
             TxCommand::Begin => {
                 let mut guard = self.current_tx.lock();
@@ -231,6 +283,10 @@ impl Connection {
                 tx.rollback()?;
                 Ok(0)
             }
+            TxCommand::SetStatementTimeout(ms) => {
+                self.set_query_timeout_ms(ms);
+                Ok(0)
+            }
             TxCommand::Other => {
                 let guard = self.current_tx.lock();
                 let res = if let Some(ref tx) = *guard {
@@ -249,14 +305,28 @@ impl Connection {
         }
     }
 
+    /// タイムアウトを指定して DDL/DML 文を実行
+    pub fn execute_timeout(&self, sql: &str, timeout: Duration) -> H2Result<u64> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.execute(sql)
+    }
+
     /// パラメータ付きで DDL/DML 文を実行
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
+        let _guard = self.setup_timeout_guard();
         let bound = bind_params(sql, params)?;
         self.execute(&bound)
     }
 
+    /// タイムアウトおよびパラメータを指定して DDL/DML 文を実行
+    pub fn execute_params_timeout(&self, sql: &str, params: &[Value], timeout: Duration) -> H2Result<u64> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.execute_params(sql, params)
+    }
+
     /// クエリ（SELECT）文を実行し、行リストを返す
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
+        let _guard = self.setup_timeout_guard();
         let guard = self.current_tx.lock();
         let res = if let Some(ref tx) = *guard {
             self.engine.execute_with_tx(tx, sql)?
@@ -269,6 +339,12 @@ impl Connection {
         }
     }
 
+    /// タイムアウトを指定してクエリ（SELECT）文を実行
+    pub fn query_timeout(&self, sql: &str, timeout: Duration) -> H2Result<Vec<Row>> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.query(sql)
+    }
+
     /// 現在明示的トランザクション中（BEGIN実行後、未COMMIT/ROLLBACK）であるか確認
     pub fn in_transaction(&self) -> bool {
         self.current_tx.lock().is_some()
@@ -276,10 +352,16 @@ impl Connection {
 
     /// パラメータ付きでクエリを実行
     pub fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
+        let _guard = self.setup_timeout_guard();
         let bound = bind_params(sql, params)?;
         self.query(&bound)
     }
 
+    /// タイムアウトおよびパラメータを指定してクエリを実行
+    pub fn query_params_timeout(&self, sql: &str, params: &[Value], timeout: Duration) -> H2Result<Vec<Row>> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.query_params(sql, params)
+    }
 
     /// 新規トランザクションを開始（スナップショット分離）
     pub fn transaction(&self) -> H2Result<Transaction> {
@@ -287,6 +369,7 @@ impl Connection {
         Ok(Transaction {
             inner: Some(inner_tx),
             engine: Arc::clone(&self.engine),
+            default_query_timeout: *self.default_query_timeout.read(),
         })
     }
 
@@ -316,11 +399,22 @@ impl Connection {
 pub struct Transaction {
     inner: Option<h2_mvstore::Transaction>,
     engine: Arc<SQLEngine>,
+    default_query_timeout: Option<Duration>,
 }
 
 impl Transaction {
+    fn setup_timeout_guard(&self) -> Option<h2_types::TimeoutGuard> {
+        if h2_types::remaining_query_timeout().is_none() {
+            if let Some(timeout) = self.default_query_timeout {
+                return Some(h2_types::set_query_timeout(Some(timeout)));
+            }
+        }
+        None
+    }
+
     /// トランザクション内で DDL/DML 文を実行
     pub fn execute(&self, sql: &str) -> H2Result<u64> {
+        let _guard = self.setup_timeout_guard();
         let tx = self.inner.as_ref().ok_or_else(|| {
             H2Error::Transaction("Transaction is already closed".to_string())
         })?;
@@ -334,14 +428,28 @@ impl Transaction {
         }
     }
 
+    /// タイムアウトを指定してトランザクション内で DDL/DML 文を実行
+    pub fn execute_timeout(&self, sql: &str, timeout: Duration) -> H2Result<u64> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.execute(sql)
+    }
+
     /// トランザクション内でパラメータ付き DDL/DML 文を実行
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
+        let _guard = self.setup_timeout_guard();
         let bound = bind_params(sql, params)?;
         self.execute(&bound)
     }
 
+    /// タイムアウトおよびパラメータを指定してトランザクション内で DDL/DML 文を実行
+    pub fn execute_params_timeout(&self, sql: &str, params: &[Value], timeout: Duration) -> H2Result<u64> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.execute_params(sql, params)
+    }
+
     /// トランザクション内でクエリ（SELECT）を実行
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
+        let _guard = self.setup_timeout_guard();
         let tx = self.inner.as_ref().ok_or_else(|| {
             H2Error::Transaction("Transaction is already closed".to_string())
         })?;
@@ -352,12 +460,24 @@ impl Transaction {
         }
     }
 
+    /// タイムアウトを指定してトランザクション内でクエリを実行
+    pub fn query_timeout(&self, sql: &str, timeout: Duration) -> H2Result<Vec<Row>> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.query(sql)
+    }
+
     /// トランザクション内でパラメータ付きクエリを実行
     pub fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
+        let _guard = self.setup_timeout_guard();
         let bound = bind_params(sql, params)?;
         self.query(&bound)
     }
 
+    /// タイムアウトおよびパラメータを指定してトランザクション内でクエリを実行
+    pub fn query_params_timeout(&self, sql: &str, params: &[Value], timeout: Duration) -> H2Result<Vec<Row>> {
+        let _guard = h2_types::set_query_timeout(Some(timeout));
+        self.query_params(sql, params)
+    }
 
     /// トランザクションをコミットして変更を確定
     pub fn commit(mut self) -> H2Result<()> {

@@ -423,6 +423,51 @@ graph TD
 
 ---
 
+### クエリ単位のタイムアウト機構 (Query / Statement Timeout Architecture)
+
+クエリが長時間実行されたり、他トランザクションの行ロック待ちでブロックされ続けたりする状態を防ぐため、ゼロコストなスレッドローカルデッドライン管理とロック待機連動を組み合わせたタイムアウト機構を実装しています。
+
+```mermaid
+graph TD
+    Client["クライアント呼び出し (query_timeout / execute_timeout)"]
+    Guard["h2_types::set_query_timeout(timeout) -> TimeoutGuard (RAII)"]
+    TL["thread_local! QUERY_DEADLINE = Instant::now() + timeout"]
+
+    Scan["B-Tree スキャン走査 (scan_visible)"]
+    Exec["SQL 実行パイプライン (execute_statement / CTE)"]
+    LockWait["ストレージ行ロック待機 (Transaction::put / remove)"]
+
+    Check["check_query_timeout()? (Instant::now() >= deadline)"]
+    MinTimeout["min(lock_timeout, remaining_query_timeout)"]
+
+    Client --> Guard --> TL
+    TL -.-> Scan
+    TL -.-> Exec
+    TL -.-> LockWait
+
+    Scan --> Check
+    Exec --> Check
+    LockWait --> MinTimeout
+
+    Check -->|"超過時"| Err["Err(H2Error::QueryTimeout)"]
+    MinTimeout -->|"待機時間切れ"| Err
+```
+
+#### 1. スレッドローカル・デッドライン管理 (`h2_types::timeout`)
+- `thread_local!` を用いてカレントスレッドの実行終了予定時刻（`Instant`）を `RefCell<Option<Instant>>` として保持。
+- `TimeoutGuard` による RAII 管理を行い、クエリ終了時（正常完了・早期リターン・パニック問わず）にデッドラインを確実に `None` にリセット。シグネチャの侵食やメモリリークを完全防止。
+
+#### 2. ストレージ層ロック待機との自動連動
+- トランザクションが排他行ロックを獲得できず `wait_timeout` に入る際、`remaining_query_timeout()` を取得。
+- ロック待機時間を `min(lock_timeout, remaining_query_timeout)` に動的短縮。
+- これにより、グローバルなロック待機タイムアウト（例: 5,000ms）に関係なく、クエリ単位で指定された制限時間（例: 50ms）が経過した瞬間に待機を打ち切り、`H2Error::QueryTimeout` を即時返却。
+
+#### 3. スキャン走査・評価ループでのチェック
+- `scan_visible` のエントリ反復走査ループや `execute_statement`、`execute_query_with_ctes` の先頭で `h2_types::check_query_timeout()?` をインライン呼び出し。
+- 大量データ処理や複雑な結合・集約の実行途中であっても、タイムアウト超過を即座に検知して CPU 浪費を停止。
+
+---
+
 ## 8. テスト戦略と品質保証
 
 本プロジェクトでは、コードの堅牢性を担保するため多層的なテストスイートを備えています。

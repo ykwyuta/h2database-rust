@@ -139,6 +139,7 @@ impl SQLEngine {
     }
 
     fn execute_statement(&self, tx: &Transaction, stmt: Statement) -> H2Result<ExecutionResult> {
+        h2_types::check_query_timeout()?;
         match stmt {
             Statement::CreateView {
                 or_replace,
@@ -1206,6 +1207,7 @@ impl SQLEngine {
         query: Query,
         parent_ctes: &HashMap<String, (TableDef, Vec<Row>)>,
     ) -> H2Result<ExecutionResult> {
+        h2_types::check_query_timeout()?;
         let mut current_ctes = parent_ctes.clone();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {

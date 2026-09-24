@@ -36,12 +36,31 @@ impl AsyncConnection {
             .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
     }
 
+    /// タイムアウトを指定して DDL/DML 文を非同期に実行
+    pub async fn execute_timeout(&self, sql: &str, timeout: std::time::Duration) -> H2Result<u64> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || conn.execute_timeout(&sql, timeout))
+            .await
+            .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
     /// パラメータ付きで DDL/DML 文を非同期に実行
     pub async fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
         let conn = self.conn.clone();
         let sql = sql.to_string();
         let params = params.to_vec();
         tokio::task::spawn_blocking(move || conn.execute_params(&sql, &params))
+            .await
+            .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
+    /// タイムアウトおよびパラメータを指定して DDL/DML 文を非同期に実行
+    pub async fn execute_params_timeout(&self, sql: &str, params: &[Value], timeout: std::time::Duration) -> H2Result<u64> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        tokio::task::spawn_blocking(move || conn.execute_params_timeout(&sql, &params, timeout))
             .await
             .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
     }
@@ -55,6 +74,15 @@ impl AsyncConnection {
             .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
     }
 
+    /// タイムアウトを指定してクエリ（SELECT）文を非同期に実行
+    pub async fn query_timeout(&self, sql: &str, timeout: std::time::Duration) -> H2Result<Vec<Row>> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || conn.query_timeout(&sql, timeout))
+            .await
+            .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
     /// パラメータ付きでクエリを非同期に実行
     pub async fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
         let conn = self.conn.clone();
@@ -63,6 +91,26 @@ impl AsyncConnection {
         tokio::task::spawn_blocking(move || conn.query_params(&sql, &params))
             .await
             .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
+    /// タイムアウトおよびパラメータを指定してクエリを非同期に実行
+    pub async fn query_params_timeout(&self, sql: &str, params: &[Value], timeout: std::time::Duration) -> H2Result<Vec<Row>> {
+        let conn = self.conn.clone();
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        tokio::task::spawn_blocking(move || conn.query_params_timeout(&sql, &params, timeout))
+            .await
+            .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
+    /// セッション全体のデフォルトクエリタイムアウトを設定
+    pub fn set_query_timeout(&self, timeout: Option<std::time::Duration>) {
+        self.conn.set_query_timeout(timeout);
+    }
+
+    /// セッション全体のデフォルトクエリタイムアウトをミリ秒単位で設定
+    pub fn set_query_timeout_ms(&self, ms: u64) {
+        self.conn.set_query_timeout_ms(ms);
     }
 
     /// 新規非同期トランザクションを開始
@@ -112,6 +160,21 @@ impl AsyncTransaction {
         .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
     }
 
+    /// タイムアウトを指定してトランザクション内で DDL/DML 文を非同期実行
+    pub async fn execute_timeout(&self, sql: &str, timeout: std::time::Duration) -> H2Result<u64> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock();
+            let tx = guard.as_ref().ok_or_else(|| {
+                H2Error::Transaction("Transaction is already closed".to_string())
+            })?;
+            tx.execute_timeout(&sql, timeout)
+        })
+        .await
+        .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
     /// トランザクション内でパラメータ付き DDL/DML 文を非同期実行
     pub async fn execute_params(&self, sql: &str, params: &[Value]) -> H2Result<u64> {
         let inner = Arc::clone(&self.inner);
@@ -123,6 +186,22 @@ impl AsyncTransaction {
                 H2Error::Transaction("Transaction is already closed".to_string())
             })?;
             tx.execute_params(&sql, &params)
+        })
+        .await
+        .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
+    /// タイムアウトおよびパラメータを指定してトランザクション内で DDL/DML 文を非同期実行
+    pub async fn execute_params_timeout(&self, sql: &str, params: &[Value], timeout: std::time::Duration) -> H2Result<u64> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock();
+            let tx = guard.as_ref().ok_or_else(|| {
+                H2Error::Transaction("Transaction is already closed".to_string())
+            })?;
+            tx.execute_params_timeout(&sql, &params, timeout)
         })
         .await
         .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
@@ -143,6 +222,21 @@ impl AsyncTransaction {
         .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
     }
 
+    /// タイムアウトを指定してトランザクション内でクエリ（SELECT）を非同期実行
+    pub async fn query_timeout(&self, sql: &str, timeout: std::time::Duration) -> H2Result<Vec<Row>> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock();
+            let tx = guard.as_ref().ok_or_else(|| {
+                H2Error::Transaction("Transaction is already closed".to_string())
+            })?;
+            tx.query_timeout(&sql, timeout)
+        })
+        .await
+        .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
     /// トランザクション内でパラメータ付きクエリを非同期実行
     pub async fn query_params(&self, sql: &str, params: &[Value]) -> H2Result<Vec<Row>> {
         let inner = Arc::clone(&self.inner);
@@ -154,6 +248,22 @@ impl AsyncTransaction {
                 H2Error::Transaction("Transaction is already closed".to_string())
             })?;
             tx.query_params(&sql, &params)
+        })
+        .await
+        .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?
+    }
+
+    /// タイムアウトおよびパラメータを指定してトランザクション内でクエリを非同期実行
+    pub async fn query_params_timeout(&self, sql: &str, params: &[Value], timeout: std::time::Duration) -> H2Result<Vec<Row>> {
+        let inner = Arc::clone(&self.inner);
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let guard = inner.lock();
+            let tx = guard.as_ref().ok_or_else(|| {
+                H2Error::Transaction("Transaction is already closed".to_string())
+            })?;
+            tx.query_params_timeout(&sql, &params, timeout)
         })
         .await
         .map_err(|e| H2Error::Execution(format!("Tokio spawn_blocking error: {}", e)))?

@@ -40,6 +40,7 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [3. SQL 文による明示的トランザクション (BEGIN, COMMIT, ROLLBACK)](#3-sql-文による明示的トランザクション-begin-commit-rollback)
   - [4. セーブポイント (SAVEPOINT) についての設計方針](#4-セーブポイント-savepoint-についての設計方針)
   - [5. デッドロック検出と自動キャンセル (Deadlock Detection & Victim Cancellation)](#5-デッドロック検出と自動キャンセル-deadlock-detection--victim-cancellation)
+  - [6. クエリ単位の実行タイムアウト (Statement / Query Timeout)](#6-クエリ単位の実行タイムアウト-statement--query-timeout)
 
 - [Part V. クライアント & 組み込み API ガイド (Client / Embedded APIs)](#part-v-クライアント--組み込み-api-ガイド-client--embedded-apis)
   - [1. パラメータ付きクエリと SQL インジェクション対策](#1-パラメータ付きクエリと-sql-インジェクション対策)
@@ -857,6 +858,79 @@ while retries > 0 {
         Err(e) => return Err(e),
     }
 }
+```
+
+## 6. クエリ単位の実行タイムアウト (Statement / Query Timeout)
+
+長時間実行される重いクエリや、他トランザクションの行ロック待ちによって処理が長時間ブロックされることを防ぐため、**クエリ単位の実行タイムアウト**をサポートしています。
+
+タイムアウトに達した場合、エンジンは処理を即座に中断し、`H2Error::QueryTimeout("Query execution timed out")` を返却します。
+
+### ① クエリ単位での明示的タイムアウト指定
+`query_timeout` / `execute_timeout` API を使用し、個別の SQL 実行ごとに制限時間をミリ秒・秒単位で指定できます。
+
+```rust
+use std::time::Duration;
+
+// 1. SELECT クエリに 500ミリ秒のタイムアウトを指定
+let rows = conn.query_timeout(
+    "SELECT * FROM large_table WHERE status = 'pending'",
+    Duration::from_millis(500),
+)?;
+
+// 2. パラメータ付きクエリでの指定
+let rows = conn.query_params_timeout(
+    "SELECT * FROM orders WHERE amount > ?1",
+    &params![10000],
+    Duration::from_secs(1),
+)?;
+
+// 3. DML / DDL 更新文での指定
+let affected = conn.execute_timeout(
+    "UPDATE accounts SET balance = balance + 10 WHERE id = 1",
+    Duration::from_millis(200),
+)?;
+```
+
+### ② セッション全体のデフォルトタイムアウト設定
+セッション（`Connection`）単位でデフォルトのタイムアウト時間を設定しておくと、通常の `query()` や `execute()` の実行時にも自動的にタイムアウトが適用されます。
+
+```rust
+// セッションのデフォルトクエリタイムアウトを 1,000ms (1秒) に設定
+conn.set_query_timeout_ms(1000);
+
+// 自動的に 1秒のタイムアウトが適用される
+let rows = conn.query("SELECT * FROM complex_view")?;
+
+// タイムアウトを解除（無期限化）
+conn.set_query_timeout(None);
+```
+
+### ③ PostgreSQL 互換 SQL 文によるタイムアウト設定
+`psql`、JDBC、外部アプリケーションから接続している場合、標準的な `SET statement_timeout` または `SET query_timeout` コマンドで動的に設定・解除できます。
+
+```sql
+-- 現在のセッションのクエリタイムアウトを 500ミリ秒に設定
+SET statement_timeout = 500;
+
+-- 重い集約クエリ (500ms を超過すると自動的に ERROR: Query timeout が返る)
+SELECT dept, AVG(salary) FROM employees GROUP BY dept;
+
+-- タイムアウトを解除 (0 = 無制限)
+SET statement_timeout = 0;
+```
+
+### ④ 非同期 Rust API (`AsyncConnection`) での利用
+Tokio ネイティブの非同期環境でも、同様にクエリ単位のタイムアウトが利用可能です。
+
+```rust
+use std::time::Duration;
+
+// 非同期クエリタイムアウト
+let rows = async_conn.query_timeout(
+    "SELECT * FROM items ORDER BY created_at DESC LIMIT 50",
+    Duration::from_millis(300),
+).await?;
 ```
 
 ---

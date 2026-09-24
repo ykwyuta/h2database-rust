@@ -29,6 +29,9 @@ pub enum H2Error {
     #[error("Lock conflict: {0}")]
     LockConflict(String),
 
+    #[error("Query timeout: {0}")]
+    QueryTimeout(String),
+
     #[error("Corrupted database file: {0}")]
     Corrupted(String),
 }

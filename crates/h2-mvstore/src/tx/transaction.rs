@@ -93,12 +93,27 @@ impl Transaction {
                         return Err(e);
                     }
 
-                    // 他トランザクションのコミットまたはロールバックによるロック解放を待機
-                    let timeout = self.store.lock_timeout();
+                    // クエリタイムアウトの残り時間を考慮した待機時間
+                    let timeout = if let Some(remaining) = h2_types::remaining_query_timeout() {
+                        if remaining.is_zero() {
+                            let _ = self.rollback();
+                            return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                        }
+                        self.store.lock_timeout().min(remaining)
+                    } else {
+                        self.store.lock_timeout()
+                    };
+
                     let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
                     self.store.lock_manager().unregister_wait(self.tx_id);
 
                     if !not_timed_out {
+                        if let Some(remaining) = h2_types::remaining_query_timeout() {
+                            if remaining.is_zero() {
+                                let _ = self.rollback();
+                                return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                            }
+                        }
                         return Err(H2Error::LockConflict(format!(
                             "Lock wait timeout ({}ms): transaction {} waiting on transaction {}",
                             timeout.as_millis(),
@@ -167,11 +182,27 @@ impl Transaction {
                         return Err(e);
                     }
 
-                    let timeout = self.store.lock_timeout();
+                    // クエリタイムアウトの残り時間を考慮した待機時間
+                    let timeout = if let Some(remaining) = h2_types::remaining_query_timeout() {
+                        if remaining.is_zero() {
+                            let _ = self.rollback();
+                            return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                        }
+                        self.store.lock_timeout().min(remaining)
+                    } else {
+                        self.store.lock_timeout()
+                    };
+
                     let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
                     self.store.lock_manager().unregister_wait(self.tx_id);
 
                     if !not_timed_out {
+                        if let Some(remaining) = h2_types::remaining_query_timeout() {
+                            if remaining.is_zero() {
+                                let _ = self.rollback();
+                                return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                            }
+                        }
                         return Err(H2Error::LockConflict(format!(
                             "Lock wait timeout ({}ms): transaction {} waiting on transaction {}",
                             timeout.as_millis(),
@@ -217,6 +248,7 @@ impl Transaction {
 
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
+            h2_types::check_query_timeout()?;
             if let Ok(vv) = serde_json::from_slice::<VersionedValue>(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
                     visible_entries.push((entry.key, val.to_vec()));
