@@ -375,10 +375,51 @@ SQL文字列 ──► parse_sql() ──► Statement ──► SQLEngine::exec
 ```
 
 > [!CAUTION]
-> **デッドロック防止のための絶対ルール**:
+> **スレッド間デッドロック防止のための絶対ルール**:
 > - `MVMap::tree` のロックを保持したまま `MVStore::maps` の write ロックを取得してはならない。
 > - `FileStore` の write ロックを保持した状態で別スレッドの同期を待ってはならない。
 > - すべてのロックには `std::sync` ではなく **`parking_lot`**（`parking_lot::RwLock`, `parking_lot::Mutex`）を使用すること。
+
+---
+
+### トランザクション行・キー排他ロックとデッドロック検出機構
+
+スレッド単位のメモリロックだけでなく、複数セッション・トランザクション間での行・キー更新の排他制御（X-Lock）において、循環依存（デッドロック）を防止・解決する以下の機構を [`crates/h2-mvstore/src/tx/lock.rs`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/tx/lock.rs) に実装しています。
+
+```mermaid
+graph TD
+    TxA["トランザクション A (Tx 1)"]
+    TxB["トランザクション B (Tx 2)"]
+    Key1[("キー 1 (Key A)")]
+    Key2[("キー 2 (Key B)")]
+
+    TxA -->|"保持 (Locked)"| Key1
+    TxB -->|"保持 (Locked)"| Key2
+    TxA -.->|"待機 (Wait-For)"| Key2
+    TxB -.->|"要求 -> サイクル検出！"| Key1
+
+    style TxB fill:#ffcccc,stroke:#ff0000,stroke-width:2px;
+```
+
+#### 1. ストライプ排他ロック (`LockManager::lock_key`)
+- 256 個のストライプ Mutex バケットを備え、同一キーに対する `VersionedValue` のチェック＆更新をアトミックに保護。
+- スレッド間の競合時にもレースコンディションなく確実に他トランザクションのロック状態を把握。
+
+#### 2. 待機グラフ (`Wait-For Graph`) とサイクル検出
+- トランザクション $T_A$ がロック中のキーに $T_B$ がアクセスした際、`wait_for` マップに $T_B \to T_A$ の有向エッジを登録。
+- エッジ追加時に循環走査（DFS / 追跡）を実行：
+  - 各トランザクションは直列実行されるため、出次数は高々 1。
+  - $T_A \to \dots \to T_B$ のパスが存在する場合、閉路（サイクル）を即座に検出。
+
+#### 3. 被害者トランザクションの選定と自発的自動キャンセル (Victim Cancellation)
+- デッドロックを形成した要求元トランザクションを **Victim** として選定。
+- 即座に `self.rollback()` を実行：
+  - Undo Log を逆順適用し、自トランザクションが保持していたロックをすべて解放。
+  - トランザクションステータスを `RolledBack` に遷移。
+  - `LockManager::notify_lock_released()` により、自トランザクションを待機していた他スレッド（$T_A$ 等）へ `Condvar::notify_all` をブロードキャスト。
+  - 要求元には `H2Error::LockConflict("Deadlock detected: transaction ... cancelled to break cycle")` を返却。
+- これにより、待機中だった他トランザクションは直ちにブロック解除され、正常に後続クエリの実行とコミットを完了できます。
+
 
 ---
 

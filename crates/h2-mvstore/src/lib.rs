@@ -133,6 +133,7 @@ mod tests {
     fn test_mvcc_write_conflict() {
         let store = Arc::new(MVStore::open_in_memory());
         let tx_store = TransactionStore::new(store);
+        tx_store.set_lock_timeout_ms(50);
 
         let tx1 = tx_store.begin();
         let tx2 = tx_store.begin();
@@ -150,5 +151,56 @@ mod tests {
         let tx3 = tx_store.begin();
         tx3.put("test", b"key1".to_vec(), b"val3".to_vec()).unwrap();
         tx3.commit().unwrap();
+    }
+
+    #[test]
+    fn test_deadlock_detection_and_cancellation() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let tx_store = TransactionStore::new(store);
+        tx_store.set_lock_timeout_ms(2000);
+
+        let tx1 = Arc::new(tx_store.begin());
+        let tx2 = Arc::new(tx_store.begin());
+
+        // Step 1: Tx1 が keyA を更新 (Tx1 が keyA をロック)
+        tx1.put("test", b"keyA".to_vec(), b"valA1".to_vec()).unwrap();
+
+        // Step 2: Tx2 が keyB を更新 (Tx2 が keyB をロック)
+        tx2.put("test", b"keyB".to_vec(), b"valB1".to_vec()).unwrap();
+
+        // Step 3: 別スレッドで Tx1 が keyB を更新しようとする -> Tx2 がロック中なので待機に入る
+        let tx1_clone = Arc::clone(&tx1);
+        let h1 = std::thread::spawn(move || {
+            tx1_clone.put("test", b"keyB".to_vec(), b"valB_by_tx1".to_vec())
+        });
+
+        // Tx1 が待機に入るのを少し待つ
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Step 4: メインスレッドで Tx2 が keyA を更新しようとする
+        // -> Tx2 は keyA (Tx1保持) を要求 -> Tx1 は既に keyB (Tx2保持) を要求して待機中
+        // -> デッドロックが検出され、Tx2 がキャンセル（自動ロールバック）される！
+        let res2 = tx2.put("test", b"keyA".to_vec(), b"valA_by_tx2".to_vec());
+
+        assert!(res2.is_err(), "Tx2 should fail due to deadlock detection");
+        let err_msg = res2.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Deadlock detected"),
+            "Error should indicate deadlock: {}",
+            err_msg
+        );
+
+        // Tx2 がキャンセル（ロールバック）されたことにより、Tx2 の保持していた keyB のロックが解放され、
+        // 待機していた Tx1 の put が完了する
+        let res1 = h1.join().unwrap();
+        assert!(res1.is_ok(), "Tx1 should successfully acquire lock and complete put after Tx2 rollback: {:?}", res1);
+
+        // Tx1 は正常にコミットできる
+        assert!(tx1.commit().is_ok());
+
+        // コミット後の状態を確認
+        let tx3 = tx_store.begin();
+        assert_eq!(tx3.get("test", b"keyA").unwrap(), Some(b"valA1".to_vec()));
+        assert_eq!(tx3.get("test", b"keyB").unwrap(), Some(b"valB_by_tx1".to_vec()));
     }
 }

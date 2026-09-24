@@ -66,41 +66,72 @@ impl Transaction {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
 
-        let mut vv = if let Some(val_bytes) = map.get(&key) {
-            let existing: VersionedValue = serde_json::from_slice(&val_bytes)
-                .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        loop {
+            let _key_guard = self.store.lock_manager().lock_key(map_name, &key);
 
-            // Write-Write Conflict チェック
-            if let Some(other_tx_id) = existing.active_tx_id() {
-                if other_tx_id != self.tx_id {
-                    return Err(H2Error::LockConflict(format!(
-                        "Key is locked by active transaction {}",
-                        other_tx_id
-                    )));
+            let existing_vv = if let Some(val_bytes) = map.get(&key) {
+                let existing: VersionedValue = serde_json::from_slice(&val_bytes)
+                    .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                Some(existing)
+            } else {
+                None
+            };
+
+            let other_tx = existing_vv
+                .as_ref()
+                .and_then(|vv| vv.active_tx_id())
+                .filter(|&id| id != self.tx_id);
+
+            if let Some(holder_tx_id) = other_tx {
+                if self.store.is_tx_active(holder_tx_id) {
+                    drop(_key_guard);
+
+                    // デッドロック（循環依存）チェックと待機関係の登録
+                    if let Err(e) = self.store.lock_manager().register_wait(self.tx_id, holder_tx_id) {
+                        // デッドロック検出！自トランザクションを即座に自動ロールバックして片方をキャンセル
+                        let _ = self.rollback();
+                        return Err(e);
+                    }
+
+                    // 他トランザクションのコミットまたはロールバックによるロック解放を待機
+                    let timeout = self.store.lock_timeout();
+                    let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
+                    self.store.lock_manager().unregister_wait(self.tx_id);
+
+                    if !not_timed_out {
+                        return Err(H2Error::LockConflict(format!(
+                            "Lock wait timeout ({}ms): transaction {} waiting on transaction {}",
+                            timeout.as_millis(),
+                            self.tx_id,
+                            holder_tx_id
+                        )));
+                    }
+                    continue;
                 }
             }
-            existing
-        } else {
-            VersionedValue {
+
+            let mut vv = existing_vv.unwrap_or(VersionedValue {
                 uncommitted: None,
                 committed_history: Vec::new(),
-            }
-        };
+            });
 
-        vv.uncommitted = Some(UncommittedRecord {
-            tx_id: self.tx_id,
-            value: Some(value),
-        });
+            vv.uncommitted = Some(UncommittedRecord {
+                tx_id: self.tx_id,
+                value: Some(value),
+            });
 
-        let serialized = serde_json::to_vec(&vv)
-            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+            let serialized = serde_json::to_vec(&vv)
+                .map_err(|e| H2Error::Serialization(e.to_string()))?;
 
-        self.undo_log.write().push(UndoLogEntry {
-            map_name: map_name.to_string(),
-            key: key.clone(),
-        });
+            self.undo_log.write().push(UndoLogEntry {
+                map_name: map_name.to_string(),
+                key: key.clone(),
+            });
 
-        map.put(key, serialized);
+            map.put(key, serialized);
+            break;
+        }
+
         Ok(())
     }
 
@@ -109,41 +140,72 @@ impl Transaction {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
 
-        let Some(val_bytes) = map.get(key) else {
-            return Ok(false);
-        };
+        loop {
+            let _key_guard = self.store.lock_manager().lock_key(map_name, key);
 
-        let mut vv: VersionedValue = serde_json::from_slice(&val_bytes)
-            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+            let existing_vv = if let Some(val_bytes) = map.get(key) {
+                let existing: VersionedValue = serde_json::from_slice(&val_bytes)
+                    .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                Some(existing)
+            } else {
+                None
+            };
 
-        if let Some(other_tx_id) = vv.active_tx_id() {
-            if other_tx_id != self.tx_id {
-                return Err(H2Error::LockConflict(format!(
-                    "Key is locked by active transaction {}",
-                    other_tx_id
-                )));
+            let Some(existing_vv) = existing_vv else {
+                return Ok(false);
+            };
+
+            let other_tx = existing_vv.active_tx_id().filter(|&id| id != self.tx_id);
+            if let Some(holder_tx_id) = other_tx {
+                if self.store.is_tx_active(holder_tx_id) {
+                    drop(_key_guard);
+
+                    // デッドロック（循環依存）チェックと待機関係の登録
+                    if let Err(e) = self.store.lock_manager().register_wait(self.tx_id, holder_tx_id) {
+                        // デッドロック検出！自トランザクションを即座に自動ロールバックして片方をキャンセル
+                        let _ = self.rollback();
+                        return Err(e);
+                    }
+
+                    let timeout = self.store.lock_timeout();
+                    let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
+                    self.store.lock_manager().unregister_wait(self.tx_id);
+
+                    if !not_timed_out {
+                        return Err(H2Error::LockConflict(format!(
+                            "Lock wait timeout ({}ms): transaction {} waiting on transaction {}",
+                            timeout.as_millis(),
+                            self.tx_id,
+                            holder_tx_id
+                        )));
+                    }
+                    continue;
+                }
             }
+
+            // もし可視な値が存在しなければ削除対象なし
+            if existing_vv.read_visible(self.tx_id, self.snapshot_version).is_none() {
+                return Ok(false);
+            }
+
+            let mut vv = existing_vv;
+            vv.uncommitted = Some(UncommittedRecord {
+                tx_id: self.tx_id,
+                value: None, // 削除マーク
+            });
+
+            let serialized = serde_json::to_vec(&vv)
+                .map_err(|e| H2Error::Serialization(e.to_string()))?;
+
+            self.undo_log.write().push(UndoLogEntry {
+                map_name: map_name.to_string(),
+                key: key.to_vec(),
+            });
+
+            map.put(key.to_vec(), serialized);
+            break;
         }
 
-        // もし可視な値が存在しなければ削除対象なし
-        if vv.read_visible(self.tx_id, self.snapshot_version).is_none() {
-            return Ok(false);
-        }
-
-        vv.uncommitted = Some(UncommittedRecord {
-            tx_id: self.tx_id,
-            value: None, // 削除マーク
-        });
-
-        let serialized = serde_json::to_vec(&vv)
-            .map_err(|e| H2Error::Serialization(e.to_string()))?;
-
-        self.undo_log.write().push(UndoLogEntry {
-            map_name: map_name.to_string(),
-            key: key.to_vec(),
-        });
-
-        map.put(key.to_vec(), serialized);
         Ok(true)
     }
 
@@ -176,6 +238,7 @@ impl Transaction {
         let undo_logs = self.undo_log.read();
 
         for log in undo_logs.iter() {
+            let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
             let map = self.store.mvstore().open_map(&log.map_name);
             if let Some(val_bytes) = map.get(&log.key) {
                 if let Ok(mut vv) = serde_json::from_slice::<VersionedValue>(&val_bytes) {
@@ -198,12 +261,16 @@ impl Transaction {
     /// ロールバック
     pub fn rollback(&self) -> H2Result<()> {
         let mut status = self.status.write();
+        if *status == TransactionStatus::RolledBack {
+            return Ok(());
+        }
         if *status != TransactionStatus::Open {
             return Err(H2Error::Transaction("Transaction is already closed".to_string()));
         }
 
         let mut undo_logs = self.undo_log.write();
         while let Some(log) = undo_logs.pop() {
+            let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
             let map = self.store.mvstore().open_map(&log.map_name);
             if let Some(val_bytes) = map.get(&log.key) {
                 if let Ok(mut vv) = serde_json::from_slice::<VersionedValue>(&val_bytes) {

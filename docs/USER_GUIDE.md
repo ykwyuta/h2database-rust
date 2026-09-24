@@ -39,6 +39,8 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [2. Rust API によるトランザクション (RAII 管理)](#2-rust-api-によるトランザクション-raii-管理)
   - [3. SQL 文による明示的トランザクション (BEGIN, COMMIT, ROLLBACK)](#3-sql-文による明示的トランザクション-begin-commit-rollback)
   - [4. セーブポイント (SAVEPOINT) についての設計方針](#4-セーブポイント-savepoint-についての設計方針)
+  - [5. デッドロック検出と自動キャンセル (Deadlock Detection & Victim Cancellation)](#5-デッドロック検出と自動キャンセル-deadlock-detection--victim-cancellation)
+
 - [Part V. クライアント & 組み込み API ガイド (Client / Embedded APIs)](#part-v-クライアント--組み込み-api-ガイド-client--embedded-apis)
   - [1. パラメータ付きクエリと SQL インジェクション対策](#1-パラメータ付きクエリと-sql-インジェクション対策)
   - [2. 型安全なクエリ結果の走査 (`FromSql` & `Row::get_as`)](#2-型安全なクエリ結果の走査-fromsql--rowget_as)
@@ -795,6 +797,67 @@ COMMIT;
 > - **推奨されるベストプラクティス**:
 >   - エラー発生時は `ROLLBACK` を発行してトランザクション全体を安全に破棄する。
 >   - 大量データ処理において部分的な失敗を許容したい場合は、一連の処理を複数の小さなトランザクションに分割して逐次コミットする。
+
+## 5. デッドロック検出と自動キャンセル (Deadlock Detection & Victim Cancellation)
+
+
+複数のトランザクションが互いに相手の保持するレコードの排他ロックを待ち合う**デッドロック（循環依存）**が発生した場合、エンジンはこれを自動検出し、片方のトランザクションを安全にキャンセル（自動ロールバック）します。
+
+### ① デッドロックの発生と自動解決のフロー
+1. **待機グラフ（Wait-For Graph）の監視**:
+   - トランザクション $T_A$ がロック中のキーにトランザクション $T_B$ がアクセスした際、エンジンは待機関係 $T_B \to T_A$ を記録し、ロック解放を待機します。
+2. **閉路（サイクル）の即時検出**:
+   - $T_A$ が $T_B$ の保持する別のキーを要求した場合、待機グラフ上にサイクル（$T_A \to T_B \to T_A$）が形成されます。
+   - エンジンは DFS による閉路検出アルゴリズムにより、このデッドロックを瞬時に検知します。
+3. **被害者（Victim）トランザクションの自動キャンセル**:
+   - デッドロックを形成した要求元トランザクションを自動的にロールバック（Undo Log を適用して変更を破棄・ロック全解放）します。
+   - キャンセルされた側には `H2Error::LockConflict`（`Deadlock detected: transaction ... cancelled to break cycle`）が返却されます。
+4. **もう片方のトランザクションのブロック解除と続行**:
+   - キャンセルされた側が保持していたロックが即座に解放されるため、もう片方のトランザクションは直ちに待機から復帰し、正常にコミットまで完了できます。
+
+```sql
+-- セッション 1 (Tx1)                    -- セッション 2 (Tx2)
+BEGIN;                                  BEGIN;
+UPDATE accounts SET bal=100 WHERE id=1; 
+                                        UPDATE accounts SET bal=200 WHERE id=2;
+-- id=2 のロック解放待ち (待機開始)
+UPDATE accounts SET bal=150 WHERE id=2;
+                                        -- id=1 を要求 -> デッドロック即時検出！
+                                        UPDATE accounts SET bal=250 WHERE id=1;
+                                        -- => ERROR: Deadlock detected (Tx2 自動ロールバック)
+-- Tx2 のロールバックによりブロック解除
+-- Tx1 は正常に完了
+COMMIT;
+```
+
+### ② ロック待機タイムアウトの設定
+デッドロック以外の理由で長時間ロックが解放されない事態を防ぐため、ロック待機タイムアウト機能（デフォルト: 1,000ms）を備えています。
+組み込み Rust API では接続単位・エンジン単位でタイムアウト時間をカスタマイズできます。
+
+```rust
+// ロック待機タイムアウトを 3,000ミリ秒 (3秒) に変更
+conn.set_lock_timeout_ms(3000);
+```
+
+### ③ アプリケーション側での推奨対処パターン
+デッドロックエラー（`LockConflict`）を受信した場合、アプリケーション側では以下のように指数バックオフ（Exponential Backoff）を伴うリトライを実装することが推奨されます。
+
+```rust
+let mut retries = 3;
+while retries > 0 {
+    let res = run_business_transaction(&conn);
+    match res {
+        Ok(_) => break,
+        Err(H2Error::LockConflict(msg)) if msg.contains("Deadlock detected") => {
+            // トランザクションは既に自動ロールバック済み。セッション状態を整えてリトライ
+            let _ = conn.execute("ROLLBACK");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            retries -= 1;
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
 
 ---
 

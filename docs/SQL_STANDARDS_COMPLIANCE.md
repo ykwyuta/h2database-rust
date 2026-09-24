@@ -14,7 +14,7 @@
 | **DDL (定義)** | SQL-92 / SQL:2008 | `CREATE TABLE` (PK, Not Null, **Foreign Key/参照整合性**), `DROP TABLE`, `ALTER TABLE` (Rename, Add Col, Drop Col), `TRUNCATE TABLE`, `CREATE/DROP INDEX`, **`CREATE/DROP VIEW` (仮想ビュー)** | `CHECK` 制約, 複合主キー制約, `CREATE SCHEMA` |
 | **DML (操作)** | SQL-92 / SQL:2003 | 単行/複数行 `INSERT`, **`INSERT INTO ... SELECT`**, `UPDATE` (複数列代入・自己参照式・FK検証), `DELETE` (連動削除 CASCADE/SET NULL/RESTRICT) | `UPSERT` (`ON CONFLICT DO UPDATE`), `RETURNING` 句 |
 | **DQL (検索)** | SQL-92 / SQL:1999 / SQL:2003 | FROM なし `SELECT`, 列射影・エイリアス, **共通テーブル式 (`WITH` / CTE)**, `WHERE`, `IN`, `BETWEEN`, `CASE WHEN`, `JOIN` (Inner, Left Outer, View/Chained Join), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, **集合演算 (`UNION`, `INTERSECT`, `EXCEPT` / ALL)**, **ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `DENSE_RANK`)**, サブクエリ (Derived Table, IN, EXISTS, スカラ) | 再帰 CTE (`WITH RECURSIVE`), `RIGHT/FULL OUTER JOIN`, `CROSS JOIN` |
-| **TCL (トランザクション)** | SQL-92 | `BEGIN`, `COMMIT`, `ROLLBACK`, MVCC スナップショット分離, 自動 Undo Log 復元 | **`SAVEPOINT` (設計方針として実装対象外)**, 動的分離レベル変更 (`SET TRANSACTION ISOLATION LEVEL`) |
+| **TCL (トランザクション)** | SQL-92 | `BEGIN`, `COMMIT`, `ROLLBACK`, MVCC スナップショット分離, 自動 Undo Log 復元, **デッドロック検出・自動キャンセル (Victim Rollback)** | **`SAVEPOINT` (設計方針として実装対象外)**, 動的分離レベル変更 (`SET TRANSACTION ISOLATION LEVEL`) |
 | **関数・演算子** | SQL-92 / 拡張 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COALESCE`, `UPPER`, `LOWER`, `CONCAT`, `LENGTH`, `ABS`, `NOW`, JSON 演算子 (`->`, `->>`), 日本語全文検索 (`FT_SEARCH`) | 三角関数/指数関数, 正規表現関数 (`REGEXP`), 日付間隔演算 (`DATE_ADD`) |
 | **メタデータ・診断** | SQL-92 / SQL:2008 / MySQL互換 | `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `SHOW TABLES`, `SHOW COLUMNS`, `EXPLAIN` | `INFORMATION_SCHEMA.VIEWS / CONSTRAINTS`, `EXPLAIN ANALYZE` (実測プロファイリング) |
 
@@ -227,6 +227,11 @@
   - **スナップショット分離 (Snapshot Isolation / MVCC)**
   - リーダーはライターをブロックせず、ライターもリーダーをブロックしない。
   - 同一キーに対する同時更新競合（Write-Write Conflict）の検知と安全なエラー拒絶。
+- **デッドロック検出と自動キャンセル (Deadlock Detection & Victim Cancellation)**:
+  - 待機グラフ（**Wait-For Graph**）をエンジン内部で維持し、閉路（Cycle）をリアルタイムに探索。
+  - トランザクション間の相互ロック待機（デッドロック）を検知した場合、閉路を形成した要求元トランザクション（Victim）を即座に自動ロールバック（キャンセル）して `H2Error::LockConflict` を返却。
+  - キャンセルされた側が保持していたロックが即座に解放されるため、待機中だった他トランザクションは直ちにブロック解除され、正常コミット可能。
+  - ロック待機タイムアウト（デフォルト 1,000ms、設定可能）による無限待ち防止。
 - **Undo Log**:
   - トランザクション途中でエラーが発生した場合、または `ROLLBACK` 時に、Undo Log を逆順再生してコミット済み直前の状態へ完全復元。
 

@@ -187,6 +187,21 @@ impl Connection {
         })
     }
 
+    /// 同一のデータベースを共有し、独立したトランザクション状態を持つ新しいセッション（接続）を作成
+    pub fn new_session(&self) -> Self {
+        Self {
+            store: Arc::clone(&self.store),
+            engine: Arc::clone(&self.engine),
+            current_tx: Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// ロック待機タイムアウト時間（ミリ秒）を設定
+    pub fn set_lock_timeout_ms(&self, ms: u64) {
+        self.engine.tx_store().set_lock_timeout_ms(ms);
+    }
+
+
     /// DDLやDML文、または明示的トランザクション制御文（BEGIN/COMMIT/ROLLBACK）を実行
     pub fn execute(&self, sql: &str) -> H2Result<u64> {
         match parse_tx_command(sql) {
