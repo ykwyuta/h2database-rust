@@ -28,21 +28,22 @@ Java版 [H2 Database](https://github.com/h2database/h2database) の先進的な�
 - **🔌 内蔵 PostgreSQL 互換ワイヤプロトコル (PG-Wire) & INFORMATION_SCHEMA**:
   - アプリ内で組み込み動作させながら、オプションでポート5432を開放。稼働中のアプリを停止させずに **DBeaver, DataGrip, VS Code拡張, psql** から直接クエリを発行してデバッグ・管理可能。
   - `information_schema.tables`, `information_schema.columns` システムビューを提供。
-
-
+- **⚡ Tokio ネイティブ非同期 API (`AsyncConnection`)**:
+  - `AsyncConnection::open(path).await` により Axum や Actix-web 等の非同期 Web サービスにそのまま統合可能。
 
 ---
 
 ## 📚 ドキュメント
 
-詳細なアーキテクチャ設計およびロードマップは [`docs/`](./docs/README.md) をご覧ください。
-
-1. [プロジェクトビジョンと技術比較](./docs/01_overview_and_vision.md)
-2. [全体アーキテクチャ設計](./docs/02_architecture_overview.md)
-3. [ストレージエンジン設計（Rust版 MVStore）](./docs/03_storage_engine_mvstore.md)
-4. [SQL処理系・型システム・実行エンジン](./docs/04_sql_parser_and_execution.md)
-5. [組み込みAPI・インターフェース設計](./docs/05_embedded_api_and_pgwire.md)
-6. [実装ロードマップとマイルストーン](./docs/06_roadmap_and_phases.md)
+- 📖 **[利用者向け公式ガイド (User's Guide)](./docs/USER_GUIDE.md)**:
+  PostgreSQL 公式ドキュメント構成をベースにした網羅的ガイド。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順までを解説。
+- 🏛️ **アーキテクチャ設計・仕様ドキュメント**:
+  1. [プロジェクトビジョンと技術比較](./docs/01_overview_and_vision.md)
+  2. [全体アーキテクチャ設計](./docs/02_architecture_overview.md)
+  3. [ストレージエンジン設計（Rust版 MVStore）](./docs/03_storage_engine_mvstore.md)
+  4. [SQL処理系・型システム・実行エンジン](./docs/04_sql_parser_and_execution.md)
+  5. [組み込みAPI・インターフェース設計](./docs/05_embedded_api_and_pgwire.md)
+  6. [実装ロードマップとマイルストーン](./docs/06_roadmap_and_phases.md)
 
 ---
 
@@ -64,30 +65,65 @@ h2database-rust/
 
 ## 🛠️ クイックスタート
 
-```rust
-use h2::{Connection, Result};
+### 1. 同期 組み込みモード
 
-fn main() -> Result<()> {
+```rust
+use h2::{Connection, H2Result, params};
+use rust_decimal::Decimal;
+use std::str::FromStr;
+
+fn main() -> H2Result<()> {
     // データベースを開く（またはインメモリ: open_in_memory()）
     let conn = Connection::open("test.h2")?;
 
     // テーブルの作成
     conn.execute(
-        "CREATE TABLE users (
+        "CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY,
             name VARCHAR,
             balance DECIMAL(10, 2)
         )",
     )?;
 
-    // データの挿入
-    conn.execute("INSERT INTO users VALUES (1, 'Alice', 100.50)")?;
-    conn.execute("INSERT INTO users VALUES (2, 'Bob', 250.00)")?;
+    // パラメータ付き INSERT (params! マクロ)
+    conn.execute_params(
+        "INSERT INTO users VALUES (?, ?, ?)",
+        &params![1, "Alice", Decimal::from_str("100.50").unwrap()],
+    )?;
+    conn.execute_params(
+        "INSERT INTO users VALUES (?, ?, ?)",
+        &params![2, "Bob", Decimal::from_str("250.00").unwrap()],
+    )?;
 
-    // クエリの実行
+    // 型安全なクエリ走査 (Row::get_as)
     let rows = conn.query("SELECT id, name, balance FROM users WHERE balance > 150")?;
     for row in rows {
-        println!("User: {:?}, Balance: {:?}", row.get(1), row.get(2));
+        let id: i32 = row.get_as(0)?;
+        let name: String = row.get_as(1)?;
+        let balance: Decimal = row.get_as(2)?;
+        println!("User #{id}: {name} (${balance})");
+    }
+
+    Ok(())
+}
+```
+
+### 2. 非同期 組み込みモード (Tokio)
+
+```rust
+use h2::{AsyncConnection, H2Result, params};
+
+#[tokio::main]
+async fn main() -> H2Result<()> {
+    let conn = AsyncConnection::open("async_test.h2").await?;
+
+    conn.execute("CREATE TABLE IF NOT EXISTS tasks (id INT PRIMARY KEY, title VARCHAR)").await?;
+    conn.execute_params("INSERT INTO tasks VALUES (?, ?)", &params![1, "Hello Async"]).await?;
+
+    let rows = conn.query("SELECT title FROM tasks WHERE id = 1").await?;
+    if let Some(r) = rows.first() {
+        let title: String = r.get_as(0)?;
+        println!("Task: {title}");
     }
 
     Ok(())

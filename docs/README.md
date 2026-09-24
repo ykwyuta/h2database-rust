@@ -4,6 +4,11 @@
 
 ## ドキュメント一覧
 
+- 📖 **[利用者向け公式ガイド (USER_GUIDE.md)](./USER_GUIDE.md)**:
+  PostgreSQL 公式ドキュメントの構成をベースに体系化した、データベース利用者向けの実践的総合マニュアル。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順などを網羅。
+
+### アーキテクチャ・設計仕様書
+
 1. [01. プロジェクトビジョンと技術比較 (01_overview_and_vision.md)](./01_overview_and_vision.md)
    - なぜ作るのか、誰のためのデータベースか
    - SQLite、Java版H2 Database、他のRust製DBとの徹底比較
