@@ -146,19 +146,68 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                 _ => Ok(Value::Boolean(false)),
             }
         }
-        // 全文検索関数: FT_SEARCH(column, 'keyword') または FT_SEARCH_MORPH(column, 'keyword')
+        SqlExpr::InList { expr, list, negated } => {
+            let target_val = evaluate_expr_context(expr, ctx, row)?;
+            let mut found = false;
+            for item in list {
+                let item_val = evaluate_expr_context(item, ctx, row)?;
+                if target_val == item_val {
+                    found = true;
+                    break;
+                }
+            }
+            let res = if *negated { !found } else { found };
+            Ok(Value::Boolean(res))
+        }
+        SqlExpr::Between { expr, negated, low, high } => {
+            let target_val = evaluate_expr_context(expr, ctx, row)?;
+            let low_val = evaluate_expr_context(low, ctx, row)?;
+            let high_val = evaluate_expr_context(high, ctx, row)?;
+            let in_range = target_val >= low_val && target_val <= high_val;
+            let res = if *negated { !in_range } else { in_range };
+            Ok(Value::Boolean(res))
+        }
+        SqlExpr::Case { operand, conditions, results, else_result } => {
+            let op_val = if let Some(op) = operand {
+                Some(evaluate_expr_context(op, ctx, row)?)
+            } else {
+                None
+            };
+
+            for (cond, res) in conditions.iter().zip(results.iter()) {
+                let matched = if let Some(ref base_val) = op_val {
+                    let cond_val = evaluate_expr_context(cond, ctx, row)?;
+                    base_val == &cond_val
+                } else {
+                    let cond_val = evaluate_expr_context(cond, ctx, row)?;
+                    matches!(cond_val, Value::Boolean(true))
+                };
+
+                if matched {
+                    return evaluate_expr_context(res, ctx, row);
+                }
+            }
+
+            if let Some(else_expr) = else_result {
+                evaluate_expr_context(else_expr, ctx, row)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        // スカラ関数
         SqlExpr::Function(func) => {
             let func_name = func.name.to_string().to_uppercase();
+            let args = match &func.args {
+                sqlparser::ast::FunctionArguments::List(arg_list) => &arg_list.args,
+                sqlparser::ast::FunctionArguments::None => &Vec::new(),
+                _ => return Err(H2Error::Execution("Invalid function args".to_string())),
+            };
+
             if func_name == "FT_SEARCH" || func_name == "FT_SEARCH_MORPH" {
                 let kind = if func_name == "FT_SEARCH_MORPH" {
                     TokenizerKind::Morph
                 } else {
                     TokenizerKind::NGram
-                };
-
-                let args = match &func.args {
-                    sqlparser::ast::FunctionArguments::List(arg_list) => &arg_list.args,
-                    _ => return Err(H2Error::Execution("Invalid function args".to_string())),
                 };
 
                 if args.len() < 2 {
@@ -182,10 +231,6 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                     _ => Ok(Value::Boolean(false)),
                 }
             } else if func_name == "JSON_EXTRACT" || func_name == "JSON_VALUE" {
-                let args = match &func.args {
-                    sqlparser::ast::FunctionArguments::List(arg_list) => &arg_list.args,
-                    _ => return Err(H2Error::Execution("Invalid function args".to_string())),
-                };
                 if args.len() < 2 {
                     return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name)));
                 }
@@ -211,10 +256,69 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                 } else {
                     Ok(Value::Null)
                 }
+            } else if func_name == "COALESCE" {
+                for arg in args {
+                    let val = evaluate_func_arg_context(arg, ctx, row)?;
+                    if !matches!(val, Value::Null) {
+                        return Ok(val);
+                    }
+                }
+                Ok(Value::Null)
+            } else if func_name == "UPPER" {
+                if args.is_empty() { return Err(H2Error::Execution("UPPER requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::String(s) => Ok(Value::String(s.to_uppercase())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::String(v.to_string().to_uppercase())),
+                }
+            } else if func_name == "LOWER" {
+                if args.is_empty() { return Err(H2Error::Execution("LOWER requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::String(s) => Ok(Value::String(s.to_lowercase())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::String(v.to_string().to_lowercase())),
+                }
+            } else if func_name == "CONCAT" {
+                let mut out = String::new();
+                for arg in args {
+                    let v = evaluate_func_arg_context(arg, ctx, row)?;
+                    match v {
+                        Value::String(s) => out.push_str(&s),
+                        Value::Null => {}
+                        _ => out.push_str(&v.to_string()),
+                    }
+                }
+                Ok(Value::String(out))
+            } else if func_name == "LENGTH" || func_name == "CHAR_LENGTH" {
+                if args.is_empty() { return Err(H2Error::Execution("LENGTH requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::String(s) => Ok(Value::Integer(s.chars().count() as i32)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::Integer(v.to_string().chars().count() as i32)),
+                }
+            } else if func_name == "ABS" {
+                if args.is_empty() { return Err(H2Error::Execution("ABS requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::TinyInt(n) => Ok(Value::TinyInt(n.abs())),
+                    Value::SmallInt(n) => Ok(Value::SmallInt(n.abs())),
+                    Value::Integer(n) => Ok(Value::Integer(n.abs())),
+                    Value::BigInt(n) => Ok(Value::BigInt(n.abs())),
+                    Value::Float(f) => Ok(Value::Float(f.abs())),
+                    Value::Double(d) => Ok(Value::Double(d.abs())),
+                    Value::Decimal(d) => Ok(Value::Decimal(d.abs())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(H2Error::TypeError("ABS requires numeric argument".to_string())),
+                }
+            } else if func_name == "NOW" || func_name == "CURRENT_TIMESTAMP" {
+                let now = chrono::Utc::now().to_rfc3339();
+                Ok(Value::String(now))
             } else {
                 Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
             }
-
         }
         _ => Err(H2Error::Execution(format!("Unsupported expression: {:?}", expr))),
     }

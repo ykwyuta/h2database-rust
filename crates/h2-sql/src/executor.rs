@@ -717,446 +717,698 @@ impl SQLEngine {
         }
     }
 
-    fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
-        let SetExpr::Select(select) = *query.body else {
-            return Err(H2Error::Execution("Only simple SELECT queries are supported".to_string()));
-        };
-
-        if select.from.is_empty() {
-            return Err(H2Error::Execution("SELECT without FROM not supported yet".to_string()));
-        }
-
-        let from_table = &select.from[0];
-        let (base_table_name, base_table_alias) = match &from_table.relation {
-            TableFactor::Table { name, alias, .. } => (
-                name.to_string(),
-                alias.as_ref().map(|a| a.name.value.clone()),
-            ),
-            _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
-        };
-
-        let is_info_tables = base_table_name.eq_ignore_ascii_case("information_schema.tables")
-            || base_table_name.eq_ignore_ascii_case("tables");
-        let is_info_columns = base_table_name.eq_ignore_ascii_case("information_schema.columns")
-            || base_table_name.eq_ignore_ascii_case("columns");
-
-        let (base_table_def, mut current_rows) = if is_info_tables {
-            let t_def = crate::catalog::TableDef::new(
-                base_table_name.clone(),
-                vec![
-                    crate::catalog::ColumnDef {
-                        name: "table_name".to_string(),
-                        data_type: h2_types::DataType::VarChar(None),
-                        is_nullable: false,
-                        is_primary_key: true,
-                    },
-                    crate::catalog::ColumnDef {
-                        name: "columns_count".to_string(),
-                        data_type: h2_types::DataType::Integer,
-                        is_nullable: false,
-                        is_primary_key: false,
-                    },
-                ],
-            );
-            let tables = self.catalog.all_tables();
-            let mut rows = Vec::new();
-            for t in tables {
-                rows.push(Row::new(vec![
-                    Value::String(t.name.clone()),
-                    Value::Integer(t.columns.len() as i32),
-                ]));
+    fn preprocess_subqueries(&self, tx: &Transaction, expr: &Expr) -> H2Result<Expr> {
+        match expr {
+            Expr::Subquery(subquery) => {
+                let res = self.execute_query(tx, *subquery.clone())?;
+                let rows = match res {
+                    ExecutionResult::Query { rows, .. } => rows,
+                    _ => return Err(H2Error::Execution("Subquery must be a query".to_string())),
+                };
+                let first_val = rows.first().and_then(|r| r.values.first().cloned()).unwrap_or(Value::Null);
+                Ok(value_to_sql_expr(first_val))
             }
-            (t_def, rows)
-        } else if is_info_columns {
-            let t_def = crate::catalog::TableDef::new(
-                base_table_name.clone(),
-                vec![
-                    crate::catalog::ColumnDef {
-                        name: "table_name".to_string(),
-                        data_type: h2_types::DataType::VarChar(None),
-                        is_nullable: false,
-                        is_primary_key: false,
-                    },
-                    crate::catalog::ColumnDef {
-                        name: "column_name".to_string(),
-                        data_type: h2_types::DataType::VarChar(None),
-                        is_nullable: false,
-                        is_primary_key: false,
-                    },
-                    crate::catalog::ColumnDef {
-                        name: "data_type".to_string(),
-                        data_type: h2_types::DataType::VarChar(None),
-                        is_nullable: false,
-                        is_primary_key: false,
-                    },
-                    crate::catalog::ColumnDef {
-                        name: "is_nullable".to_string(),
-                        data_type: h2_types::DataType::Boolean,
-                        is_nullable: false,
-                        is_primary_key: false,
-                    },
-                ],
-            );
-            let tables = self.catalog.all_tables();
-            let mut rows = Vec::new();
-            for t in tables {
-                for c in &t.columns {
-                    rows.push(Row::new(vec![
-                        Value::String(t.name.clone()),
-                        Value::String(c.name.clone()),
-                        Value::String(c.data_type.to_string()),
-                        Value::Boolean(c.is_nullable),
-                    ]));
+            Expr::InSubquery { expr: target_expr, subquery, negated } => {
+                let processed_target = self.preprocess_subqueries(tx, target_expr)?;
+                let res = self.execute_query(tx, *subquery.clone())?;
+                let rows = match res {
+                    ExecutionResult::Query { rows, .. } => rows,
+                    _ => return Err(H2Error::Execution("Subquery must be a query".to_string())),
+                };
+
+                let mut list = Vec::with_capacity(rows.len());
+                for r in rows {
+                    let val = r.values.first().cloned().unwrap_or(Value::Null);
+                    list.push(value_to_sql_expr(val));
                 }
+
+                Ok(Expr::InList {
+                    expr: Box::new(processed_target),
+                    list,
+                    negated: *negated,
+                })
             }
-            (t_def, rows)
-        } else {
-            let table_def = self.catalog.get_table(&base_table_name).ok_or_else(|| {
-                H2Error::Catalog(format!("Table '{}' not found", base_table_name))
-            })?;
+            Expr::Exists { subquery, negated } => {
+                let res = self.execute_query(tx, *subquery.clone())?;
+                let has_rows = match res {
+                    ExecutionResult::Query { rows, .. } => !rows.is_empty(),
+                    _ => false,
+                };
+                let matches = if *negated { !has_rows } else { has_rows };
+                Ok(Expr::Value(sqlparser::ast::Value::Boolean(matches)))
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let new_left = self.preprocess_subqueries(tx, left)?;
+                let new_right = self.preprocess_subqueries(tx, right)?;
+                Ok(Expr::BinaryOp {
+                    left: Box::new(new_left),
+                    op: op.clone(),
+                    right: Box::new(new_right),
+                })
+            }
+            Expr::UnaryOp { op, expr: inner } => {
+                let new_inner = self.preprocess_subqueries(tx, inner)?;
+                Ok(Expr::UnaryOp {
+                    op: op.clone(),
+                    expr: Box::new(new_inner),
+                })
+            }
+            Expr::Nested(inner) => {
+                let new_inner = self.preprocess_subqueries(tx, inner)?;
+                Ok(Expr::Nested(Box::new(new_inner)))
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
 
-            let map_name = format!("tbl_{}", base_table_name.to_lowercase());
+    fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
+        match *query.body.clone() {
+            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                if op == sqlparser::ast::SetOperator::Union {
+                    let mut left_query = query.clone();
+                    left_query.body = left;
+                    left_query.order_by = None;
+                    left_query.limit = None;
+                    left_query.offset = None;
 
-            // IndexScan の最適化
-            let mut index_scanned: Option<Vec<Row>> = None;
-            if from_table.joins.is_empty() {
-                if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = &select.selection {
-                    if let Expr::Identifier(ident) = left.as_ref() {
-                        let col_name = &ident.value;
-                        let indexes = self.catalog.get_table_indexes(&base_table_name);
-                        if let Some(target_idx) = indexes.iter().find(|i| i.columns[0].eq_ignore_ascii_case(col_name)) {
-                            if let Ok(search_val) = evaluate_literal_or_unary(right) {
-                                let idx_map_name = format!("idx_{}_{}", base_table_name.to_lowercase(), target_idx.name.to_lowercase());
-                                let idx_entries = tx.scan_visible(&idx_map_name)?;
-                                let mut matched_row_ids = Vec::new();
-                                for (k, _) in idx_entries {
-                                    if let Some((v, r_id)) = decode_index_key(&k) {
-                                        if v == search_val {
-                                            matched_row_ids.push(r_id);
+                    let mut right_query = query.clone();
+                    right_query.body = right;
+                    right_query.order_by = None;
+                    right_query.limit = None;
+                    right_query.offset = None;
+
+                    let (columns, mut rows) = match (self.execute_query(tx, left_query)?, self.execute_query(tx, right_query)?) {
+                        (ExecutionResult::Query { columns: l_cols, rows: l_rows }, ExecutionResult::Query { rows: r_rows, .. }) => {
+                            let mut combined = l_rows;
+                            combined.extend(r_rows);
+                            (l_cols, combined)
+                        }
+                        _ => return Err(H2Error::Execution("UNION inputs must be queries".to_string())),
+                    };
+
+                    let is_distinct = !matches!(set_quantifier, sqlparser::ast::SetQuantifier::All);
+                    if is_distinct {
+                        let mut seen = Vec::new();
+                        let mut unique_rows = Vec::new();
+                        for r in rows {
+                            if !seen.contains(&r.values) {
+                                seen.push(r.values.clone());
+                                unique_rows.push(r);
+                            }
+                        }
+                        rows = unique_rows;
+                    }
+
+                    if let Some(order_by) = &query.order_by {
+                        let res_ctx = RowContext {
+                            columns: columns.iter().enumerate().map(|(i, name)| ColumnBinding {
+                                table_name: None,
+                                table_alias: None,
+                                column_name: name.clone(),
+                                index: i,
+                            }).collect(),
+                        };
+                        rows.sort_by(|a, b| {
+                            for order_expr in &order_by.exprs {
+                                let val_a = evaluate_expr_context(&order_expr.expr, &res_ctx, a).unwrap_or(Value::Null);
+                                let val_b = evaluate_expr_context(&order_expr.expr, &res_ctx, b).unwrap_or(Value::Null);
+                                let mut ord = val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal);
+                                let is_asc = order_expr.asc.unwrap_or(true);
+                                if !is_asc {
+                                    ord = ord.reverse();
+                                }
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                    }
+
+                    let offset_num = if let Some(offset) = &query.offset {
+                        match evaluate_literal_or_unary(&offset.value)? {
+                            Value::TinyInt(n) => n.max(0) as usize,
+                            Value::SmallInt(n) => n.max(0) as usize,
+                            Value::Integer(n) => n.max(0) as usize,
+                            Value::BigInt(n) => n.max(0) as usize,
+                            _ => return Err(H2Error::Execution("OFFSET must be an integer".to_string())),
+                        }
+                    } else {
+                        0
+                    };
+
+                    let limit_num = if let Some(limit_expr) = &query.limit {
+                        match evaluate_literal_or_unary(limit_expr)? {
+                            Value::TinyInt(n) => Some(n.max(0) as usize),
+                            Value::SmallInt(n) => Some(n.max(0) as usize),
+                            Value::Integer(n) => Some(n.max(0) as usize),
+                            Value::BigInt(n) => Some(n.max(0) as usize),
+                            _ => return Err(H2Error::Execution("LIMIT must be an integer".to_string())),
+                        }
+                    } else {
+                        None
+                    };
+
+                    let final_rows = if let Some(lim) = limit_num {
+                        rows.into_iter().skip(offset_num).take(lim).collect()
+                    } else {
+                        rows.into_iter().skip(offset_num).collect()
+                    };
+
+                    return Ok(ExecutionResult::Query {
+                        columns,
+                        rows: final_rows,
+                    });
+                }
+                return Err(H2Error::Execution(format!("Unsupported set operation: {:?}", op)));
+            }
+            SetExpr::Select(select) => {
+                let select = *select;
+                if select.from.is_empty() {
+                    let ctx = RowContext::new();
+                    let dummy_row = Row::new(vec![]);
+
+                    // WHERE 句の評価（サブクエリ展開含む）
+                    if let Some(selection) = &select.selection {
+                        let proc_sel = self.preprocess_subqueries(tx, selection)?;
+                        match evaluate_expr_context(&proc_sel, &ctx, &dummy_row)? {
+                            Value::Boolean(true) => {}
+                            _ => {
+                                let mut columns = Vec::new();
+                                for item in &select.projection {
+                                    columns.push(get_select_item_name(item));
+                                }
+                                return Ok(ExecutionResult::Query { columns, rows: vec![] });
+                            }
+                        }
+                    }
+
+                    let mut result_columns = Vec::new();
+                    let mut row_values = Vec::new();
+                    for item in &select.projection {
+                        result_columns.push(get_select_item_name(item));
+                        let val = match item {
+                            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                                let proc_expr = self.preprocess_subqueries(tx, expr)?;
+                                evaluate_expr_context(&proc_expr, &ctx, &dummy_row)?
+                            }
+                            _ => return Err(H2Error::Execution("Wildcard not supported without FROM".to_string())),
+                        };
+                        row_values.push(val);
+                    }
+
+                    return Ok(ExecutionResult::Query {
+                        columns: result_columns,
+                        rows: vec![Row::new(row_values)],
+                    });
+                }
+
+                let from_table = &select.from[0];
+                let (base_table_def, current_rows, base_table_alias) = match &from_table.relation {
+                    TableFactor::Derived { subquery, alias, .. } => {
+                        let sub_alias = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| "subquery".to_string());
+                        let sub_res = self.execute_query(tx, *subquery.clone())?;
+                        let (cols, rows) = match sub_res {
+                            ExecutionResult::Query { columns, rows } => (columns, rows),
+                            _ => return Err(H2Error::Execution("Derived table must be a query".to_string())),
+                        };
+                        let col_defs = cols.into_iter().map(|c| ColumnDef {
+                            name: c,
+                            data_type: h2_types::DataType::VarChar(None),
+                            is_nullable: true,
+                            is_primary_key: false,
+                        }).collect();
+                        let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
+                        (t_def, rows, Some(sub_alias))
+                    }
+                    TableFactor::Table { name, alias, .. } => {
+                        let base_table_name = name.to_string();
+                        let base_table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+                        let is_info_tables = base_table_name.eq_ignore_ascii_case("information_schema.tables")
+                            || base_table_name.eq_ignore_ascii_case("tables");
+                        let is_info_columns = base_table_name.eq_ignore_ascii_case("information_schema.columns")
+                            || base_table_name.eq_ignore_ascii_case("columns");
+
+                        let (base_table_def, rows) = if is_info_tables {
+                            let t_def = crate::catalog::TableDef::new(
+                                base_table_name.clone(),
+                                vec![
+                                    crate::catalog::ColumnDef {
+                                        name: "table_name".to_string(),
+                                        data_type: h2_types::DataType::VarChar(None),
+                                        is_nullable: false,
+                                        is_primary_key: true,
+                                    },
+                                    crate::catalog::ColumnDef {
+                                        name: "columns_count".to_string(),
+                                        data_type: h2_types::DataType::Integer,
+                                        is_nullable: false,
+                                        is_primary_key: false,
+                                    },
+                                ],
+                            );
+                            let tables = self.catalog.all_tables();
+                            let mut rows = Vec::new();
+                            for t in tables {
+                                rows.push(Row::new(vec![
+                                    Value::String(t.name.clone()),
+                                    Value::Integer(t.columns.len() as i32),
+                                ]));
+                            }
+                            (t_def, rows)
+                        } else if is_info_columns {
+                            let t_def = crate::catalog::TableDef::new(
+                                base_table_name.clone(),
+                                vec![
+                                    crate::catalog::ColumnDef {
+                                        name: "table_name".to_string(),
+                                        data_type: h2_types::DataType::VarChar(None),
+                                        is_nullable: false,
+                                        is_primary_key: false,
+                                    },
+                                    crate::catalog::ColumnDef {
+                                        name: "column_name".to_string(),
+                                        data_type: h2_types::DataType::VarChar(None),
+                                        is_nullable: false,
+                                        is_primary_key: false,
+                                    },
+                                    crate::catalog::ColumnDef {
+                                        name: "data_type".to_string(),
+                                        data_type: h2_types::DataType::VarChar(None),
+                                        is_nullable: false,
+                                        is_primary_key: false,
+                                    },
+                                    crate::catalog::ColumnDef {
+                                        name: "is_nullable".to_string(),
+                                        data_type: h2_types::DataType::Boolean,
+                                        is_nullable: false,
+                                        is_primary_key: false,
+                                    },
+                                ],
+                            );
+                            let tables = self.catalog.all_tables();
+                            let mut rows = Vec::new();
+                            for t in tables {
+                                for c in &t.columns {
+                                    rows.push(Row::new(vec![
+                                        Value::String(t.name.clone()),
+                                        Value::String(c.name.clone()),
+                                        Value::String(c.data_type.to_string()),
+                                        Value::Boolean(c.is_nullable),
+                                    ]));
+                                }
+                            }
+                            (t_def, rows)
+                        } else {
+                            let table_def = self.catalog.get_table(&base_table_name).ok_or_else(|| {
+                                H2Error::Catalog(format!("Table '{}' not found", base_table_name))
+                            })?;
+
+                            let map_name = format!("tbl_{}", base_table_name.to_lowercase());
+
+                            // IndexScan の最適化
+                            let mut index_scanned: Option<Vec<Row>> = None;
+                            if from_table.joins.is_empty() {
+                                if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = &select.selection {
+                                    if let Expr::Identifier(ident) = left.as_ref() {
+                                        let col_name = &ident.value;
+                                        let indexes = self.catalog.get_table_indexes(&base_table_name);
+                                        if let Some(target_idx) = indexes.iter().find(|i| i.columns[0].eq_ignore_ascii_case(col_name)) {
+                                            if let Ok(search_val) = evaluate_literal_or_unary(right) {
+                                                let idx_map_name = format!("idx_{}_{}", base_table_name.to_lowercase(), target_idx.name.to_lowercase());
+                                                let idx_entries = tx.scan_visible(&idx_map_name)?;
+                                                let mut matched_row_ids = Vec::new();
+                                                for (k, _) in idx_entries {
+                                                    if let Some((v, r_id)) = decode_index_key(&k) {
+                                                        if v == search_val {
+                                                            matched_row_ids.push(r_id);
+                                                        }
+                                                    }
+                                                }
+                                                let mut fetched = Vec::new();
+                                                for r_id in matched_row_ids {
+                                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                        fetched.push(Row::from_bytes(&val_bytes)?);
+                                                    }
+                                                }
+                                                index_scanned = Some(fetched);
+                                            }
                                         }
                                     }
                                 }
-                                let mut fetched = Vec::new();
-                                for r_id in matched_row_ids {
-                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
-                                        fetched.push(Row::from_bytes(&val_bytes)?);
-                                    }
+                            }
+
+                            let rows = if let Some(r) = index_scanned {
+                                r
+                            } else {
+                                let entries = tx.scan_visible(&map_name)?;
+                                let mut current_rows = Vec::with_capacity(entries.len());
+                                for (_k, val_bytes) in entries {
+                                    current_rows.push(Row::from_bytes(&val_bytes)?);
                                 }
-                                index_scanned = Some(fetched);
-                            }
-                        }
+                                current_rows
+                            };
+                            (table_def, rows)
+                        };
+                        (base_table_def, rows, base_table_alias)
                     }
-                }
-            }
-
-            let rows = if let Some(r) = index_scanned {
-                r
-            } else {
-                let entries = tx.scan_visible(&map_name)?;
-                let mut current_rows = Vec::with_capacity(entries.len());
-                for (_k, val_bytes) in entries {
-                    current_rows.push(Row::from_bytes(&val_bytes)?);
-                }
-                current_rows
-            };
-            (table_def, rows)
-        };
-
-        let mut ctx = RowContext::from_table_def(&base_table_def, base_table_alias.as_deref());
-
-
-        // JOIN の処理
-        for join in &from_table.joins {
-            let (join_table_name, join_table_alias) = match &join.relation {
-                TableFactor::Table { name, alias, .. } => (
-                    name.to_string(),
-                    alias.as_ref().map(|a| a.name.value.clone()),
-                ),
-                _ => return Err(H2Error::Execution("Complex join relations not supported".to_string())),
-            };
-
-            let join_table_def = self.catalog.get_table(&join_table_name).ok_or_else(|| {
-                H2Error::Catalog(format!("Table '{}' not found in JOIN", join_table_name))
-            })?;
-
-            let join_map_name = format!("tbl_{}", join_table_name.to_lowercase());
-            let join_entries = tx.scan_visible(&join_map_name)?;
-            let mut join_rows = Vec::with_capacity(join_entries.len());
-            for (_k, val_bytes) in join_entries {
-                join_rows.push(Row::from_bytes(&val_bytes)?);
-            }
-
-            let base_idx = ctx.columns.len();
-            ctx.append_table(&join_table_def, join_table_alias.as_deref(), base_idx);
-
-            match &join.join_operator {
-                JoinOperator::Inner(JoinConstraint::On(on_expr)) => {
-                    let mut new_rows = Vec::new();
-                    for l in &current_rows {
-                        for r in &join_rows {
-                            let mut vals = l.values.clone();
-                            vals.extend(r.values.clone());
-                            let combined_row = Row::new(vals);
-                            if let Value::Boolean(true) = evaluate_expr_context(on_expr, &ctx, &combined_row)? {
-                                new_rows.push(combined_row);
-                            }
-                        }
-                    }
-                    current_rows = new_rows;
-                }
-                JoinOperator::LeftOuter(JoinConstraint::On(on_expr)) => {
-                    let mut new_rows = Vec::new();
-                    let right_null_vals = vec![Value::Null; join_table_def.columns.len()];
-                    for l in &current_rows {
-                        let mut matched_any = false;
-                        for r in &join_rows {
-                            let mut vals = l.values.clone();
-                            vals.extend(r.values.clone());
-                            let combined_row = Row::new(vals);
-                            if let Value::Boolean(true) = evaluate_expr_context(on_expr, &ctx, &combined_row)? {
-                                new_rows.push(combined_row);
-                                matched_any = true;
-                            }
-                        }
-                        if !matched_any {
-                            let mut vals = l.values.clone();
-                            vals.extend(right_null_vals.clone());
-                            new_rows.push(Row::new(vals));
-                        }
-                    }
-                    current_rows = new_rows;
-                }
-                _ => return Err(H2Error::Execution(format!("Unsupported join operator: {:?}", join.join_operator))),
-            }
-        }
-
-        // WHERE 句のフィルタリング
-        let filtered_rows = if let Some(selection) = &select.selection {
-            let mut matched = Vec::new();
-            for row in current_rows {
-                if let Value::Boolean(true) = evaluate_expr_context(selection, &ctx, &row)? {
-                    matched.push(row);
-                }
-            }
-            matched
-        } else {
-            current_rows
-        };
-
-        // GROUP BY / 集約関数の判定
-        let group_by_exprs = match &select.group_by {
-            GroupByExpr::Expressions(exprs, _) => exprs.clone(),
-            _ => Vec::new(),
-        };
-
-        let has_agg = select.projection.iter().any(|item| match item {
-            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => has_aggregate_func(expr),
-            _ => false,
-        });
-
-        let is_aggregate = !group_by_exprs.is_empty() || has_agg || select.having.is_some();
-
-        let (result_columns, projected_rows) = if is_aggregate {
-            let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
-            for row in filtered_rows {
-                let mut key = Vec::with_capacity(group_by_exprs.len());
-                for expr in &group_by_exprs {
-                    key.push(evaluate_expr_context(expr, &ctx, &row)?);
-                }
-                if let Some(pos) = groups.iter().position(|(k, _)| k == &key) {
-                    groups[pos].1.push(row);
-                } else {
-                    groups.push((key, vec![row]));
-                }
-            }
-
-            if groups.is_empty() && group_by_exprs.is_empty() {
-                groups.push((Vec::new(), Vec::new()));
-            }
-
-            let mut result_columns = Vec::new();
-            for item in &select.projection {
-                result_columns.push(get_select_item_name(item));
-            }
-
-            let mut rows = Vec::new();
-            for (_key, group_rows) in groups {
-                let mut row_vals = Vec::new();
-                for item in &select.projection {
-                    let val = match item {
-                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                            evaluate_aggregate_expr(expr, &ctx, &group_rows)?
-                        }
-                        SelectItem::Wildcard(_) => {
-                            return Err(H2Error::Execution("Wildcard in aggregate query not supported".to_string()));
-                        }
-                        _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
-                    };
-                    row_vals.push(val);
-                }
-                let agg_row = Row::new(row_vals);
-
-                // HAVING 句の評価
-                let mut matches_having = true;
-                if let Some(having) = &select.having {
-                    let having_val = evaluate_aggregate_expr(having, &ctx, &group_rows)?;
-                    if let Value::Boolean(b) = having_val {
-                        matches_having = b;
-                    } else {
-                        matches_having = false;
-                    }
-                }
-
-                if matches_having {
-                    rows.push(agg_row);
-                }
-            }
-
-            // 集約クエリの ORDER BY
-            if let Some(order_by) = &query.order_by {
-                let res_ctx = RowContext {
-                    columns: result_columns.iter().enumerate().map(|(i, name)| ColumnBinding {
-                        table_name: None,
-                        table_alias: None,
-                        column_name: name.clone(),
-                        index: i,
-                    }).collect(),
+                    _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
                 };
 
-                rows.sort_by(|a, b| {
-                    for order_expr in &order_by.exprs {
-                        let val_a = evaluate_expr_context(&order_expr.expr, &res_ctx, a).unwrap_or(Value::Null);
-                        let val_b = evaluate_expr_context(&order_expr.expr, &res_ctx, b).unwrap_or(Value::Null);
-                        let mut ord = val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal);
-                        let is_asc = order_expr.asc.unwrap_or(true);
-                        if !is_asc {
-                            ord = ord.reverse();
+                let mut current_rows = current_rows;
+                let mut ctx = RowContext::from_table_def(&base_table_def, base_table_alias.as_deref());
+
+                // JOIN の処理
+                for join in &from_table.joins {
+                    let (join_table_def, join_rows, join_table_alias) = match &join.relation {
+                        TableFactor::Derived { subquery, alias, .. } => {
+                            let sub_alias = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| "subquery".to_string());
+                            let sub_res = self.execute_query(tx, *subquery.clone())?;
+                            let (cols, rows) = match sub_res {
+                                ExecutionResult::Query { columns, rows } => (columns, rows),
+                                _ => return Err(H2Error::Execution("Derived table must be a query".to_string())),
+                            };
+                            let col_defs = cols.into_iter().map(|c| ColumnDef {
+                                name: c,
+                                data_type: h2_types::DataType::VarChar(None),
+                                is_nullable: true,
+                                is_primary_key: false,
+                            }).collect();
+                            let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
+                            (t_def, rows, Some(sub_alias))
                         }
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-            }
+                        TableFactor::Table { name, alias, .. } => {
+                            let join_table_name = name.to_string();
+                            let join_table_alias = alias.as_ref().map(|a| a.name.value.clone());
 
-            (result_columns, rows)
-        } else {
-            let is_wildcard = select.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_)));
-            let mut result_columns = Vec::new();
+                            let join_table_def = self.catalog.get_table(&join_table_name).ok_or_else(|| {
+                                H2Error::Catalog(format!("Table '{}' not found in JOIN", join_table_name))
+                            })?;
 
-            if is_wildcard {
-                for col in &ctx.columns {
-                    result_columns.push(col.column_name.clone());
-                }
-            } else {
-                for item in &select.projection {
-                    result_columns.push(get_select_item_name(item));
-                }
-            }
-
-            // ソート用に行を準備
-            let mut sort_ctx = ctx.clone();
-            let base_col_len = ctx.columns.len();
-            if !is_wildcard {
-                for (i, name) in result_columns.iter().enumerate() {
-                    sort_ctx.columns.push(ColumnBinding {
-                        table_name: None,
-                        table_alias: None,
-                        column_name: name.clone(),
-                        index: base_col_len + i,
-                    });
-                }
-            }
-
-            let mut extended_rows = Vec::with_capacity(filtered_rows.len());
-            for row in filtered_rows {
-                if is_wildcard {
-                    extended_rows.push(row);
-                } else {
-                    let mut proj_vals = Vec::with_capacity(select.projection.len());
-                    for item in &select.projection {
-                        let val = match item {
-                            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                                evaluate_expr_context(expr, &ctx, &row)?
+                            let join_map_name = format!("tbl_{}", join_table_name.to_lowercase());
+                            let join_entries = tx.scan_visible(&join_map_name)?;
+                            let mut join_rows = Vec::with_capacity(join_entries.len());
+                            for (_k, val_bytes) in join_entries {
+                                join_rows.push(Row::from_bytes(&val_bytes)?);
                             }
-                            _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
-                        };
-                        proj_vals.push(val);
-                    }
-                    let mut full_vals = row.values;
-                    full_vals.extend(proj_vals);
-                    extended_rows.push(Row::new(full_vals));
-                }
-            }
+                            (join_table_def, join_rows, join_table_alias)
+                        }
+                        _ => return Err(H2Error::Execution("Complex join relations not supported".to_string())),
+                    };
 
-            // ORDER BY
-            if let Some(order_by) = &query.order_by {
-                extended_rows.sort_by(|a, b| {
-                    for order_expr in &order_by.exprs {
-                        let val_a = evaluate_expr_context(&order_expr.expr, &sort_ctx, a).unwrap_or(Value::Null);
-                        let val_b = evaluate_expr_context(&order_expr.expr, &sort_ctx, b).unwrap_or(Value::Null);
-                        let mut ord = val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal);
-                        let is_asc = order_expr.asc.unwrap_or(true);
-                        if !is_asc {
-                            ord = ord.reverse();
+                    let base_idx = ctx.columns.len();
+                    ctx.append_table(&join_table_def, join_table_alias.as_deref(), base_idx);
+
+                    match &join.join_operator {
+                        JoinOperator::Inner(JoinConstraint::On(on_expr)) => {
+                            let mut new_rows = Vec::new();
+                            for l in &current_rows {
+                                for r in &join_rows {
+                                    let mut vals = l.values.clone();
+                                    vals.extend(r.values.clone());
+                                    let combined_row = Row::new(vals);
+                                    if let Value::Boolean(true) = evaluate_expr_context(on_expr, &ctx, &combined_row)? {
+                                        new_rows.push(combined_row);
+                                    }
+                                }
+                            }
+                            current_rows = new_rows;
                         }
-                        if ord != std::cmp::Ordering::Equal {
-                            return ord;
+                        JoinOperator::LeftOuter(JoinConstraint::On(on_expr)) => {
+                            let mut new_rows = Vec::new();
+                            let right_null_vals = vec![Value::Null; join_table_def.columns.len()];
+                            for l in &current_rows {
+                                let mut matched_any = false;
+                                for r in &join_rows {
+                                    let mut vals = l.values.clone();
+                                    vals.extend(r.values.clone());
+                                    let combined_row = Row::new(vals);
+                                    if let Value::Boolean(true) = evaluate_expr_context(on_expr, &ctx, &combined_row)? {
+                                        new_rows.push(combined_row);
+                                        matched_any = true;
+                                    }
+                                }
+                                if !matched_any {
+                                    let mut vals = l.values.clone();
+                                    vals.extend(right_null_vals.clone());
+                                    new_rows.push(Row::new(vals));
+                                }
+                            }
+                            current_rows = new_rows;
+                        }
+                        _ => return Err(H2Error::Execution(format!("Unsupported join operator: {:?}", join.join_operator))),
+                    }
+                }
+
+                // WHERE 句のフィルタリング（サブクエリ展開含む）
+                let filtered_rows = if let Some(selection) = &select.selection {
+                    let proc_sel = self.preprocess_subqueries(tx, selection)?;
+                    let mut matched = Vec::new();
+                    for row in current_rows {
+                        if let Value::Boolean(true) = evaluate_expr_context(&proc_sel, &ctx, &row)? {
+                            matched.push(row);
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    matched
+                } else {
+                    current_rows
+                };
+
+                // GROUP BY / 集約関数の判定
+                let group_by_exprs = match &select.group_by {
+                    GroupByExpr::Expressions(exprs, _) => exprs.clone(),
+                    _ => Vec::new(),
+                };
+
+                let has_agg = select.projection.iter().any(|item| match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => has_aggregate_func(expr),
+                    _ => false,
                 });
-            }
 
-            let mut rows = Vec::with_capacity(extended_rows.len());
-            if is_wildcard {
-                rows = extended_rows;
-            } else {
-                for ext_row in extended_rows {
-                    let proj_vals = ext_row.values[base_col_len..].to_vec();
-                    rows.push(Row::new(proj_vals));
+                let is_aggregate = !group_by_exprs.is_empty() || has_agg || select.having.is_some();
+
+                let (result_columns, projected_rows) = if is_aggregate {
+                    let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
+                    for row in filtered_rows {
+                        let mut key = Vec::with_capacity(group_by_exprs.len());
+                        for expr in &group_by_exprs {
+                            key.push(evaluate_expr_context(expr, &ctx, &row)?);
+                        }
+                        if let Some(pos) = groups.iter().position(|(k, _)| k == &key) {
+                            groups[pos].1.push(row);
+                        } else {
+                            groups.push((key, vec![row]));
+                        }
+                    }
+
+                    if groups.is_empty() && group_by_exprs.is_empty() {
+                        groups.push((Vec::new(), Vec::new()));
+                    }
+
+                    let mut result_columns = Vec::new();
+                    for item in &select.projection {
+                        result_columns.push(get_select_item_name(item));
+                    }
+
+                    let mut rows = Vec::new();
+                    for (_key, group_rows) in groups {
+                        let mut row_vals = Vec::new();
+                        for item in &select.projection {
+                            let val = match item {
+                                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                                    let proc_expr = self.preprocess_subqueries(tx, expr)?;
+                                    evaluate_aggregate_expr(&proc_expr, &ctx, &group_rows)?
+                                }
+                                SelectItem::Wildcard(_) => {
+                                    return Err(H2Error::Execution("Wildcard in aggregate query not supported".to_string()));
+                                }
+                                _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
+                            };
+                            row_vals.push(val);
+                        }
+                        let agg_row = Row::new(row_vals);
+
+                        // HAVING 句の評価
+                        let mut matches_having = true;
+                        if let Some(having) = &select.having {
+                            let proc_having = self.preprocess_subqueries(tx, having)?;
+                            let having_val = evaluate_aggregate_expr(&proc_having, &ctx, &group_rows)?;
+                            if let Value::Boolean(b) = having_val {
+                                matches_having = b;
+                            } else {
+                                matches_having = false;
+                            }
+                        }
+
+                        if matches_having {
+                            rows.push(agg_row);
+                        }
+                    }
+
+                    // 集約クエリの ORDER BY
+                    if let Some(order_by) = &query.order_by {
+                        let res_ctx = RowContext {
+                            columns: result_columns.iter().enumerate().map(|(i, name)| ColumnBinding {
+                                table_name: None,
+                                table_alias: None,
+                                column_name: name.clone(),
+                                index: i,
+                            }).collect(),
+                        };
+
+                        rows.sort_by(|a, b| {
+                            for order_expr in &order_by.exprs {
+                                let val_a = evaluate_expr_context(&order_expr.expr, &res_ctx, a).unwrap_or(Value::Null);
+                                let val_b = evaluate_expr_context(&order_expr.expr, &res_ctx, b).unwrap_or(Value::Null);
+                                let mut ord = val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal);
+                                let is_asc = order_expr.asc.unwrap_or(true);
+                                if !is_asc {
+                                    ord = ord.reverse();
+                                }
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                    }
+
+                    (result_columns, rows)
+                } else {
+                    let is_wildcard = select.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_)));
+                    let mut result_columns = Vec::new();
+
+                    if is_wildcard {
+                        for col in &ctx.columns {
+                            result_columns.push(col.column_name.clone());
+                        }
+                    } else {
+                        for item in &select.projection {
+                            result_columns.push(get_select_item_name(item));
+                        }
+                    }
+
+                    // ソート用に行を準備
+                    let mut sort_ctx = ctx.clone();
+                    let base_col_len = ctx.columns.len();
+                    if !is_wildcard {
+                        for (i, name) in result_columns.iter().enumerate() {
+                            sort_ctx.columns.push(ColumnBinding {
+                                table_name: None,
+                                table_alias: None,
+                                column_name: name.clone(),
+                                index: base_col_len + i,
+                            });
+                        }
+                    }
+
+                    let mut extended_rows = Vec::with_capacity(filtered_rows.len());
+                    for row in filtered_rows {
+                        if is_wildcard {
+                            extended_rows.push(row);
+                        } else {
+                            let mut proj_vals = Vec::with_capacity(select.projection.len());
+                            for item in &select.projection {
+                                let val = match item {
+                                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                                        let proc_expr = self.preprocess_subqueries(tx, expr)?;
+                                        evaluate_expr_context(&proc_expr, &ctx, &row)?
+                                    }
+                                    _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
+                                };
+                                proj_vals.push(val);
+                            }
+                            let mut full_vals = row.values;
+                            full_vals.extend(proj_vals);
+                            extended_rows.push(Row::new(full_vals));
+                        }
+                    }
+
+                    // ORDER BY
+                    if let Some(order_by) = &query.order_by {
+                        extended_rows.sort_by(|a, b| {
+                            for order_expr in &order_by.exprs {
+                                let val_a = evaluate_expr_context(&order_expr.expr, &sort_ctx, a).unwrap_or(Value::Null);
+                                let val_b = evaluate_expr_context(&order_expr.expr, &sort_ctx, b).unwrap_or(Value::Null);
+                                let mut ord = val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal);
+                                let is_asc = order_expr.asc.unwrap_or(true);
+                                if !is_asc {
+                                    ord = ord.reverse();
+                                }
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                    }
+
+                    let mut rows = Vec::with_capacity(extended_rows.len());
+                    if is_wildcard {
+                        rows = extended_rows;
+                    } else {
+                        for ext_row in extended_rows {
+                            let proj_vals = ext_row.values[base_col_len..].to_vec();
+                            rows.push(Row::new(proj_vals));
+                        }
+                    }
+
+                    (result_columns, rows)
+                };
+
+                // DISTINCT
+                let mut final_rows = projected_rows;
+                if select.distinct.is_some() {
+                    let mut seen = Vec::new();
+                    let mut unique_rows = Vec::new();
+                    for row in final_rows {
+                        if !seen.contains(&row.values) {
+                            seen.push(row.values.clone());
+                            unique_rows.push(row);
+                        }
+                    }
+                    final_rows = unique_rows;
                 }
+
+                // LIMIT / OFFSET スライス
+                let offset_num = if let Some(offset) = &query.offset {
+                    match evaluate_literal_or_unary(&offset.value)? {
+                        Value::TinyInt(n) => n.max(0) as usize,
+                        Value::SmallInt(n) => n.max(0) as usize,
+                        Value::Integer(n) => n.max(0) as usize,
+                        Value::BigInt(n) => n.max(0) as usize,
+                        _ => return Err(H2Error::Execution("OFFSET must be an integer".to_string())),
+                    }
+                } else {
+                    0
+                };
+
+                let limit_num = if let Some(limit_expr) = &query.limit {
+                    match evaluate_literal_or_unary(limit_expr)? {
+                        Value::TinyInt(n) => Some(n.max(0) as usize),
+                        Value::SmallInt(n) => Some(n.max(0) as usize),
+                        Value::Integer(n) => Some(n.max(0) as usize),
+                        Value::BigInt(n) => Some(n.max(0) as usize),
+                        _ => return Err(H2Error::Execution("LIMIT must be an integer".to_string())),
+                    }
+                } else {
+                    None
+                };
+
+                let final_rows = if let Some(lim) = limit_num {
+                    final_rows.into_iter().skip(offset_num).take(lim).collect()
+                } else {
+                    final_rows.into_iter().skip(offset_num).collect()
+                };
+
+                Ok(ExecutionResult::Query {
+                    columns: result_columns,
+                    rows: final_rows,
+                })
             }
-
-            (result_columns, rows)
-        };
-
-        // LIMIT / OFFSET スライス
-        let offset_num = if let Some(offset) = &query.offset {
-            match evaluate_literal_or_unary(&offset.value)? {
-                Value::TinyInt(n) => n.max(0) as usize,
-                Value::SmallInt(n) => n.max(0) as usize,
-                Value::Integer(n) => n.max(0) as usize,
-                Value::BigInt(n) => n.max(0) as usize,
-                _ => return Err(H2Error::Execution("OFFSET must be an integer".to_string())),
-            }
-        } else {
-            0
-        };
-
-        let limit_num = if let Some(limit_expr) = &query.limit {
-            match evaluate_literal_or_unary(limit_expr)? {
-                Value::TinyInt(n) => Some(n.max(0) as usize),
-                Value::SmallInt(n) => Some(n.max(0) as usize),
-                Value::Integer(n) => Some(n.max(0) as usize),
-                Value::BigInt(n) => Some(n.max(0) as usize),
-                _ => return Err(H2Error::Execution("LIMIT must be an integer".to_string())),
-            }
-        } else {
-            None
-        };
-
-        let final_rows = if let Some(lim) = limit_num {
-            projected_rows.into_iter().skip(offset_num).take(lim).collect()
-        } else {
-            projected_rows.into_iter().skip(offset_num).collect()
-        };
-
-        Ok(ExecutionResult::Query {
-            columns: result_columns,
-            rows: final_rows,
-        })
+            _ => Err(H2Error::Execution("Only SELECT queries or UNION are supported".to_string())),
+        }
     }
 }
 
@@ -1355,6 +1607,22 @@ fn add_values(left: &Value, right: &Value) -> H2Result<Value> {
                 Err(H2Error::TypeError(format!("Cannot add {:?} and {:?}", left, right)))
             }
         }
+    }
+}
+
+fn value_to_sql_expr(val: Value) -> Expr {
+    match val {
+        Value::Null => Expr::Value(sqlparser::ast::Value::Null),
+        Value::Boolean(b) => Expr::Value(sqlparser::ast::Value::Boolean(b)),
+        Value::TinyInt(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
+        Value::SmallInt(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
+        Value::Integer(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
+        Value::BigInt(n) => Expr::Value(sqlparser::ast::Value::Number(n.to_string(), false)),
+        Value::Float(f) => Expr::Value(sqlparser::ast::Value::Number(f.to_string(), false)),
+        Value::Double(d) => Expr::Value(sqlparser::ast::Value::Number(d.to_string(), false)),
+        Value::Decimal(d) => Expr::Value(sqlparser::ast::Value::Number(d.to_string(), false)),
+        Value::String(s) => Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)),
+        _ => Expr::Value(sqlparser::ast::Value::SingleQuotedString(val.to_string())),
     }
 }
 

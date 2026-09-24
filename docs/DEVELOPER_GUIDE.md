@@ -190,7 +190,20 @@ SQL文字列 ──► parse_sql() ──► Statement ──► SQLEngine::exec
 - **`EXPLAIN`**:
   - クエリ AST を解析し、スキャン種別（`IndexScan` vs `TableScan`）、結合アルゴリズム（`NestedLoopJoin`）、Filter 条件、Aggregate、Sort、Limit/Offset を分かりやすいツリー構造で出力します。
 - **`SHOW TABLES` / `SHOW COLUMNS`**:
-  - カタログ情報を走査し、対話型 CLI や GUI ツールで扱いやすい結果セット形式（Table 列、Field/Type/Null/Key 列）で返却します。
+  - カタログ情報を走査し、対話型 CLI や GUIツールで扱いやすい結果セット形式（Table 列、Field/Type/Null/Key 列）で返却します。
+
+### 3.6 高度なクエリ実行パイプライン (FROM句なしSELECT, サブクエリ展開, 派生テーブル, UNION)
+
+- **ファイル**: [`crates/h2-sql/src/executor.rs#L720`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs#L720), [`crates/h2-sql/src/expression.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/expression.rs)
+- **FROM 句なしの SELECT**:
+  - `select.from.is_empty()` の場合、空のコンテキストとダミー行 `Row::new(vec![])` を生成し、プロジェクションリストの式評価（リテラル、四則演算、スカラ関数、CASE WHEN）を実行。
+- **サブクエリ事前展開 (`preprocess_subqueries`)**:
+  - クエリ実行前に AST を走査し、`Expr::Subquery`（スカラサブクエリ）、`Expr::InSubquery`（IN サブクエリ）、`Expr::Exists`（EXISTS 判定）を再帰実行。
+  - `InSubquery` はサブクエリ結果から第0列の値を抽出して `Expr::InList` に変換し、`Exists` は行の有無を `Expr::Value(Boolean)` に置換して既存の高速評価器へ引き渡します。
+- **派生テーブル (FROM / JOIN Subqueries)**:
+  - `TableFactor::Derived` を検知すると、内部サブクエリを再帰的に `execute_query` で実行。得られた列メタデータからインメモリ一時 `TableDef` を構築し、結果行を `current_rows` または `join_rows` にバインドして透過的に結合・集約・ソートを行います。
+- **集合演算 (`UNION` / `UNION ALL`)**:
+  - `SetExpr::SetOperation` をインターセプトし、左右のクエリを並行実行して結果をマージ。`UNION`（デフォルト）の場合は重複行を `O(N)` で排除。
 
 ---
 

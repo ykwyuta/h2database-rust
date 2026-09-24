@@ -28,6 +28,7 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [7. メタデータ調査 (INFORMATION_SCHEMA)](#7-メタデータ調査-information_schema)
   - [8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE)](#8-テーブル構造の変更全削除-alter-table--truncate-table)
   - [9. 実行計画の確認とスキーマ照会 (EXPLAIN, SHOW TABLES, SHOW COLUMNS)](#9-実行計画の確認とスキーマ照会-explain-show-tables-show-columns)
+  - [10. 高度なクエリ演算 (FROM句なしSELECT, サブクエリ, DISTINCT, UNION)](#10-高度なクエリ演算-from句なしselect-サブクエリ-distinct-union)
 - [Part IV. トランザクションと並行性制御 (Transactions & Concurrency)](#part-iv-トランザクションと並行性制御-transactions--concurrency)
   - [1. MVCC (マルチバージョン並行性制御) の特徴](#1-mvcc-マルチバージョン並行性制御-の特徴)
   - [2. Rust API によるトランザクション (RAII 管理)](#2-rust-api-によるトランザクション-raii-管理)
@@ -443,6 +444,92 @@ SHOW TABLES;
 SHOW COLUMNS FROM users;
 ```
 
+## 10. 高度なクエリ演算 (FROM句なしSELECT, サブクエリ, DISTINCT, UNION)
+
+複雑なデータ抽出や計算処理に対応するモダンな SQL 構文を豊富にサポートしています。
+
+### ① FROM 句なしの計算・式評価 (FROM-less SELECT)
+テーブルを参照せず、リテラル計算や関数評価、条件分岐を即座に評価できます。
+
+```sql
+SELECT 1 + 1 AS result, UPPER('hello') AS greeting, NOW() AS current_time;
+```
+
+### ② 条件分岐式 (`CASE WHEN ... THEN ... ELSE ... END`)
+行ごとの動的な値変換やラベル付けが可能です。
+
+```sql
+SELECT name,
+       CASE 
+           WHEN score >= 90 THEN 'A'
+           WHEN score >= 70 THEN 'B'
+           ELSE 'C'
+       END AS rank
+FROM students;
+```
+
+### ③ `IN` および `BETWEEN` 式
+複数の候補値や範囲指定による簡潔な絞り込みに対応しています。
+
+```sql
+SELECT * FROM products WHERE category_id IN (1, 3, 5);
+SELECT * FROM orders WHERE amount BETWEEN 100 AND 500;
+```
+
+### ④ 派生テーブル (FROM 句 / JOIN 句のサブクエリ)
+集約クエリや複雑な中間結果をインメモリの派生テーブル（Derived Table）として扱い、さらにフィルタや結合を行えます。
+
+```sql
+-- 集約結果をサブクエリとして再フィルタ
+SELECT sub.user_id, sub.total_amount
+FROM (
+    SELECT user_id, SUM(amount) AS total_amount
+    FROM orders
+    GROUP BY user_id
+) AS sub
+WHERE sub.total_amount >= 10000;
+
+-- サブクエリとの JOIN
+SELECT u.name, sub.total_amount
+FROM users u
+JOIN (
+    SELECT user_id, SUM(amount) AS total_amount
+    FROM orders
+    GROUP BY user_id
+) AS sub ON u.id = sub.user_id;
+```
+
+### ⑤ `IN` / `EXISTS` サブクエリ & スカラサブクエリ
+WHERE 句での動的条件判定や、列定義でのスカラサブクエリを利用できます。
+
+```sql
+-- IN サブクエリ
+SELECT name FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount >= 500);
+
+-- EXISTS サブクエリ
+SELECT name FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id);
+
+-- スカラサブクエリ
+SELECT name, (SELECT MAX(amount) FROM orders) AS max_order FROM users;
+```
+
+### ⑥ 重複排除 (`SELECT DISTINCT`)
+抽出結果から完全に重複する行を除去します。
+
+```sql
+SELECT DISTINCT department FROM employees ORDER BY department;
+```
+
+### ⑦ クエリ結果の統合 (`UNION` / `UNION ALL`)
+複数のクエリ結果を縦方向に結合します。`UNION` は重複行を自動排除し、`UNION ALL` は全行をそのまま保持します。
+
+```sql
+SELECT name, email FROM internal_users
+UNION
+SELECT name, email FROM external_partners
+ORDER BY name;
+```
+
 ---
 
 # Part IV. トランザクションと並行性制御 (Transactions & Concurrency)
@@ -667,7 +754,8 @@ async_conn.vacuum().await?;
 | `INSERT` | `INSERT INTO tbl [(cols)] VALUES (vals), ...` | 行の挿入 |
 | `UPDATE` | `UPDATE tbl SET col = expr, ... [WHERE cond]` | 行の更新（自己参照式、複数列対応） |
 | `DELETE` | `DELETE FROM tbl [WHERE cond]` | 行の削除 |
-| `SELECT` | `SELECT expr [AS alias], ... FROM tbl [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... OFFSET ...]` | データの問い合わせ・集計・結合 |
+| `SELECT` | `SELECT [DISTINCT] expr [AS alias], ... [FROM tbl [JOIN ...]] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT ... OFFSET ...]` | データの問い合わせ・集計・結合（FROM なし計算、派生テーブルサブクエリ対応） |
+| `UNION` / `UNION ALL` | `SELECT ... UNION [ALL] SELECT ...` | 複数クエリ結果の縦方向結合（重複排除 / 保持） |
 | `EXPLAIN` | `EXPLAIN SELECT ...` | クエリ実行計画の確認（IndexScan / TableScan / NestedLoopJoin など） |
 | `SHOW TABLES` | `SHOW TABLES;` | 定義されている全テーブル名の一覧照会 |
 | `SHOW COLUMNS` | `SHOW COLUMNS FROM tbl;` | テーブルのカラム名・データ型・制約情報の一覧照会 |
@@ -681,6 +769,16 @@ async_conn.vacuum().await?;
 | 関数 / 演算子 | 使用例 | 説明 |
 | :--- | :--- | :--- |
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | `SELECT department, AVG(salary) FROM emp GROUP BY department` | 標準集約関数 |
+| `COALESCE` | `COALESCE(col1, col2, 'default')` | 最初の非 NULL 引数を返却 |
+| `UPPER`, `LOWER` | `UPPER(name)`, `LOWER(email)` | 大文字・小文字変換 |
+| `CONCAT` | `CONCAT(first_name, ' ', last_name)` | 複数文字列の結合 |
+| `LENGTH`, `CHAR_LENGTH` | `LENGTH(title)` | 文字列の文字数を取得 |
+| `ABS` | `ABS(amount)` | 数値の絶対値を計算 |
+| `NOW`, `CURRENT_TIMESTAMP` | `SELECT NOW()` | 現在の協定世界時（RFC 3339 形式）を取得 |
+| `CASE WHEN` | `CASE WHEN age >= 20 THEN 'adult' ELSE 'minor' END` | 条件分岐評価式 |
+| `IN`, `NOT IN` | `id IN (1, 2, 3)` / `id IN (SELECT user_id FROM orders)` | リストまたはサブクエリに含まれるか判定 |
+| `BETWEEN` | `price BETWEEN 100 AND 500` | 範囲内判定（境界含む） |
+| `EXISTS` | `WHERE EXISTS (SELECT 1 FROM orders WHERE ...)` | 相関/非相関サブクエリの存在判定 |
 | `FT_SEARCH` | `FT_SEARCH(col, 'キーワード')` | 日本語 2-gram 全文検索述語（AND一致） |
 | `FT_SEARCH_MORPH` | `FT_SEARCH_MORPH(col, '形態素 単語')` | 文字種境界形態素解析 全文検索述語 |
 | `->` | `data -> 'profile'` | JSON オブジェクトの特定キー抽出（JSON値返却） |
