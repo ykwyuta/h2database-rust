@@ -13,6 +13,20 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub is_nullable: bool,
     pub is_primary_key: bool,
+    #[serde(default)]
+    pub physical_index: Option<usize>,
+}
+
+impl ColumnDef {
+    pub fn new(name: impl Into<String>, data_type: DataType, is_nullable: bool, is_primary_key: bool) -> Self {
+        Self {
+            name: name.into(),
+            data_type,
+            is_nullable,
+            is_primary_key,
+            physical_index: None,
+        }
+    }
 }
 
 /// 外部キーアクション
@@ -46,7 +60,12 @@ pub struct TableDef {
 }
 
 impl TableDef {
-    pub fn new(name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
+    pub fn new(name: impl Into<String>, mut columns: Vec<ColumnDef>) -> Self {
+        for (idx, col) in columns.iter_mut().enumerate() {
+            if col.physical_index.is_none() {
+                col.physical_index = Some(idx);
+            }
+        }
         Self {
             name: name.into(),
             columns,
@@ -57,6 +76,35 @@ impl TableDef {
 
     pub fn column_index(&self, col_name: &str) -> Option<usize> {
         self.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))
+    }
+
+    /// 行データのカラム構成をテーブル定義の論理カラム列にアライン
+    /// （Instant Add Column / Drop Column で生じる物理行と論理定義の差異を透過的に補正）
+    pub fn align_row(&self, row: &mut crate::row::Row) {
+        let has_explicit_phys = self.columns.iter().any(|c| c.physical_index.is_some());
+        if has_explicit_phys {
+            let mut new_values = Vec::with_capacity(self.columns.len());
+            for col in &self.columns {
+                let val = match col.physical_index {
+                    Some(phys_idx) if phys_idx < row.values.len() => row.values[phys_idx].clone(),
+                    _ => h2_types::Value::Null,
+                };
+                new_values.push(val);
+            }
+            row.values = new_values;
+        } else if row.values.len() < self.columns.len() {
+            row.values.resize(self.columns.len(), h2_types::Value::Null);
+        }
+    }
+
+    /// 次の物理カラムインデックスを決定
+    pub fn next_physical_index(&self) -> usize {
+        self.columns
+            .iter()
+            .filter_map(|c| c.physical_index)
+            .max()
+            .map(|idx| idx + 1)
+            .unwrap_or(self.columns.len())
     }
 }
 

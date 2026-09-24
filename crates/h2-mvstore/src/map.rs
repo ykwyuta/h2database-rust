@@ -33,4 +33,9 @@ impl MVMap {
     pub fn scan_all(&self) -> Vec<Entry> {
         self.tree.read().scan_all()
     }
+
+    /// マップ内の全エントリを一括消去 (O(1))
+    pub fn clear(&self) {
+        *self.tree.write() = MVTree::default();
+    }
 }

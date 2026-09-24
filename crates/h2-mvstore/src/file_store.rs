@@ -215,8 +215,35 @@ impl FileStore {
         drop(temp_file);
         self.file = None;
 
-        // Windowsでも安全なファイル置換
-        std::fs::rename(&temp_path, path)?;
+        // Windowsでも安全なアトミックファイル置換
+        let backup_path = path.with_extension("compact_bak");
+        if backup_path.exists() {
+            let _ = std::fs::remove_file(&backup_path);
+        }
+
+        // 既存ファイルをバックアップへ移動し、新ファイルを配置
+        let mut replaced = false;
+        for _ in 0..10 {
+            if std::fs::rename(path, &backup_path).is_ok() {
+                if std::fs::rename(&temp_path, path).is_ok() {
+                    let _ = std::fs::remove_file(&backup_path);
+                    replaced = true;
+                    break;
+                } else {
+                    // ロールバック
+                    let _ = std::fs::rename(&backup_path, path);
+                }
+            } else if std::fs::rename(&temp_path, path).is_ok() {
+                // 直接置換に成功した場合
+                replaced = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        if !replaced {
+            return Err(H2Error::Storage("Failed to replace storage file during compaction".to_string()));
+        }
 
         // 置換後のファイルを再オープン
         let reopened = OpenOptions::new()

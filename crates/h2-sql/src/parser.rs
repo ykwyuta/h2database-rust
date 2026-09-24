@@ -143,12 +143,7 @@ pub fn extract_create_table(
             }
         }
 
-        col_defs.push(ColumnDef {
-            name: col_name,
-            data_type: dt,
-            is_nullable,
-            is_primary_key: is_pk,
-        });
+        col_defs.push(ColumnDef::new(col_name, dt, is_nullable, is_pk));
     }
 
     let mut t_def = TableDef::new(table_name, col_defs);

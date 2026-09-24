@@ -465,36 +465,49 @@ WHERE table_name = 'users'
 ORDER BY ordinal_position;
 ```
 
-## 8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE)
+## 8. テーブル構造の変更・全削除 (ALTER TABLE & TRUNCATE TABLE) - 完全オンライン / Instant DDL 対応
 
-稼働中のテーブルに対するスキーマ変更（列の追加・削除、テーブル名変更）や、大量データの高速な一括削除に対応しています。
+本データベースは、稼働中の大規模本番環境でもサービス停止やクエリ待ち（ロック競合）を発生させない**完全オンライン DDL (Online & Instant DDL)** を標準採用しています。
 
-### ① テーブル名の変更 (`ALTER TABLE ... RENAME TO`)
-データおよび関連インデックスを保持したままテーブル名を変更します。
+> [!TIP]
+> **Instant DDL の技術的特徴 ($O(1)$ メタデータ変更)**:
+> 従来の RDBMS のように数百万行のテーブル全件をスキャンして物理書き換え（長時間の排他ロック）を行うのではなく、カタログメタデータのみを $O(1)$ で更新し、行読み取り時に透過補完（`align_row`）を行うアーキテクチャを採用しています。これにより、行数に関わらず **数ミリ秒オーダー** で安全かつ即座に完了します。
+
+### ① 高速オンライン・テーブル名変更 (`ALTER TABLE ... RENAME TO`)
+全行のコピー・削除ループを行わず、内部 B-Tree マップのキー付け替え（`rename_map`）のみで $O(1)$ アトミックに完了します。関連インデックスも同時にリネームされます。
 
 ```sql
 ALTER TABLE customers RENAME TO clients;
 ```
 
-### ② カラムの追加 (`ALTER TABLE ... ADD COLUMN`)
-既存テーブルに新しい列を追加します。既存レコードには自動的に `NULL` が補完されます。
+### ② インスタント・カラム追加 (`ALTER TABLE ... ADD COLUMN`)
+**Instant Add Column** に対応しています。全行の物理書き換えを行わず、カタログに論理カラム定義を追加するのみで即座に完了します。既存レコードを読み出す際は、エンジンが動的に `NULL` またはデフォルト値を透過補完します。
 
 ```sql
 ALTER TABLE employees ADD COLUMN department VARCHAR(50);
 ```
 
-### ③ カラムの削除 (`ALTER TABLE ... DROP COLUMN`)
-テーブル定義および既存レコードから対象列のデータを安全に削除します。
+### ③ インスタント・カラム削除 (`ALTER TABLE ... DROP COLUMN`)
+**Instant Drop Column** に対応しています。物理行から 1 件ずつ削除するのではなく、カタログの論理定義から除外するのみで $O(1)$ 完了します。読み出し時に該当列は自動的に非表示（プロジェクション除外）となります。
 
 ```sql
 ALTER TABLE users DROP COLUMN temp_token;
 ```
 
-### ④ テーブルデータの全削除 (`TRUNCATE TABLE`)
-テーブルの定義およびスキーマ構造を維持したまま、格納されている全レコードおよび関連インデックスを即座に破棄し、自動採番カウンタ（Row ID）を初期化します。
+### ④ 高速オンライン・テーブル全データ削除 (`TRUNCATE TABLE`)
+**Online Truncate Table** に対応しています。1行ずつの削除・Undo Log 積み上げループを廃止し、内部 B-Tree を $O(1)$ で一括クリア（`clear_map`）します。大量データであっても一瞬で全件消去され、Row ID も 1 にリセットされます（外部キー制約の参照チェックは安全に維持されます）。
 
 ```sql
 TRUNCATE TABLE logs;
+```
+
+### ⑤ オンライン・インデックス構築 (`CREATE INDEX CONCURRENTLY`)
+通常の `CREATE INDEX` に加え、PostgreSQL 互換の `CONCURRENTLY` オプションをサポートしています。
+MVCC スナップショット読み取りを活用し、テーブル全体を排他ロックすることなく、並行ライター（INSERT/UPDATE）やリーダー（SELECT）の処理を妨げずにインデックスを構築できます。
+
+```sql
+CREATE INDEX CONCURRENTLY idx_users_email ON users (email);
+CREATE UNIQUE INDEX CONCURRENTLY idx_orders_code ON orders (order_code);
 ```
 
 ## 9. 実行計画の確認とスキーマ照会 (EXPLAIN, SHOW TABLES, SHOW COLUMNS)
@@ -1078,10 +1091,17 @@ h2> .exit
 Bye!
 ```
 
-## 4. ストレージのコンパクション (Vacuum によるファイル縮小)
+## 4. ストレージのオンライン・コンパクション (Concurrent Vacuum によるファイル縮小)
 
 追記型 CoW B-Tree ストレージ（MVStore）では、データの更新や削除を繰り返すと過去バージョンの古いデータがファイル内に残ります。
-`VACUUM` を実行することで、現在有効なデータのみを前方へ再配置し、ファイルサイズを物理的に縮小（空き領域を OS へ返却）できます。
+`VACUUM` を実行することで、コミット済みの最新確定データのみを抽出して一時ファイルにコンパクトに再構築し、アトミックにファイルを置換してファイルサイズを物理的に縮小（空き領域を OS へ返却）できます。
+
+> [!IMPORTANT]
+> **完全オンライン・非ブロッキング設計 (Concurrent Vacuum)**:
+> 1. **並行トランザクションの非ブロッキング**: 他の接続が `SELECT` や `INSERT/UPDATE/DELETE` を実行中であってもブロックせず、並行してコンパクションが完了します。
+> 2. **未コミットデータの混入防止**: Vacuum 実行時に未コミットのトランザクションが存在しても、未コミットの変更は永続化ツリーから自動的に除外されます。
+> 3. **安全な物理ガベージコレクション**: 過去に `DELETE` されコミットされたデッドレコードは物理ツリーから完全に除去（Purge）されます。
+> 4. **アトミック置換**: 一時ファイルへの同期（fsync）完了後にアトミックにファイル切り替えが行われるため、停電やクラッシュ時にもデータ破損が発生しません。
 
 ### SQL からの実行:
 ```sql
@@ -1106,11 +1126,12 @@ async_conn.vacuum().await?;
 | コマンド | 構文例 | 概要 |
 | :--- | :--- | :--- |
 | `CREATE TABLE` | `CREATE TABLE [IF NOT EXISTS] tbl (col type, ...)` | テーブル作成（主キー、NOT NULL、デフォルト値） |
-| `ALTER TABLE` | `ALTER TABLE tbl RENAME TO new_tbl` / `ADD [COLUMN] col_def` / `DROP [COLUMN] col_name` | テーブル定義の変更（リネーム、列追加、列削除） |
+| `ALTER TABLE` | `ALTER TABLE tbl RENAME TO new_tbl` / `ADD [COLUMN] col_def` / `DROP [COLUMN] col_name` | **Instant / Online DDL**: O(1)メタデータ更新による非ブロッキング高速変更 |
 | `DROP TABLE` | `DROP TABLE [IF EXISTS] tbl` | テーブルおよび関連インデックス・マップの削除 |
-| `TRUNCATE TABLE` | `TRUNCATE TABLE tbl` | 全行およびインデックスの高速一括削除・Row ID リセット |
-| `CREATE INDEX` | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx ON tbl (col)` | セカンダリ・一意インデックスの作成 |
+| `TRUNCATE TABLE` | `TRUNCATE TABLE tbl` | **Online Truncate**: O(1)一括クリアによる全行高速削除・Row ID リセット |
+| `CREATE INDEX` | `CREATE [UNIQUE] INDEX [CONCURRENTLY] idx ON tbl (col)` | **Online Index Build**: ロックフリーな並行インデックス作成対応 |
 | `DROP INDEX` | `DROP INDEX [IF EXISTS] idx` | インデックスの削除 |
+| `VACUUM` | `VACUUM;` | **Concurrent Vacuum**: 並行トランザクションと両立するオンライン物理ファイル縮小 |
 | `INSERT` | `INSERT INTO tbl [(cols)] VALUES (vals), ...` | 行の挿入 |
 | `UPDATE` | `UPDATE tbl SET col = expr, ... [WHERE cond]` | 行の更新（自己参照式、複数列対応） |
 | `DELETE` | `DELETE FROM tbl [WHERE cond]` | 行の削除 |

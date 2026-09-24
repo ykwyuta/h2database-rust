@@ -11,7 +11,7 @@
 | 分野 | 主な標準規格 | 実装完了 (Supported) | 未実装 / 制限事項 (Unsupported / Limitations) |
 | :--- | :--- | :--- | :--- |
 | **データ型** | SQL-92 / SQL:1999 / SQL:2016 | 真偽値, 整数各種, 浮動小数, 高精度数値(Decimal), 文字列(Varchar/Text), バイナリ, 日付時刻(Date/Time/Timestamp), **TIMESTAMPTZ (タイムゾーン保持型)**, UUID, JSON/JSONB, 配列 | `INTERVAL`, `ENUM`, 複合型/ユーザー定義型(UDT), 空間型 |
-| **DDL (定義)** | SQL-92 / SQL:2008 | `CREATE TABLE` (PK, Not Null, **Foreign Key/参照整合性**), `DROP TABLE`, `ALTER TABLE` (Rename, Add Col, Drop Col), `TRUNCATE TABLE`, `CREATE/DROP INDEX`, **`CREATE/DROP VIEW` (仮想ビュー)** | `CHECK` 制約, 複合主キー制約, `CREATE SCHEMA` |
+| **DDL (定義)** | SQL-92 / SQL:2008 | `CREATE TABLE` (PK, Not Null, **Foreign Key/参照整合性**), `DROP TABLE`, **`ALTER TABLE` (Instant Add Col, Instant Drop Col, Online Rename Table)**, **`TRUNCATE TABLE` (Online Truncate)**, **`CREATE INDEX CONCURRENTLY` (Online Index)**, `DROP INDEX`, **`CREATE/DROP VIEW` (仮想ビュー)**, **`VACUUM` (Concurrent Vacuum)** | `CHECK` 制約, 複合主キー制約, `CREATE SCHEMA` |
 | **DML (操作)** | SQL-92 / SQL:2003 | 単行/複数行 `INSERT`, **`INSERT INTO ... SELECT`**, `UPDATE` (複数列代入・自己参照式・FK検証), `DELETE` (連動削除 CASCADE/SET NULL/RESTRICT) | `UPSERT` (`ON CONFLICT DO UPDATE`), `RETURNING` 句 |
 | **DQL (検索)** | SQL-92 / SQL:1999 / SQL:2003 | FROM なし `SELECT`, 列射影・エイリアス, **共通テーブル式 (`WITH` / CTE)**, `WHERE`, `IN`, `BETWEEN`, `CASE WHEN`, `JOIN` (Inner, Left Outer, View/Chained Join), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, **集合演算 (`UNION`, `INTERSECT`, `EXCEPT` / ALL)**, **ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `DENSE_RANK`)**, サブクエリ (Derived Table, IN, EXISTS, スカラ) | 再帰 CTE (`WITH RECURSIVE`), `RIGHT/FULL OUTER JOIN`, `CROSS JOIN` |
 | **TCL (トランザクション)** | SQL-92 | `BEGIN`, `COMMIT`, `ROLLBACK`, MVCC スナップショット分離, 自動 Undo Log 復元, **デッドロック検出・自動キャンセル (Victim Rollback)**, **クエリ単位実行タイムアウト (`SET statement_timeout`)** | **`SAVEPOINT` (設計方針として実装対象外)**, 動的分離レベル変更 (`SET TRANSACTION ISOLATION LEVEL`) |
@@ -81,16 +81,18 @@
 - **テーブル削除 (`DROP TABLE`)**:
   - `DROP TABLE [IF EXISTS] tbl`
   - 削除時に所属するセカンダリインデックスおよびストレージマップも安全に物理破棄。
-- **テーブル定義変更 (`ALTER TABLE`)**:
-  - **テーブル名変更**: `ALTER TABLE tbl RENAME TO new_tbl` (データと全インデックスを維持してリネーム)
-  - **列追加**: `ALTER TABLE tbl ADD [COLUMN] col_name data_type` (既存行には自動で `NULL` を補完)
-  - **列削除**: `ALTER TABLE tbl DROP [COLUMN] col_name [IF EXISTS]` (対象列の値を全行から削除)
-- **全データ高速削除 (`TRUNCATE TABLE`)**:
-  - `TRUNCATE TABLE tbl` (テーブル定義を残して全レコードと全インデックスを破棄、Row ID を 1 に初期化)
+- **テーブル定義変更 (`ALTER TABLE`) - 完全オンライン / Instant DDL**:
+  - **オンライン・テーブル名変更**: `ALTER TABLE tbl RENAME TO new_tbl` (内部マップのキー置換のみで $O(1)$ アトミックに完了)
+  - **インスタント・列追加**: `ALTER TABLE tbl ADD [COLUMN] col_name data_type` (全行物理書き換えを行わず $O(1)$ メタデータ更新。読み出し時に NULL 透過補完)
+  - **インスタント・列削除**: `ALTER TABLE tbl DROP [COLUMN] col_name [IF EXISTS]` (全行物理削除ループを行わず $O(1)$ カタログ更新。射影時に自動非表示)
+- **全データ高速削除 (`TRUNCATE TABLE`) - 完全オンライン**:
+  - `TRUNCATE TABLE tbl` (1行ずつの削除ループを廃止し、B-Tree ツリーを $O(1)$ 一括クリア。Row ID を 1 に初期化)
 - **インデックス管理 (`CREATE INDEX`, `DROP INDEX`)**:
-  - `CREATE [UNIQUE] INDEX [IF NOT EXISTS] idx_name ON tbl (col)`
+  - `CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] idx_name ON tbl (col)`: **Online Index Build** 対応（スナップショット分離により並行ライターをブロックせず構築可能）
   - `DROP INDEX [IF EXISTS] idx_name`
   - B-Tree による O(log N) 探索、一意性制約の強制。
+- **オンライン・ストレージコンパクション (`VACUUM`)**:
+  - `VACUUM`: **Concurrent Vacuum** 対応（並行トランザクションをブロックせず、未コミット変更を排除してコミット済みデータのみを一時ファイル書き出し＋アトミック置換してファイルサイズを物理縮小）
 - **仮想ビュー管理 (`CREATE VIEW`, `DROP VIEW`)**:
   - `CREATE VIEW view_name AS query`: 仮想ビューの定義とカタログ永続化
   - `CREATE OR REPLACE VIEW view_name AS query`: 既存ビューの安全な置換

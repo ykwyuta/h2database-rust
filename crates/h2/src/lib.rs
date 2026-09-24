@@ -28,6 +28,7 @@ enum TxCommand {
     Commit,
     Rollback,
     SetStatementTimeout(u64),
+    Vacuum,
     Other,
 }
 
@@ -47,6 +48,8 @@ fn parse_tx_command(sql: &str) -> TxCommand {
         || trimmed.eq_ignore_ascii_case("ROLLBACK TRANSACTION")
     {
         TxCommand::Rollback
+    } else if trimmed.eq_ignore_ascii_case("VACUUM") {
+        TxCommand::Vacuum
     } else if let Some(ms) = parse_set_timeout(trimmed) {
         TxCommand::SetStatementTimeout(ms)
     } else {
@@ -285,6 +288,10 @@ impl Connection {
             }
             TxCommand::SetStatementTimeout(ms) => {
                 self.set_query_timeout_ms(ms);
+                Ok(0)
+            }
+            TxCommand::Vacuum => {
+                self.vacuum()?;
                 Ok(0)
             }
             TxCommand::Other => {

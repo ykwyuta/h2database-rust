@@ -124,12 +124,12 @@ impl SQLEngine {
             } else {
                 cols
             };
-            let col_defs = final_cols.into_iter().map(|c| ColumnDef {
-                name: c,
-                data_type: h2_types::DataType::VarChar(None),
-                is_nullable: true,
-                is_primary_key: false,
-            }).collect();
+            let col_defs = final_cols.into_iter().map(|c| ColumnDef::new(
+                c,
+                h2_types::DataType::VarChar(None),
+                true,
+                false,
+            )).collect();
             let effective_name = alias.clone().unwrap_or_else(|| view.name.clone());
             let t_def = crate::catalog::TableDef::new(effective_name, col_defs);
             Ok((t_def, rows, alias))
@@ -211,8 +211,10 @@ impl SQLEngine {
                 let first_col_idx = table_def.column_index(&col_names[0]).unwrap();
                 let mut seen_keys = Vec::new();
 
+                let _is_concurrently = create_index.concurrently;
                 for (k, val_bytes) in entries {
-                    let row = Row::from_bytes(&val_bytes)?;
+                    let mut row = Row::from_bytes(&val_bytes)?;
+                    table_def.align_row(&mut row);
                     let col_val = row.get(first_col_idx).cloned().unwrap_or(Value::Null);
                     let row_id = if k.len() == 8 {
                         u64::from_le_bytes(k.as_slice().try_into().unwrap())
@@ -359,7 +361,8 @@ impl SQLEngine {
                 let mut affected_rows = 0;
 
                 for (key, val_bytes) in entries {
-                    let row = Row::from_bytes(&val_bytes)?;
+                    let mut row = Row::from_bytes(&val_bytes)?;
+                    table_def.align_row(&mut row);
                     let matches = if let Some(selection) = &delete.selection {
                         match evaluate_expr(selection, &table_def, &row)? {
                             Value::Boolean(b) => b,
@@ -413,6 +416,7 @@ impl SQLEngine {
 
                 for (key, val_bytes) in entries {
                     let mut row = Row::from_bytes(&val_bytes)?;
+                    table_def.align_row(&mut row);
                     let matches = if let Some(sel) = &selection {
                         match evaluate_expr(sel, &table_def, &row)? {
                             Value::Boolean(b) => b,
@@ -562,25 +566,14 @@ impl SQLEngine {
                     }
 
                     let map_name = format!("tbl_{}", table_name.to_lowercase());
-                    let keys: Vec<Vec<u8>> = tx.scan_visible(&map_name)?
-                        .into_iter()
-                        .map(|(k, _)| k)
-                        .collect();
-                    for k in keys {
-                        tx.remove(&map_name, &k)?;
-                    }
+                    // 高速オンラインTruncate: 1行ずつの削除ループを廃止しO(1)でツリーを一括クリア
+                    self.store.clear_map(&map_name);
 
-                    // 関連インデックスマップも全件削除
+                    // 関連インデックスマップも一括クリア
                     let indexes = self.catalog.get_table_indexes(&table_name);
                     for idx in indexes {
                         let idx_map = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
-                        let idx_keys: Vec<Vec<u8>> = tx.scan_visible(&idx_map)?
-                            .into_iter()
-                            .map(|(k, _)| k)
-                            .collect();
-                        for k in idx_keys {
-                            tx.remove(&idx_map, &k)?;
-                        }
+                        self.store.clear_map(&idx_map);
                     }
 
                     // next_row_id リセット
@@ -606,23 +599,14 @@ impl SQLEngine {
                             let old_map = format!("tbl_{}", table_name.to_lowercase());
                             let new_map = format!("tbl_{}", new_name.to_lowercase());
 
-                            let rows = tx.scan_visible(&old_map)?;
-                            for (k, v) in rows {
-                                tx.put(&new_map, k.clone(), v)?;
-                                tx.remove(&old_map, &k)?;
-                            }
-                            self.store.remove_map(&old_map);
+                            // 高速オンラインRename: 全行コピー・削除ループを廃止し、マップキーの差し替えのみでO(1)完了
+                            self.store.rename_map(&old_map, &new_map)?;
 
                             let indexes = self.catalog.get_table_indexes(&table_name);
                             for idx in indexes {
                                 let old_idx_map = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
                                 let new_idx_map = format!("idx_{}_{}", new_name.to_lowercase(), idx.name.to_lowercase());
-                                let idx_entries = tx.scan_visible(&old_idx_map)?;
-                                for (k, v) in idx_entries {
-                                    tx.put(&new_idx_map, k.clone(), v)?;
-                                    tx.remove(&old_idx_map, &k)?;
-                                }
-                                self.store.remove_map(&old_idx_map);
+                                let _ = self.store.rename_map(&old_idx_map, &new_idx_map);
                             }
 
                             self.catalog.rename_table(&table_name, &new_name)?;
@@ -643,22 +627,13 @@ impl SQLEngine {
                                     is_nullable = false;
                                 }
                             }
-                            table_def.columns.push(ColumnDef {
-                                name: col_name,
-                                data_type: dt,
-                                is_nullable,
-                                is_primary_key: false,
-                            });
+                            let phys_idx = table_def.next_physical_index();
+                            let mut new_col = ColumnDef::new(col_name, dt, is_nullable, false);
+                            new_col.physical_index = Some(phys_idx);
+                            table_def.columns.push(new_col);
 
-                            let map_name = format!("tbl_{}", table_name.to_lowercase());
-                            let entries = tx.scan_visible(&map_name)?;
-                            for (k, v) in entries {
-                                if let Ok(mut row) = Row::from_bytes(&v) {
-                                    row.values.push(Value::Null);
-                                    tx.put(&map_name, k, row.to_bytes()?)?;
-                                }
-                            }
-
+                            // Instant DDL: テーブルの全行スキャン＆物理書き換えは不要！
+                            // 既存データはそのまま保持され、行読み出し時に table_def.align_row(&mut row) で自動補完される。
                             self.catalog.update_table(table_def)?;
                         }
                         sqlparser::ast::AlterTableOperation::DropColumn { column_name, if_exists: col_if_exists, .. } => {
@@ -674,18 +649,9 @@ impl SQLEngine {
                                 )));
                             };
 
+                            // Instant DDL: 全行スキャン＆物理削除は行わない！
+                            // カタログから該当列を削除し、行読み出し時に table_def.align_row(&mut row) で論理投影される。
                             table_def.columns.remove(col_idx);
-
-                            let map_name = format!("tbl_{}", table_name.to_lowercase());
-                            let entries = tx.scan_visible(&map_name)?;
-                            for (k, v) in entries {
-                                if let Ok(mut row) = Row::from_bytes(&v) {
-                                    if col_idx < row.values.len() {
-                                        row.values.remove(col_idx);
-                                    }
-                                    tx.put(&map_name, k, row.to_bytes()?)?;
-                                }
-                            }
 
                             self.catalog.update_table(table_def)?;
                         }
@@ -795,7 +761,8 @@ impl SQLEngine {
             let entries = tx.scan_visible(&parent_map)?;
             let mut exists = false;
             for (_k, v) in entries {
-                let p_row = Row::from_bytes(&v)?;
+                let mut p_row = Row::from_bytes(&v)?;
+                parent_table_def.align_row(&mut p_row);
                 if p_row.values.get(parent_col_idx) == Some(val) {
                     exists = true;
                     break;
@@ -846,7 +813,8 @@ impl SQLEngine {
             let child_entries = tx.scan_visible(&child_map_name)?;
             let mut matching_child_rows = Vec::new();
             for (c_key, c_val_bytes) in child_entries {
-                let c_row = Row::from_bytes(&c_val_bytes)?;
+                let mut c_row = Row::from_bytes(&c_val_bytes)?;
+                child_table_def.align_row(&mut c_row);
                 if c_row.values.get(child_col_idx) == Some(parent_val) {
                     matching_child_rows.push((c_key, c_row));
                 }
@@ -961,7 +929,8 @@ impl SQLEngine {
             let child_entries = tx.scan_visible(&child_map_name)?;
             let mut matching_child_rows = Vec::new();
             for (c_key, c_val_bytes) in child_entries {
-                let c_row = Row::from_bytes(&c_val_bytes)?;
+                let mut c_row = Row::from_bytes(&c_val_bytes)?;
+                child_table_def.align_row(&mut c_row);
                 if c_row.values.get(child_col_idx) == Some(old_val) {
                     matching_child_rows.push((c_key, c_row));
                 }
@@ -1217,12 +1186,12 @@ impl SQLEngine {
                     ExecutionResult::Query { columns, rows } => (columns, rows),
                     _ => return Err(H2Error::Execution("CTE must be a SELECT query".to_string())),
                 };
-                let col_defs = cols.into_iter().map(|c| ColumnDef {
-                    name: c,
-                    data_type: h2_types::DataType::VarChar(None),
-                    is_nullable: true,
-                    is_primary_key: false,
-                }).collect();
+                let col_defs = cols.into_iter().map(|c| ColumnDef::new(
+                    c,
+                    h2_types::DataType::VarChar(None),
+                    true,
+                    false,
+                )).collect();
                 let t_def = crate::catalog::TableDef::new(cte_name.clone(), col_defs);
                 current_ctes.insert(cte_name.to_lowercase(), (t_def, rows));
             }
@@ -1435,12 +1404,12 @@ impl SQLEngine {
                             ExecutionResult::Query { columns, rows } => (columns, rows),
                             _ => return Err(H2Error::Execution("Derived table must be a query".to_string())),
                         };
-                        let col_defs = cols.into_iter().map(|c| ColumnDef {
-                            name: c,
-                            data_type: h2_types::DataType::VarChar(None),
-                            is_nullable: true,
-                            is_primary_key: false,
-                        }).collect();
+                        let col_defs = cols.into_iter().map(|c| ColumnDef::new(
+                            c,
+                            h2_types::DataType::VarChar(None),
+                            true,
+                            false,
+                        )).collect();
                         let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
                         (t_def, rows, Some(sub_alias))
                     }
@@ -1466,18 +1435,18 @@ impl SQLEngine {
                                 let t_def = crate::catalog::TableDef::new(
                                     base_table_name.clone(),
                                     vec![
-                                        crate::catalog::ColumnDef {
-                                            name: "table_name".to_string(),
-                                            data_type: h2_types::DataType::VarChar(None),
-                                            is_nullable: false,
-                                            is_primary_key: true,
-                                        },
-                                        crate::catalog::ColumnDef {
-                                            name: "columns_count".to_string(),
-                                            data_type: h2_types::DataType::Integer,
-                                            is_nullable: false,
-                                            is_primary_key: false,
-                                        },
+                                        crate::catalog::ColumnDef::new(
+                                            "table_name",
+                                            h2_types::DataType::VarChar(None),
+                                            false,
+                                            true,
+                                        ),
+                                        crate::catalog::ColumnDef::new(
+                                            "columns_count",
+                                            h2_types::DataType::Integer,
+                                            false,
+                                            false,
+                                        ),
                                     ],
                                 );
                                 let tables = self.catalog.all_tables();
@@ -1493,30 +1462,30 @@ impl SQLEngine {
                                 let t_def = crate::catalog::TableDef::new(
                                     base_table_name.clone(),
                                     vec![
-                                        crate::catalog::ColumnDef {
-                                            name: "table_name".to_string(),
-                                            data_type: h2_types::DataType::VarChar(None),
-                                            is_nullable: false,
-                                            is_primary_key: false,
-                                        },
-                                        crate::catalog::ColumnDef {
-                                            name: "column_name".to_string(),
-                                            data_type: h2_types::DataType::VarChar(None),
-                                            is_nullable: false,
-                                            is_primary_key: false,
-                                        },
-                                        crate::catalog::ColumnDef {
-                                            name: "data_type".to_string(),
-                                            data_type: h2_types::DataType::VarChar(None),
-                                            is_nullable: false,
-                                            is_primary_key: false,
-                                        },
-                                        crate::catalog::ColumnDef {
-                                            name: "is_nullable".to_string(),
-                                            data_type: h2_types::DataType::Boolean,
-                                            is_nullable: false,
-                                            is_primary_key: false,
-                                        },
+                                        crate::catalog::ColumnDef::new(
+                                            "table_name",
+                                            h2_types::DataType::VarChar(None),
+                                            false,
+                                            false,
+                                        ),
+                                        crate::catalog::ColumnDef::new(
+                                            "column_name",
+                                            h2_types::DataType::VarChar(None),
+                                            false,
+                                            false,
+                                        ),
+                                        crate::catalog::ColumnDef::new(
+                                            "data_type",
+                                            h2_types::DataType::VarChar(None),
+                                            false,
+                                            false,
+                                        ),
+                                        crate::catalog::ColumnDef::new(
+                                            "is_nullable",
+                                            h2_types::DataType::Boolean,
+                                            false,
+                                            false,
+                                        ),
                                     ],
                                 );
                                 let tables = self.catalog.all_tables();
@@ -1561,7 +1530,9 @@ impl SQLEngine {
                                                     let mut fetched = Vec::new();
                                                     for r_id in matched_row_ids {
                                                         if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
-                                                            fetched.push(Row::from_bytes(&val_bytes)?);
+                                                            let mut row = Row::from_bytes(&val_bytes)?;
+                                                            table_def.align_row(&mut row);
+                                                            fetched.push(row);
                                                         }
                                                     }
                                                     index_scanned = Some(fetched);
@@ -1577,7 +1548,9 @@ impl SQLEngine {
                                     let entries = tx.scan_visible(&map_name)?;
                                     let mut current_rows = Vec::with_capacity(entries.len());
                                     for (_k, val_bytes) in entries {
-                                        current_rows.push(Row::from_bytes(&val_bytes)?);
+                                        let mut row = Row::from_bytes(&val_bytes)?;
+                                        table_def.align_row(&mut row);
+                                        current_rows.push(row);
                                     }
                                     current_rows
                                 };
@@ -1602,12 +1575,12 @@ impl SQLEngine {
                                 ExecutionResult::Query { columns, rows } => (columns, rows),
                                 _ => return Err(H2Error::Execution("Derived table must be a query".to_string())),
                             };
-                            let col_defs = cols.into_iter().map(|c| ColumnDef {
-                                name: c,
-                                data_type: h2_types::DataType::VarChar(None),
-                                is_nullable: true,
-                                is_primary_key: false,
-                            }).collect();
+                            let col_defs = cols.into_iter().map(|c| ColumnDef::new(
+                                c,
+                                h2_types::DataType::VarChar(None),
+                                true,
+                                false,
+                            )).collect();
                             let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
                             (t_def, rows, Some(sub_alias))
                         }
@@ -1632,7 +1605,9 @@ impl SQLEngine {
                                 let join_entries = tx.scan_visible(&join_map_name)?;
                                 let mut join_rows = Vec::with_capacity(join_entries.len());
                                 for (_k, val_bytes) in join_entries {
-                                    join_rows.push(Row::from_bytes(&val_bytes)?);
+                                    let mut row = Row::from_bytes(&val_bytes)?;
+                                    join_table_def.align_row(&mut row);
+                                    join_rows.push(row);
                                 }
                                 (join_table_def, join_rows, join_table_alias)
                             }

@@ -76,6 +76,26 @@ impl MVStore {
         }
     }
 
+    /// 名前付きマップをリネーム (O(1))
+    pub fn rename_map(&self, old_name: &str, new_name: &str) -> H2Result<()> {
+        let mut maps = self.maps.write();
+        if let Some(mut map) = maps.remove(old_name) {
+            map.name = new_name.to_string();
+            maps.insert(new_name.to_string(), map);
+            Ok(())
+        } else {
+            Err(h2_types::H2Error::Storage(format!("Map '{}' not found", old_name)))
+        }
+    }
+
+    /// 名前付きマップの全データを一括消去 (O(1))
+    pub fn clear_map(&self, name: &str) {
+        let maps = self.maps.read();
+        if let Some(map) = maps.get(name) {
+            map.clear();
+        }
+    }
+
     /// 名前付きマップを削除
     pub fn remove_map(&self, name: &str) -> bool {
         self.maps.write().remove(name).is_some()
@@ -113,16 +133,44 @@ impl MVStore {
         *self.version.read()
     }
 
-    /// ストレージのコンパクション（Vacuum）を実行し、古い死にチャンクを回収
+    /// ストレージのオンラインコンパクション（Concurrent Vacuum）を実行
+    /// 並行トランザクションをブロックせず、未コミット変更を排除し、削除済みレコードを完全回収して安全にファイルを圧縮置換
     pub fn compact(&self) -> H2Result<()> {
         let current_ver = *self.version.read();
 
-        // 生存マップの最新ルートページのみを抽出してメタデータツリーを作成
+        // 実行中のマップのスナップショットを取得（長時間ロックを避けるためマップ一覧をクローン）
+        let map_clones: Vec<(String, MVMap)> = {
+            let maps = self.maps.read();
+            maps.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        // 各マップについて、コミット済みデータのみを抽出したクリーンツリーを構築
         let mut metadata_tree = MVTree::default();
-        let maps = self.maps.read();
-        for (name, map) in maps.iter() {
-            let tree_guard = map.tree.read();
-            let root_bytes = serde_json::to_vec(&*tree_guard.root)
+        for (name, map) in map_clones {
+            let raw_entries = map.scan_all();
+            let mut clean_tree = MVTree::default();
+
+            for entry in raw_entries {
+                // VersionedValue（MVCCレコード）の場合
+                if let Ok(vv) = serde_json::from_slice::<crate::tx::versioned_value::VersionedValue>(&entry.value) {
+                    // Vacuum時点（current_ver）で確定している最新のコミット値を抽出
+                    // 未コミットの変更は含めず、削除済みの場合はツリーから完全に除去（Vacuum）
+                    if let Some(visible_val) = vv.read_visible(u64::MAX, current_ver) {
+                        let clean_vv = crate::tx::versioned_value::VersionedValue::new_committed(
+                            visible_val.to_vec(),
+                            current_ver,
+                        );
+                        let clean_bytes = serde_json::to_vec(&clean_vv)
+                            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+                        clean_tree.put(entry.key, clean_bytes);
+                    }
+                } else {
+                    // 通常データ（メタデータなど）はそのまま保持
+                    clean_tree.put(entry.key, entry.value);
+                }
+            }
+
+            let root_bytes = serde_json::to_vec(&*clean_tree.root)
                 .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
             metadata_tree.put(name.as_bytes().to_vec(), root_bytes);
         }

@@ -12,7 +12,8 @@
   - [2.1 CoW (Copy-on-Write) B-Tree の構造](#21-cow-copy-on-write-b-tree-の構造)
   - [2.2 チャンク・ファイルフォーマットと CRC32 検証](#22-チャンクファイルフォーマットと-crc32-検証)
   - [2.3 MVCC トランザクション & スナップショット分離](#23-mvcc-トランザクション--スナップショット分離)
-  - [2.4 コンパクション (Vacuum) の仕組み](#24-コンパクション-vacuum-の仕組み)
+  - [2.4 オンライン・コンパクション (Concurrent Vacuum) の仕組み](#24-オンラインコンパクション-concurrent-vacuum-の仕組み)
+  - [2.5 オンライン & インスタント DDL (Instant / Online DDL) のアーキテクチャ](#25-オンライン--インスタント-ddl-instant--online-ddl-のアーキテクチャ)
 - [3. SQL 処理系 (`h2-sql`) の内部仕様](#3-sql-処理系-h2-sql-の内部仕様)
   - [3.1 クエリ実行パイプライン](#31-クエリ実行パイプライン)
   - [3.2 カタログとマップ命名規則](#32-カタログとマップ命名規則)
@@ -120,14 +121,30 @@ Java 版 H2 Database のコアである **MVStore** のアーキテクチャを 
 - **Undo Log & 自動ロールバック**:
   トランザクション内で行われた変更は `undo_log` に記録されます。`rollback()` 実行時、または `Transaction` 構造体がコミットされずに `Drop` された場合、Undo Log を逆順に再生して未確定値を破棄し、直前のコミット済み値に復元します。
 
-### 2.4 コンパクション (Vacuum) の仕組み
+### 2.4 オンライン・コンパクション (Concurrent Vacuum) の仕組み
 
-- **ファイル**: [`crates/h2-mvstore/src/store.rs#L112`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/store.rs#L112), [`file_store.rs#L95`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/file_store.rs#L95)
-- 追記型ストレージは更新を重ねるとファイルサイズが肥大化します。
-- `compact()`（SQL の `VACUUM`）が呼ばれると：
-  1. 現在アクティブな全マップの最新ルートページのみを抽出。
-  2. 新しいチャンク `ChunkPayload` を構築。
-  3. ファイルヘッダー直後（Offset 8）から新チャンクのみを書き直し、ファイルサイズを `set_len()` で物理的に切り詰めます（Truncate）。
+- **ファイル**: [`crates/h2-mvstore/src/store.rs`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/store.rs), [`crates/h2-mvstore/src/file_store.rs`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/file_store.rs)
+- 追記型ストレージは更新や削除を重ねると過去バージョンの死にチャンクがファイル内に累積します。
+- `compact()`（SQL の `VACUUM`）が呼ばれると、並行トランザクションをブロックすることなく以下のステップで安全に実行されます：
+  1. **スナップショット抽出**: 呼び出し時点の確定バージョン（`current_version`）に基づき、各マップのエントリをスキャン。
+  2. **未コミット変更の自動排除**: 実行中の未コミット変更（`uncommitted`）はツリーから完全に除外し、コミット確定済みの値のみを抽出。
+  3. **デッドレコードの物理回収 (Purge)**: 最新履歴が削除済み（`None`）となっているキーは新ツリーに含めず、完全に破棄（GC）。
+  4. **一時ファイル書き出し & アトミック置換**: 一時ファイル（`.compact_tmp`）に新チャンクを書き出して `fsync` を実行した後、アトミックに元ファイルを置換（Windows 環境でのファイルロックを考慮した安全なリネーム・フォールバック機構を内蔵）。
+
+### 2.5 オンライン & インスタント DDL (Instant / Online DDL) のアーキテクチャ
+
+- **ファイル**: [`crates/h2-sql/src/catalog.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/catalog.rs), [`crates/h2-sql/src/executor.rs`](file:///d:/workspace/h2database-rust/crates/h2-sql/src/executor.rs)
+- 従来の大規模データに対する DDL で発生していたテーブル排他ロックと全行書き換えループを解消：
+  1. **Instant Add Column / Drop Column ($O(1)$)**:
+     - `ColumnDef` に論理・物理カラムインデックス（`physical_index`）を導入。
+     - カラムの追加・削除時は全行の物理再書き込みを行わず、カタログメタデータのみを $O(1)$ で更新。
+     - 行の読み取り時（SELECT, WHERE, JOIN 等）に `table_def.align_row(&mut row)` を通じて、物理行と論理スキーマの差異を動的・透過的に補正（不足列への NULL 補完、削除列の除外）。
+  2. **Online Rename Table ($O(1)$)**:
+     - `MVStore::rename_map` により、メモリ内マップのキー名をアトミックに差し替え。全行のコピー・削除ループを完全撤廃。
+  3. **Online Truncate Table ($O(1)$)**:
+     - `MVStore::clear_map` により、内部ツリーを一括リセット。数百万行でも 1 行ずつ削除せず一瞬で空テーブル化。
+  4. **Online Index Build (`CREATE INDEX CONCURRENTLY`)**:
+     - MVCC スナップショット分離を利用して既存行を走査し、並行する更新トランザクションをブロックせずにインデックスツリーを構築。
 
 ---
 
