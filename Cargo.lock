@@ -223,6 +223,7 @@ dependencies = [
  "h2-sql",
  "h2-types",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -252,6 +253,9 @@ dependencies = [
 name = "h2-server"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
+ "bytes",
+ "h2-mvstore",
  "h2-sql",
  "h2-types",
  "thiserror",

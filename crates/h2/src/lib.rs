@@ -60,6 +60,17 @@ impl Connection {
     pub fn version(&self) -> u64 {
         self.store.current_version()
     }
+
+    #[cfg(feature = "server")]
+    /// バックグラウンドで PostgreSQL 互換ワイヤプロトコルサーバーを起動し、リッスンアドレスを返却
+    pub async fn start_pg_server(&self, addr: std::net::SocketAddr) -> H2Result<std::net::SocketAddr> {
+        let server = h2_server::PgServer::bind(addr, Arc::clone(&self.engine)).await?;
+        let local_addr = server.local_addr()?;
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        });
+        Ok(local_addr)
+    }
 }
 
 /// rusqlite 風の型安全なトランザクションハンドル
@@ -249,4 +260,81 @@ mod tests {
         // コミット後は2件見える
         assert_eq!(conn.query("SELECT * FROM counter").unwrap().len(), 2);
     }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_hybrid_embedded_and_pgwire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let conn = Connection::open_in_memory().unwrap();
+        // 組み込みAPIでテーブル作成とデータ挿入
+        conn.execute("CREATE TABLE products (id INTEGER, name VARCHAR)").unwrap();
+        conn.execute("INSERT INTO products VALUES (1, 'Laptop')").unwrap();
+
+        // バックグラウンドでPostgreSQL互換サーバーを起動
+        let server_addr = conn
+            .start_pg_server("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        // 外部クライアント（psqlやDBeaver相当）から接続
+        let mut client = TcpStream::connect(server_addr).await.unwrap();
+
+        // 簡易ハンドシェイク（SSLRequest + StartupMessage）
+        let mut ssl_req = Vec::new();
+        ssl_req.extend_from_slice(&8u32.to_be_bytes());
+        ssl_req.extend_from_slice(&80877103u32.to_be_bytes());
+        client.write_all(&ssl_req).await.unwrap();
+
+        let mut ssl_resp = [0u8; 1];
+        client.read_exact(&mut ssl_resp).await.unwrap();
+
+        let mut startup = Vec::new();
+        startup.extend_from_slice(&196608u32.to_be_bytes());
+        startup.extend_from_slice(b"user\0app\0database\0main\0\0");
+        let startup_len = 4 + startup.len() as u32;
+
+        let mut startup_msg = Vec::new();
+        startup_msg.extend_from_slice(&startup_len.to_be_bytes());
+        startup_msg.extend_from_slice(&startup);
+        client.write_all(&startup_msg).await.unwrap();
+
+        let mut init_buf = vec![0u8; 1024];
+        client.read(&mut init_buf).await.unwrap();
+
+        // 外部クライアントからクエリを発行して、組み込みAPIで挿入したデータを参照
+        let sql = "SELECT * FROM products";
+        let sql_bytes = sql.as_bytes();
+        let len = 4 + sql_bytes.len() + 1;
+        let mut query_buf = Vec::new();
+        query_buf.push(b'Q');
+        query_buf.extend_from_slice(&(len as u32).to_be_bytes());
+        query_buf.extend_from_slice(sql_bytes);
+        query_buf.push(0);
+        client.write_all(&query_buf).await.unwrap();
+
+        let mut resp_buf = vec![0u8; 1024];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp_str.contains("Laptop"));
+
+        // 外部クライアントからデータを追加挿入
+        let insert_sql = "INSERT INTO products VALUES (2, 'Smartphone')";
+        let insert_bytes = insert_sql.as_bytes();
+        let len = 4 + insert_bytes.len() + 1;
+        let mut insert_buf = Vec::new();
+        insert_buf.push(b'Q');
+        insert_buf.extend_from_slice(&(len as u32).to_be_bytes());
+        insert_buf.extend_from_slice(insert_bytes);
+        insert_buf.push(0);
+        client.write_all(&insert_buf).await.unwrap();
+        client.read(&mut resp_buf).await.unwrap();
+
+        // 組み込みAPI側から即座に参照可能であることを確認
+        let rows = conn.query("SELECT * FROM products").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].get(1), Some(&Value::String("Smartphone".to_string())));
+    }
 }
+

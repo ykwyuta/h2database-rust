@@ -7,7 +7,11 @@ license.workspace = true
 
 [dependencies]
 h2-types = { path = "../h2-types" }
+h2-mvstore = { path = "../h2-mvstore" }
 h2-sql = { path = "../h2-sql" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+bytes = { workspace = true }
+byteorder = { workspace = true }
+

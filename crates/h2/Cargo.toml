@@ -10,11 +10,12 @@ h2-types = { path = "../h2-types" }
 h2-mvstore = { path = "../h2-mvstore" }
 h2-sql = { path = "../h2-sql" }
 h2-server = { path = "../h2-server", optional = true }
+tokio = { workspace = true, optional = true }
 
 [features]
-default = []
-server = ["dep:h2-server"]
+default = ["server"]
+server = ["dep:h2-server", "dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3.14"
-
+tokio = { workspace = true, features = ["full"] }
