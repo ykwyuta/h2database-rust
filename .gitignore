@@ -1,2 +1,48 @@
-reference/
+# Rust build artifacts
 target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# Database files & transient runtime data
+*.h2
+*.db
+*.mv.db
+*.trace.db
+
+# Maven / Java build artifacts (demo/005_jdbc)
+.mvn/
+*.class
+*.jar
+*.war
+*.ear
+
+# Logs, crash dumps & temporary files
+*.log
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Miscreated command line artifact flags
+--*
+
+# Project specific reference data
+reference/
