@@ -194,6 +194,13 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                 Ok(Value::Null)
             }
         }
+        SqlExpr::Tuple(exprs) => {
+            let mut vals = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                vals.push(evaluate_expr_context(e, ctx, row)?);
+            }
+            Ok(Value::Array(vals))
+        }
         // スカラ関数
         SqlExpr::Function(func) => {
             let func_name = func.name.to_string().to_uppercase();
@@ -381,6 +388,13 @@ pub fn evaluate_literal_or_unary(expr: &SqlExpr) -> H2Result<Value> {
                 },
                 _ => Err(H2Error::Execution(format!("Unsupported unary operator: {:?}", op))),
             }
+        }
+        SqlExpr::Tuple(exprs) => {
+            let mut vals = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                vals.push(evaluate_literal_or_unary(e)?);
+            }
+            Ok(Value::Array(vals))
         }
         _ => Err(H2Error::Execution(format!("Unsupported literal or unary expression: {:?}", expr))),
     }

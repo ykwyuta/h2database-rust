@@ -351,6 +351,7 @@ impl PartialOrd for Value {
             (Value::Time(a), Value::Time(b)) => a.partial_cmp(b),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
+            (Value::Array(a), Value::Array(b)) => a.partial_cmp(b),
             // Timestamp と String のクロス比較
             (Value::Timestamp(a), Value::String(s)) => {
                 let b = parse_timestamp(s)?;

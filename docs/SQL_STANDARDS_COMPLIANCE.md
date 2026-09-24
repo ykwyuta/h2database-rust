@@ -99,16 +99,21 @@
   - 列名明示指定: `CREATE VIEW view_name (col1, col2) AS query`
   - `DROP VIEW [IF EXISTS] view_name`: ビュー定義の削除
   - クエリ実行時の動的ビュー展開、テーブルとの `JOIN`、CTE との併用、多段ビュー結合に完全対応。
+- **複合主キー・複合一意制約**:
+  - `CREATE TABLE tbl (..., CONSTRAINT pk PRIMARY KEY (col1, col2))`
+  - `CREATE TABLE tbl (..., CONSTRAINT uq UNIQUE (col1, col2))`
+  - テーブル制約構文での複合主キーおよび複合ユニーク制約の完全サポート。
+  - カタログ永続化、自動インデックス構築、挿入・更新時の複合キー一意性チェックに対応。
+- **スキーマ管理 (`CREATE SCHEMA`, `DROP SCHEMA`)**:
+  - `CREATE SCHEMA [IF NOT EXISTS] schema_name`: スキーマの作成とカタログ永続化
+  - `DROP SCHEMA [IF EXISTS] schema_name [CASCADE | RESTRICT]`: スキーマの安全な削除および配下テーブルの一括破棄
+  - `schema.table` 形式の修飾テーブル名解決、スキーマごとのテーブル・インデックス分離に対応。
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
 - ❌ **CHECK 制約 (`CHECK (expr)`)**:
   - 任意式による行バリデーションは未実装。
-- ❌ **複合主キー・複合一意制約**:
-  - `CONSTRAINT pk PRIMARY KEY (col1, col2)` のような複数列からなる主キー定義は未実装（現在は単一列主キーのみ）。
 - ❌ **マテリアライズドビュー (`CREATE MATERIALIZED VIEW`)**:
   - クエリ結果を物理的に保持・リフレッシュするマテリアライズドビューは未実装（仮想ビューは完全サポート）。
-- ❌ **スキーマ管理 (`CREATE SCHEMA`, `DROP SCHEMA`)**:
-  - 常にデフォルトスキーマ（`PUBLIC`）配下で管理され、マルチテナントスキーマ分離は未実装。
 - ❌ **列定義の変更 (`ALTER COLUMN ... TYPE ...`, `RENAME COLUMN`)**:
   - 既存列のデータ型変換や列名のリネームは未実装（新規列追加 → 移行 → 旧列削除で代替）。
 
@@ -131,14 +136,22 @@
 - **行削除 (`DELETE`)**:
   - `DELETE FROM tbl [WHERE cond]`
   - 削除に伴うインデックスキーの自動クリーンアップ、および子テーブルへの `ON DELETE CASCADE / SET NULL / RESTRICT` 連動。
+- **条件付き挿入・更新 (`UPSERT` / `MERGE`)**:
+  - `INSERT INTO tbl (...) VALUES (...) ON CONFLICT (col1, ...) DO NOTHING`
+  - `INSERT INTO tbl (...) VALUES (...) ON CONFLICT (col1, ...) DO UPDATE SET col = expr` (`EXCLUDED.col` 擬似テーブル参照対応)
+  - `MERGE INTO target USING source ON cond WHEN MATCHED THEN UPDATE SET ... WHEN NOT MATCHED THEN INSERT (...) VALUES (...)`
+- **DML 戻り値句 (`RETURNING`)**:
+  - `INSERT INTO tbl (...) VALUES (...) RETURNING id, col, expr`
+  - `UPDATE tbl SET ... WHERE ... RETURNING *`
+  - `DELETE FROM tbl WHERE ... RETURNING *`
+  - DML 実行と同時に影響を受けた行のプロジェクション結果をクライアントに返却。
+- **結合を伴う更新・削除 (`UPDATE ... FROM`, `DELETE ... USING`)**:
+  - `UPDATE tbl SET col = f.val FROM other f WHERE tbl.id = f.tbl_id`
+  - `DELETE FROM tbl USING other f WHERE tbl.id = f.tbl_id`
+  - 複数テーブルの結合条件および `RETURNING` 句との併用に完全対応。
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
-- ❌ **条件付き挿入・更新 (`UPSERT` / `MERGE`)**:
-  - PostgreSQL の `INSERT ... ON CONFLICT (col) DO UPDATE` や標準 SQL の `MERGE INTO` は未実装。
-- ❌ **DML 戻り値句 (`RETURNING`)**:
-  - `INSERT ... RETURNING id`, `DELETE ... RETURNING *` などの実行時レコード取得構文は未実装。
-- ❌ **結合を伴う更新・削除 (`UPDATE ... FROM`, `DELETE ... USING`)**:
-  - 別テーブルの条件を JOIN して直接 UPDATE/DELETE する構文は未対応（サブクエリ `WHERE id IN (...)` で代替可能）。
+- ※ 現在、標準 SQL および PostgreSQL 互換の主要 DML 機能はすべてサポートされています。
 
 ---
 
@@ -153,6 +166,10 @@
   - 単一 CTE、複数 CTE の順次定義（先行 CTE を参照するチェイン CTE）に対応。
   - メインクエリおよび JOIN 句（`JOIN cte ON ...`）での透過的な参照。
   - `INSERT INTO ... WITH ... SELECT ...` によるデータ転送クエリとの統合。
+- **再帰共通テーブル式 (Recursive CTE / SQL:1999)**:
+  - `WITH RECURSIVE cte AS (SELECT ... UNION ALL SELECT ... FROM cte ...) SELECT ...`
+  - アンカークエリと再帰クエリの反復評価、階層データ（親子ツリー構造）や動的数列生成に対応。
+  - 無限ループ防止のための最大再帰深度ガード（1,000回）内蔵。
 - **列射影 (Projection)**:
   - 列名指定、別名付与 (`AS alias`)、ワイルドカード (`*`, `table.*`)、複合計算式。
 - **フィルタリング (`WHERE`)**:
@@ -162,12 +179,22 @@
   - NULL 検証: `IS NULL`, `IS NOT NULL`
   - リスト包含判定: `IN (val1, val2, ...)` / `NOT IN (...)`
   - 範囲判定: `BETWEEN low AND high` / `NOT BETWEEN low AND high`
+- **行値式の比較 (Row Value Constructors)**:
+  - タプル等値・不等値比較: `WHERE (a, b) = (1, 2)`, `WHERE (a, b) != (1, 2)`
+  - タプル順序・辞書順比較: `WHERE (a, b) > (1, 2)`, `WHERE (a, b) <= (10, 20)`
+  - タプル IN リスト: `WHERE (a, b) IN ((1, 2), (3, 4))`
+  - 複数列サブクエリ IN: `WHERE (a, b) IN (SELECT x, y FROM tbl)`
 - **条件分岐式 (`CASE WHEN`)**:
   - `CASE WHEN cond1 THEN res1 WHEN cond2 THEN res2 ELSE default END`
   - 単純 CASE (`CASE expr WHEN val THEN ...`) および検索 CASE の双方に対応。
 - **テーブル結合 (`JOIN`)**:
   - `INNER JOIN <table> ON <expr>`
-  - `LEFT OUTER JOIN <table> ON <expr>`
+  - `LEFT [OUTER] JOIN <table> ON <expr>`
+  - `RIGHT [OUTER] JOIN <table> ON <expr>` (右外部結合)
+  - `FULL [OUTER] JOIN <table> ON <expr>` (完全外部結合)
+  - `CROSS JOIN <table>` (直積結合)
+  - `NATURAL JOIN <table>` (同名共通列の自動等値結合)
+  - `JOIN <table> USING (col1, col2, ...)` (指定列による簡潔結合構文)
   - 複数テーブルの連続結合（3テーブル以上の Chained Join）に対応。
   - テーブルエイリアス (`FROM users u JOIN orders o ON u.id = o.user_id`)。
 - **集約とグループ化 (`GROUP BY`, `HAVING`)**:
@@ -184,10 +211,15 @@
   - `INTERSECT` / `INTERSECT ALL`: 積集合（共通行の抽出）
   - `EXCEPT` / `EXCEPT ALL`: 差集合（左クエリから右クエリ行を除外）
   - 演算結果に対する `ORDER BY` および `LIMIT/OFFSET` の適用に対応。
-- **ウィンドウ関数 (Window Functions / SQL:2003)**:
+- **ウィンドウ関数 (Window Functions / SQL:2003, SQL:2011)**:
   - `ROW_NUMBER() OVER ([PARTITION BY ...] [ORDER BY ...])`: 行番号付与 (1, 2, 3...)
   - `RANK() OVER ([PARTITION BY ...] [ORDER BY ...])`: 同点同位ランク・スキップあり (1, 1, 3...)
   - `DENSE_RANK() OVER ([PARTITION BY ...] [ORDER BY ...])`: 同点同位ランク・連番 (1, 1, 2...)
+  - `LEAD(col [, offset [, default]]) OVER (...)`: 後続行の値参照
+  - `LAG(col [, offset [, default]]) OVER (...)`: 先行行の値参照
+  - `FIRST_VALUE(col) OVER (...)`: パーティション内最初の値
+  - `LAST_VALUE(col) OVER (...)`: パーティション内最後の値
+  - `NTILE(n) OVER (...)`: パーティション内のバケット等分割 (1..n)
   - 単一ソート、複数列 `PARTITION BY` / `ORDER BY`、式の中での複合利用（算術計算や CASE 式連携）に対応。
 - **サブクエリ (Subqueries)**:
   - **派生テーブル (Derived Tables)**: `SELECT * FROM (SELECT ...) AS sub` (FROM 句および JOIN 句)
@@ -200,21 +232,8 @@
   - `EXPLAIN SELECT ...` によるスキャン方式（`IndexScan` vs `TableScan`）、`NestedLoopJoin`、集約、ソートのツリー表示。
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
-- ❌ **再帰共通テーブル式 (Recursive CTE / SQL:1999)**:
-  - `WITH RECURSIVE cte AS (...) SELECT ...`
-  - グラフ探索や階層ツリー探索を行う再帰問い合わせ構文は未対応（非再帰 CTE は完全サポート）。
-- ❌ **その他のウィンドウ関数**:
-  - `LEAD()`, `LAG()`, `FIRST_VALUE()`, `LAST_VALUE()`, `NTILE()`
-  - ※ 行番号・順位計算（`ROW_NUMBER`, `RANK`, `DENSE_RANK`）は完全サポート。
-- ❌ **その他の結合方式**:
-  - `RIGHT OUTER JOIN` (左右を入れ替えた `LEFT JOIN` で代替可能)
-  - `FULL OUTER JOIN` (全結合)
-  - `CROSS JOIN` (直積結合)
-  - `NATURAL JOIN`, `USING (col)`
 - ❌ **グルーピング拡張 (SQL:1999)**:
   - `GROUP BY ROLLUP(...)`, `CUBE(...)`, `GROUPING SETS(...)`
-- ❌ **行値式の比較 (Row Value Constructors)**:
-  - `WHERE (a, b) = (1, 2)` や `WHERE (a, b) IN (...)` のようなタプル比較。
 
 ---
 

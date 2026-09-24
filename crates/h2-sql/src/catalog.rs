@@ -1,10 +1,14 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use parking_lot::RwLock;
 
 use h2_mvstore::{MVMap, MVStore};
 use h2_types::{DataType, H2Error, H2Result};
+
+fn default_schema() -> String {
+    "public".to_string()
+}
 
 /// カラム定義
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,14 +53,27 @@ pub struct ForeignKeyDef {
     pub on_update: ForeignKeyAction,
 }
 
+/// 一意制約定義
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UniqueConstraintDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+}
+
 /// テーブル定義
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
+    #[serde(default = "default_schema")]
+    pub schema: String,
     pub columns: Vec<ColumnDef>,
     pub next_row_id: u64,
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyDef>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub unique_constraints: Vec<UniqueConstraintDef>,
 }
 
 impl TableDef {
@@ -66,11 +83,41 @@ impl TableDef {
                 col.physical_index = Some(idx);
             }
         }
+        let pk_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .map(|c| c.name.clone())
+            .collect();
         Self {
             name: name.into(),
+            schema: default_schema(),
             columns,
             next_row_id: 1,
             foreign_keys: Vec::new(),
+            primary_key: pk_cols,
+            unique_constraints: Vec::new(),
+        }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema.to_lowercase(), self.name.to_lowercase())
+    }
+
+    pub fn map_name(&self) -> String {
+        let s = self.schema.to_lowercase();
+        let n = self.name.to_lowercase();
+        if s == "public" {
+            format!("tbl_{}", n)
+        } else {
+            format!("tbl_{}_{}", s, n)
+        }
+    }
+
+    pub fn get_primary_key(&self) -> Vec<String> {
+        if !self.primary_key.is_empty() {
+            self.primary_key.clone()
+        } else {
+            self.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect()
         }
     }
 
@@ -132,6 +179,7 @@ pub struct Catalog {
     tables: Arc<RwLock<HashMap<String, TableDef>>>,
     indexes: Arc<RwLock<HashMap<String, IndexDef>>>,
     views: Arc<RwLock<HashMap<String, ViewDef>>>,
+    schemas: Arc<RwLock<HashSet<String>>>,
 }
 
 impl Catalog {
@@ -140,11 +188,16 @@ impl Catalog {
         let mut tables = HashMap::new();
         let mut indexes = HashMap::new();
         let mut views = HashMap::new();
+        let mut schemas = HashSet::new();
+        schemas.insert("public".to_string());
 
         // 永続化されたカタログ情報をロード
         for entry in catalog_map.scan_all() {
             let key_str = String::from_utf8_lossy(&entry.key).to_string();
-            if key_str.starts_with("tbl:") {
+            if key_str.starts_with("schema:") {
+                let schema_name = &key_str[7..];
+                schemas.insert(schema_name.to_lowercase());
+            } else if key_str.starts_with("tbl:") {
                 let table_name = &key_str[4..];
                 if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
                     tables.insert(table_name.to_lowercase(), table_def);
@@ -173,6 +226,7 @@ impl Catalog {
             tables: Arc::new(RwLock::new(tables)),
             indexes: Arc::new(RwLock::new(indexes)),
             views: Arc::new(RwLock::new(views)),
+            schemas: Arc::new(RwLock::new(schemas)),
         })
     }
 
@@ -181,9 +235,76 @@ impl Catalog {
         &self.store
     }
 
+    pub fn create_schema(&self, name: &str) -> H2Result<()> {
+        let name_key = name.to_lowercase();
+        let mut schemas = self.schemas.write();
+        if schemas.contains(&name_key) {
+            return Err(H2Error::Catalog(format!("Schema '{}' already exists", name)));
+        }
+        self.catalog_map.put(format!("schema:{}", name_key).into_bytes(), vec![]);
+        schemas.insert(name_key);
+        Ok(())
+    }
+
+    pub fn drop_schema(&self, name: &str, if_exists: bool, cascade: bool) -> H2Result<Vec<String>> {
+        let name_key = name.to_lowercase();
+        if name_key == "public" {
+            return Err(H2Error::Catalog("Cannot drop public schema".to_string()));
+        }
+        let mut schemas = self.schemas.write();
+        if !schemas.contains(&name_key) {
+            if if_exists {
+                return Ok(vec![]);
+            }
+            return Err(H2Error::Catalog(format!("Schema '{}' not found", name)));
+        }
+
+        // スキーマ内のテーブルを確認
+        let tables_in_schema: Vec<String> = self.tables.read().values()
+            .filter(|t| t.schema.eq_ignore_ascii_case(&name_key))
+            .map(|t| t.name.clone())
+            .collect();
+
+        if !tables_in_schema.is_empty() && !cascade {
+            return Err(H2Error::Catalog(format!(
+                "Cannot drop schema '{}' because other objects depend on it (use CASCADE)",
+                name
+            )));
+        }
+
+        let mut dropped_maps = Vec::new();
+        if cascade {
+            for tbl_name in tables_in_schema {
+                let full = format!("{}.{}", name_key, tbl_name.to_lowercase());
+                if let Ok(maps) = self.drop_table(&full) {
+                    dropped_maps.extend(maps);
+                }
+            }
+        }
+
+        schemas.remove(&name_key);
+        self.catalog_map.remove(format!("schema:{}", name_key).as_bytes());
+        Ok(dropped_maps)
+    }
+
+    pub fn get_schemas(&self) -> Vec<String> {
+        self.schemas.read().iter().cloned().collect()
+    }
+
+    pub fn schema_exists(&self, name: &str) -> bool {
+        self.schemas.read().contains(&name.to_lowercase())
+    }
+
     pub fn create_table(&self, table_def: TableDef) -> H2Result<()> {
+        let schema_key = table_def.schema.to_lowercase();
+        if !self.schemas.read().contains(&schema_key) {
+            return Err(H2Error::Catalog(format!("Schema '{}' does not exist", table_def.schema)));
+        }
+
+        let full_key = table_def.full_name();
         let name_key = table_def.name.to_lowercase();
-        if self.views.read().contains_key(&name_key) {
+
+        if self.views.read().contains_key(&full_key) || self.views.read().contains_key(&name_key) {
             return Err(H2Error::Catalog(format!(
                 "Cannot create table '{}': view with same name exists",
                 table_def.name
@@ -191,7 +312,7 @@ impl Catalog {
         }
         let mut tables = self.tables.write();
 
-        if tables.contains_key(&name_key) {
+        if tables.contains_key(&full_key) || (schema_key == "public" && tables.contains_key(&name_key)) {
             return Err(H2Error::Catalog(format!(
                 "Table '{}' already exists",
                 table_def.name
@@ -200,19 +321,50 @@ impl Catalog {
 
         let serialized = serde_json::to_vec(&table_def)
             .map_err(|e| H2Error::Serialization(e.to_string()))?;
-        self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
-        tables.insert(name_key, table_def);
+        self.catalog_map.put(format!("tbl:{}", full_key).into_bytes(), serialized.clone());
+        if schema_key == "public" {
+            self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
+            tables.insert(name_key, table_def.clone());
+        }
+        tables.insert(full_key, table_def);
 
         Ok(())
     }
 
     pub fn get_table(&self, name: &str) -> Option<TableDef> {
         let name_key = name.to_lowercase();
-        self.tables.read().get(&name_key).cloned()
+        let tables = self.tables.read();
+        if let Some(t) = tables.get(&name_key) {
+            return Some(t.clone());
+        }
+        if !name_key.contains('.') {
+            let pub_key = format!("public.{}", name_key);
+            if let Some(t) = tables.get(&pub_key) {
+                return Some(t.clone());
+            }
+        } else {
+            let parts: Vec<&str> = name_key.splitn(2, '.').collect();
+            if parts[0] == "public" {
+                if let Some(t) = tables.get(parts[1]) {
+                    return Some(t.clone());
+                }
+            }
+        }
+        None
     }
 
     pub fn all_tables(&self) -> Vec<TableDef> {
-        self.tables.read().values().cloned().collect()
+        let tables = self.tables.read();
+        let mut seen = std::collections::HashSet::new();
+        let mut list = Vec::new();
+        for t in tables.values() {
+            let full = t.full_name();
+            if !seen.contains(&full) {
+                seen.insert(full);
+                list.push(t.clone());
+            }
+        }
+        list
     }
 
     pub fn get_tables_referencing(&self, parent_table: &str) -> Vec<(TableDef, ForeignKeyDef)> {
@@ -231,26 +383,43 @@ impl Catalog {
     pub fn drop_table(&self, name: &str) -> H2Result<Vec<String>> {
         let name_key = name.to_lowercase();
         let mut tables = self.tables.write();
-        if !tables.contains_key(&name_key) {
-            return Err(H2Error::Catalog(format!("Table '{}' not found", name)));
-        }
+        let table_def = tables.remove(&name_key).or_else(|| {
+            if !name_key.contains('.') {
+                tables.remove(&format!("public.{}", name_key))
+            } else {
+                let parts: Vec<&str> = name_key.splitn(2, '.').collect();
+                if parts[0] == "public" {
+                    tables.remove(parts[1])
+                } else {
+                    None
+                }
+            }
+        }).ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", name)))?;
 
-        tables.remove(&name_key);
-        self.catalog_map.remove(format!("tbl:{}", name_key).as_bytes());
+        let full_key = table_def.full_name();
+        let simple_key = table_def.name.to_lowercase();
+        tables.remove(&full_key);
+        tables.remove(&simple_key);
 
-        let mut dropped_maps = vec![format!("tbl_{}", name_key)];
+        self.catalog_map.remove(format!("tbl:{}", full_key).as_bytes());
+        self.catalog_map.remove(format!("tbl:{}", simple_key).as_bytes());
+
+        let mut dropped_maps = vec![table_def.map_name()];
 
         let mut indexes = self.indexes.write();
         let idx_keys_to_remove: Vec<String> = indexes
             .iter()
-            .filter(|(_, idx)| idx.table_name.eq_ignore_ascii_case(&name_key))
+            .filter(|(_, idx)| {
+                idx.table_name.eq_ignore_ascii_case(&full_key)
+                    || idx.table_name.eq_ignore_ascii_case(&simple_key)
+            })
             .map(|(k, _)| k.clone())
             .collect();
 
         for idx_key in idx_keys_to_remove {
             if let Some(idx_def) = indexes.remove(&idx_key) {
                 self.catalog_map.remove(format!("idx:{}", idx_key).as_bytes());
-                dropped_maps.push(format!("idx_{}_{}", name_key, idx_def.name.to_lowercase()));
+                dropped_maps.push(format!("idx_{}_{}", simple_key, idx_def.name.to_lowercase()));
             }
         }
 
@@ -259,45 +428,85 @@ impl Catalog {
 
     pub fn update_table(&self, table_def: TableDef) -> H2Result<()> {
         let name_key = table_def.name.to_lowercase();
+        let full_key = table_def.full_name();
         let mut tables = self.tables.write();
-        if !tables.contains_key(&name_key) {
+        if !tables.contains_key(&name_key) && !tables.contains_key(&full_key) {
             return Err(H2Error::Catalog(format!("Table '{}' not found", table_def.name)));
         }
 
         let serialized = serde_json::to_vec(&table_def)
             .map_err(|e| H2Error::Serialization(e.to_string()))?;
-        self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
-        tables.insert(name_key, table_def);
+        self.catalog_map.put(format!("tbl:{}", full_key).into_bytes(), serialized.clone());
+        tables.insert(full_key, table_def.clone());
+        if table_def.schema.eq_ignore_ascii_case("public") {
+            self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
+            tables.insert(name_key, table_def);
+        }
 
         Ok(())
     }
 
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> H2Result<()> {
         let old_key = old_name.to_lowercase();
-        let new_key = new_name.to_lowercase();
         let mut tables = self.tables.write();
 
-        let mut table_def = tables.remove(&old_key).ok_or_else(|| {
+        let mut table_def = tables.remove(&old_key).or_else(|| {
+            if !old_key.contains('.') {
+                tables.remove(&format!("public.{}", old_key))
+            } else {
+                let parts: Vec<&str> = old_key.splitn(2, '.').collect();
+                if parts[0] == "public" {
+                    tables.remove(parts[1])
+                } else {
+                    None
+                }
+            }
+        }).ok_or_else(|| {
             H2Error::Catalog(format!("Table '{}' not found", old_name))
         })?;
 
-        if tables.contains_key(&new_key) {
+        let old_full = table_def.full_name();
+        let old_simple = table_def.name.to_lowercase();
+        tables.remove(&old_full);
+        tables.remove(&old_simple);
+        self.catalog_map.remove(format!("tbl:{}", old_full).as_bytes());
+        self.catalog_map.remove(format!("tbl:{}", old_simple).as_bytes());
+
+        let (new_schema, new_simple) = if new_name.contains('.') {
+            let parts: Vec<&str> = new_name.splitn(2, '.').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        } else {
+            (table_def.schema.clone(), new_name.to_string())
+        };
+
+        let new_full = format!("{}.{}", new_schema.to_lowercase(), new_simple.to_lowercase());
+        let new_simple_key = new_simple.to_lowercase();
+
+        if tables.contains_key(&new_full) || (new_schema.eq_ignore_ascii_case("public") && tables.contains_key(&new_simple_key)) {
             return Err(H2Error::Catalog(format!("Table '{}' already exists", new_name)));
         }
 
-        self.catalog_map.remove(format!("tbl:{}", old_key).as_bytes());
-        table_def.name = new_name.to_string();
+        table_def.schema = new_schema.clone();
+        table_def.name = new_simple;
 
         let serialized = serde_json::to_vec(&table_def)
             .map_err(|e| H2Error::Serialization(e.to_string()))?;
-        self.catalog_map.put(format!("tbl:{}", new_key).into_bytes(), serialized);
-        tables.insert(new_key.clone(), table_def);
+        self.catalog_map.put(format!("tbl:{}", new_full).into_bytes(), serialized.clone());
+        if new_schema.eq_ignore_ascii_case("public") {
+            self.catalog_map.put(format!("tbl:{}", new_simple_key).into_bytes(), serialized);
+            tables.insert(new_simple_key.clone(), table_def.clone());
+        }
+        tables.insert(new_full.clone(), table_def);
 
         // 関連インデックスの table_name も更新
         let mut indexes = self.indexes.write();
         for (_, idx) in indexes.iter_mut() {
-            if idx.table_name.eq_ignore_ascii_case(&old_key) {
-                idx.table_name = new_name.to_string();
+            if idx.table_name.eq_ignore_ascii_case(&old_full) || idx.table_name.eq_ignore_ascii_case(&old_simple) {
+                idx.table_name = if new_schema.eq_ignore_ascii_case("public") {
+                    new_simple_key.clone()
+                } else {
+                    new_full.clone()
+                };
                 let serialized_idx = serde_json::to_vec(&*idx)
                     .map_err(|e| H2Error::Serialization(e.to_string()))?;
                 self.catalog_map.put(format!("idx:{}", idx.name.to_lowercase()).into_bytes(), serialized_idx);
@@ -333,10 +542,23 @@ impl Catalog {
 
     pub fn get_table_indexes(&self, table_name: &str) -> Vec<IndexDef> {
         let table_key = table_name.to_lowercase();
+        let short_key = if let Some((_, t)) = table_key.split_once('.') {
+            t.to_string()
+        } else {
+            table_key.clone()
+        };
+        let full_key = if !table_key.contains('.') {
+            format!("public.{}", table_key)
+        } else {
+            table_key.clone()
+        };
         self.indexes
             .read()
             .values()
-            .filter(|idx| idx.table_name.eq_ignore_ascii_case(&table_key))
+            .filter(|idx| {
+                let lower = idx.table_name.to_lowercase();
+                lower == table_key || lower == short_key || lower == full_key
+            })
             .cloned()
             .collect()
     }
@@ -359,7 +581,21 @@ impl Catalog {
     pub fn allocate_row_id(&self, table_name: &str) -> H2Result<u64> {
         let name_key = table_name.to_lowercase();
         let mut tables = self.tables.write();
-        let table_def = tables.get_mut(&name_key).ok_or_else(|| {
+        let target_key = if tables.contains_key(&name_key) {
+            name_key
+        } else if !name_key.contains('.') && tables.contains_key(&format!("public.{}", name_key)) {
+            format!("public.{}", name_key)
+        } else if let Some((first, rest)) = name_key.split_once('.') {
+            if first == "public" && tables.contains_key(rest) {
+                rest.to_string()
+            } else {
+                name_key
+            }
+        } else {
+            name_key
+        };
+
+        let table_def = tables.get_mut(&target_key).ok_or_else(|| {
             H2Error::Catalog(format!("Table '{}' not found", table_name))
         })?;
 
@@ -368,7 +604,10 @@ impl Catalog {
 
         let serialized = serde_json::to_vec(&table_def)
             .map_err(|e| H2Error::Serialization(e.to_string()))?;
-        self.catalog_map.put(format!("tbl:{}", name_key).into_bytes(), serialized);
+        self.catalog_map.put(format!("tbl:{}", table_def.full_name()).into_bytes(), serialized.clone());
+        if table_def.schema.eq_ignore_ascii_case("public") {
+            self.catalog_map.put(format!("tbl:{}", table_def.name.to_lowercase()).into_bytes(), serialized);
+        }
 
         Ok(id)
     }

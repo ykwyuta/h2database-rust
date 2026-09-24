@@ -5,7 +5,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
 use h2_types::{DataType, H2Error, H2Result};
-use crate::catalog::{ColumnDef, ForeignKeyAction, ForeignKeyDef, TableDef};
+use crate::catalog::{ColumnDef, ForeignKeyAction, ForeignKeyDef, TableDef, UniqueConstraintDef};
 
 pub fn parse_sql(sql: &str) -> H2Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
@@ -84,16 +84,31 @@ pub fn extract_create_table(
     columns: &[SqlColumnDef],
     constraints: &[TableConstraint],
 ) -> H2Result<TableDef> {
-    let table_name = name.to_string();
+    let (schema_name, table_name) = match name.0.len() {
+        2 => (name.0[0].value.clone(), name.0[1].value.clone()),
+        _ => ("public".to_string(), name.to_string()),
+    };
     let mut col_defs = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
+    let mut unique_constraints = Vec::new();
     let mut foreign_keys = Vec::new();
 
     for constraint in constraints {
         match constraint {
             TableConstraint::PrimaryKey { columns, .. } => {
                 for col in columns {
-                    pk_columns.push(col.value.clone());
+                    if !pk_columns.iter().any(|p| p.eq_ignore_ascii_case(&col.value)) {
+                        pk_columns.push(col.value.clone());
+                    }
+                }
+            }
+            TableConstraint::Unique { name, columns, .. } => {
+                let cols: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                if !cols.is_empty() {
+                    unique_constraints.push(UniqueConstraintDef {
+                        name: name.as_ref().map(|n| n.value.clone()),
+                        columns: cols,
+                    });
                 }
             }
             TableConstraint::ForeignKey { name, columns, foreign_table, referred_columns, on_delete, on_update, .. } => {
@@ -123,6 +138,14 @@ pub fn extract_create_table(
                 sqlparser::ast::ColumnOption::Unique { is_primary, .. } => {
                     if *is_primary {
                         is_pk = true;
+                        if !pk_columns.iter().any(|p| p.eq_ignore_ascii_case(&col_name)) {
+                            pk_columns.push(col_name.clone());
+                        }
+                    } else {
+                        unique_constraints.push(UniqueConstraintDef {
+                            name: opt.name.as_ref().map(|n| n.value.clone()),
+                            columns: vec![col_name.clone()],
+                        });
                     }
                 }
                 sqlparser::ast::ColumnOption::NotNull => {
@@ -143,11 +166,18 @@ pub fn extract_create_table(
             }
         }
 
+        if is_pk {
+            is_nullable = false;
+        }
+
         col_defs.push(ColumnDef::new(col_name, dt, is_nullable, is_pk));
     }
 
     let mut t_def = TableDef::new(table_name, col_defs);
+    t_def.schema = schema_name;
     t_def.foreign_keys = foreign_keys;
+    t_def.primary_key = pk_columns;
+    t_def.unique_constraints = unique_constraints;
     Ok(t_def)
 }
 
