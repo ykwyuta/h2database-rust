@@ -119,8 +119,47 @@ fn main() -> H2Result<()> {
         println!("  After commit: views updated to: {v}");
     }
 
-    // 8. ストレージのコンパクション (Vacuum)
-    println!("\n[8] Running Vacuum compaction to reclaim space...");
+    // 8. 高度なSQL機能 (SEQUENCE, SERIAL, INTERVAL, 高度な数学・文字列関数, カーソル, COPY)
+    println!("\n[8] Advanced SQL Features:");
+
+    // 8.1 SEQUENCE & SERIAL
+    conn.execute("CREATE SEQUENCE IF NOT EXISTS item_seq INCREMENT BY 5 START WITH 100")?;
+    let seq_val = conn.query("SELECT NEXTVAL('item_seq'), NEXTVAL('item_seq')")?;
+    println!("  - SEQUENCE: next values = {}, {}", seq_val[0].get_as::<i64>(0)?, seq_val[0].get_as::<i64>(1)?);
+
+    conn.execute("CREATE TABLE orders (order_id SERIAL PRIMARY KEY, note VARCHAR, expire_after INTERVAL)")?;
+    conn.execute("INSERT INTO orders (note, expire_after) VALUES ('Urgent Delivery', INTERVAL '3 days 4 hours')")?;
+    let order_row = conn.query("SELECT order_id, note, expire_after FROM orders")?;
+    println!("  - SERIAL & INTERVAL: Order ID = {}, Expire = {}", 
+        order_row[0].get_as::<i64>(0)?, 
+        order_row[0].get_as::<String>(2)?
+    );
+
+    // 8.2 高度な数学・文字列関数 & 正規表現演算子 (~, ~*)
+    let fn_row = conn.query(
+        "SELECT LN(EXP(2.0)), INITCAP('hello rust world'), REGEXP_REPLACE('2026-09-25', '(\\d{4})-(\\d{2})-(\\d{2})', '$1/$2/$3')"
+    )?;
+    println!("  - Math & String Functions: LN(EXP(2)) = {}, INITCAP = '{}', REGEXP_REPLACE = '{}'",
+        fn_row[0].get_as::<f64>(0)?,
+        fn_row[0].get_as::<String>(1)?,
+        fn_row[0].get_as::<String>(2)?,
+    );
+
+    let regex_match = conn.query("SELECT 'h2database-rust' ~ '^h2.*-rust$' AS is_matched")?;
+    println!("  - Regex Match (~): {}", regex_match[0].get_as::<bool>(0)?);
+
+    // 8.3 カーソル (DECLARE ... CURSOR & FETCH)
+    println!("\n[9] Cursor (DECLARE & FETCH):");
+    conn.execute("DECLARE art_cur CURSOR FOR SELECT id, title FROM articles ORDER BY id")?;
+    let cur_row1 = conn.query("FETCH NEXT FROM art_cur")?;
+    println!("  - FETCH NEXT 1: ID = {}, Title = '{}'", cur_row1[0].get_as::<i32>(0)?, cur_row1[0].get_as::<String>(1)?);
+    let cur_row2 = conn.query("FETCH NEXT FROM art_cur")?;
+    println!("  - FETCH NEXT 2: ID = {}, Title = '{}'", cur_row2[0].get_as::<i32>(0)?, cur_row2[0].get_as::<String>(1)?);
+    conn.execute("CLOSE art_cur")?;
+    println!("  - Cursor closed.");
+
+    // 9. ストレージのコンパクション (Vacuum)
+    println!("\n[10] Running Vacuum compaction to reclaim space...");
     conn.vacuum()?;
     println!("  Vacuum complete! Current version: {}", conn.version());
 

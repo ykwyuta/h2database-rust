@@ -1,0 +1,10 @@
+[package]
+name = "demo-replication"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2 = { path = "../../crates/h2" }
+tokio = { workspace = true, features = ["full"] }

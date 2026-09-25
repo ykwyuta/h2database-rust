@@ -9,6 +9,9 @@ members = [
     "demo/002_psql",
     "demo/003_embedded_sync",
     "demo/004_embedded_async",
+    "demo/006_replication",
+    "demo/007_mq",
+    "demo/008_decoupled_aurora",
 ]
 resolver = "2"
 
