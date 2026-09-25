@@ -59,6 +59,10 @@ impl MVMap {
         self.tree.read().scan_prefix(prefix)
     }
 
+    pub fn scan_range(&self, start: std::ops::Bound<&[u8]>, end: std::ops::Bound<&[u8]>) -> Vec<Entry> {
+        self.tree.read().scan_range(start, end)
+    }
+
     /// マップ内の全エントリを一括消去 (O(1))
     pub fn clear(&self) {
         if let Some(ref sink) = *self.sink.read() {

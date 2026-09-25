@@ -1,3 +1,4 @@
+use std::ops::Bound;
 use std::sync::Arc;
 use crate::page::{Entry, Page};
 
@@ -250,6 +251,70 @@ impl MVTree {
                         }
                     }
                     self.collect_prefix_entries(child, prefix, out);
+                }
+            }
+        }
+    }
+
+    /// 指定された範囲 [start, end] の全エントリの高速走査（真の B+Tree Range Scan）
+    pub fn scan_range(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Vec<Entry> {
+        let mut results = Vec::new();
+        self.collect_range_entries(&self.root, start, end, &mut results);
+        results
+    }
+
+    fn collect_range_entries(
+        &self,
+        node: &Page,
+        start: Bound<&[u8]>,
+        end: Bound<&[u8]>,
+        out: &mut Vec<Entry>,
+    ) {
+        match node {
+            Page::Leaf { entries } => {
+                let start_idx = match start {
+                    Bound::Unbounded => 0,
+                    Bound::Included(k) => match entries.binary_search_by(|e| e.key.as_slice().cmp(k)) {
+                        Ok(idx) | Err(idx) => idx,
+                    },
+                    Bound::Excluded(k) => match entries.binary_search_by(|e| e.key.as_slice().cmp(k)) {
+                        Ok(idx) => idx + 1,
+                        Err(idx) => idx,
+                    },
+                };
+                for entry in &entries[start_idx..] {
+                    let k = entry.key.as_slice();
+                    let within_end = match end {
+                        Bound::Unbounded => true,
+                        Bound::Included(end_k) => k <= end_k,
+                        Bound::Excluded(end_k) => k < end_k,
+                    };
+                    if within_end {
+                        out.push(entry.clone());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            Page::Branch { keys, children, .. } => {
+                for (i, child) in children.iter().enumerate() {
+                    if i > 0 {
+                        let lower = keys[i - 1].as_slice();
+                        match end {
+                            Bound::Included(end_k) if end_k < lower => continue,
+                            Bound::Excluded(end_k) if end_k <= lower => continue,
+                            _ => {}
+                        }
+                    }
+                    if i < keys.len() {
+                        let upper = keys[i].as_slice();
+                        match start {
+                            Bound::Included(start_k) if start_k >= upper => continue,
+                            Bound::Excluded(start_k) if start_k >= upper => continue,
+                            _ => {}
+                        }
+                    }
+                    self.collect_range_entries(child, start, end, out);
                 }
             }
         }

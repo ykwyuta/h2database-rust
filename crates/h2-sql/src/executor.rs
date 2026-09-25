@@ -7,6 +7,9 @@ use sqlparser::ast::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use chrono::Datelike;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
@@ -17,13 +20,258 @@ use crate::expression::{
 use crate::parser::{convert_data_type, extract_create_table, parse_sql};
 use crate::row::Row;
 
-pub(crate) fn encode_composite_index_key(vals: &[Value], row_id: u64) -> Vec<u8> {
-    let mut bytes = if vals.len() == 1 {
-        serde_json::to_vec(&vals[0]).unwrap_or_default()
-    } else {
-        serde_json::to_vec(vals).unwrap_or_default()
-    };
+pub(crate) fn encode_memcomparable_value(val: &Value, buf: &mut Vec<u8>) {
+    match val {
+        Value::Null => {
+            buf.push(0x01);
+        }
+        Value::Boolean(b) => {
+            buf.push(0x02);
+            buf.push(if *b { 1 } else { 0 });
+        }
+        Value::TinyInt(i) => {
+            buf.push(0x03);
+            buf.push((*i as u8) ^ 0x80);
+        }
+        Value::SmallInt(i) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&((*i as u16) ^ 0x8000).to_be_bytes());
+        }
+        Value::Integer(i) => {
+            buf.push(0x05);
+            buf.extend_from_slice(&((*i as u32) ^ 0x8000_0000).to_be_bytes());
+        }
+        Value::BigInt(i) => {
+            buf.push(0x06);
+            buf.extend_from_slice(&((*i as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+        }
+        Value::Float(f) => {
+            buf.push(0x07);
+            let u = f.to_bits();
+            let encoded = if (u & 0x8000_0000) != 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000
+            };
+            buf.extend_from_slice(&encoded.to_be_bytes());
+        }
+        Value::Double(f) => {
+            buf.push(0x08);
+            let u = f.to_bits();
+            let encoded = if (u & 0x8000_0000_0000_0000) != 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000_0000_0000
+            };
+            buf.extend_from_slice(&encoded.to_be_bytes());
+        }
+        Value::String(s) => {
+            buf.push(0x09);
+            for &byte in s.as_bytes() {
+                buf.push(byte);
+                if byte == 0x00 {
+                    buf.push(0xFF);
+                }
+            }
+            buf.push(0x00);
+            buf.push(0x00);
+        }
+        Value::Date(d) => {
+            buf.push(0x0A);
+            buf.extend_from_slice(&((d.num_days_from_ce() as u32) ^ 0x8000_0000).to_be_bytes());
+        }
+        Value::Timestamp(ts) => {
+            buf.push(0x0B);
+            let nanos = ts.timestamp_nanos_opt().unwrap_or(0);
+            buf.extend_from_slice(&((nanos as u64) ^ 0x8000_0000_0000_0000).to_be_bytes());
+        }
+        Value::Decimal(dec) => {
+            buf.push(0x0C);
+            let f = dec.to_f64().unwrap_or(0.0);
+            let u = f.to_bits();
+            let encoded = if (u & 0x8000_0000_0000_0000) != 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000_0000_0000
+            };
+            buf.extend_from_slice(&encoded.to_be_bytes());
+        }
+        Value::Bytes(b) => {
+            buf.push(0x0D);
+            for &byte in b {
+                buf.push(byte);
+                if byte == 0x00 {
+                    buf.push(0xFF);
+                }
+            }
+            buf.push(0x00);
+            buf.push(0x00);
+        }
+        Value::Uuid(u) => {
+            buf.push(0x0E);
+            buf.extend_from_slice(u.as_bytes());
+        }
+        _ => {
+            buf.push(0xFF);
+        }
+    }
+}
+
+pub(crate) fn decode_memcomparable_value(bytes: &[u8]) -> Option<(Value, usize)> {
+    if bytes.is_empty() {
+        return None;
+    }
+    match bytes[0] {
+        0x01 => Some((Value::Null, 1)),
+        0x02 => {
+            if bytes.len() < 2 { return None; }
+            Some((Value::Boolean(bytes[1] != 0), 2))
+        }
+        0x03 => {
+            if bytes.len() < 2 { return None; }
+            let v = (bytes[1] ^ 0x80) as i8;
+            Some((Value::TinyInt(v), 2))
+        }
+        0x04 => {
+            if bytes.len() < 3 { return None; }
+            let u = u16::from_be_bytes(bytes[1..3].try_into().ok()?);
+            let v = (u ^ 0x8000) as i16;
+            Some((Value::SmallInt(v), 3))
+        }
+        0x05 => {
+            if bytes.len() < 5 { return None; }
+            let u = u32::from_be_bytes(bytes[1..5].try_into().ok()?);
+            let v = (u ^ 0x8000_0000) as i32;
+            Some((Value::Integer(v), 5))
+        }
+        0x06 => {
+            if bytes.len() < 9 { return None; }
+            let u = u64::from_be_bytes(bytes[1..9].try_into().ok()?);
+            let v = (u ^ 0x8000_0000_0000_0000) as i64;
+            Some((Value::BigInt(v), 9))
+        }
+        0x07 => {
+            if bytes.len() < 5 { return None; }
+            let u = u32::from_be_bytes(bytes[1..5].try_into().ok()?);
+            let decoded = if (u & 0x8000_0000) == 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000
+            };
+            Some((Value::Float(f32::from_bits(decoded)), 5))
+        }
+        0x08 => {
+            if bytes.len() < 9 { return None; }
+            let u = u64::from_be_bytes(bytes[1..9].try_into().ok()?);
+            let decoded = if (u & 0x8000_0000_0000_0000) == 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000_0000_0000
+            };
+            Some((Value::Double(f64::from_bits(decoded)), 9))
+        }
+        0x09 => {
+            let mut s_bytes = Vec::new();
+            let mut i = 1;
+            while i < bytes.len() {
+                if bytes[i] == 0x00 {
+                    if i + 1 < bytes.len() && bytes[i + 1] == 0xFF {
+                        s_bytes.push(0x00);
+                        i += 2;
+                    } else if i + 1 < bytes.len() && bytes[i + 1] == 0x00 {
+                        i += 2;
+                        break;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    s_bytes.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            let s = String::from_utf8(s_bytes).ok()?;
+            Some((Value::String(s), i))
+        }
+        0x0A => {
+            if bytes.len() < 5 { return None; }
+            let u = u32::from_be_bytes(bytes[1..5].try_into().ok()?);
+            let num_days = (u ^ 0x8000_0000) as i32;
+            let d = chrono::NaiveDate::from_num_days_from_ce_opt(num_days)?;
+            Some((Value::Date(d), 5))
+        }
+        0x0B => {
+            if bytes.len() < 9 { return None; }
+            let u = u64::from_be_bytes(bytes[1..9].try_into().ok()?);
+            let nanos = (u ^ 0x8000_0000_0000_0000) as i64;
+            let dt = chrono::DateTime::from_timestamp_nanos(nanos);
+            Some((Value::Timestamp(dt), 9))
+        }
+        0x0C => {
+            if bytes.len() < 9 { return None; }
+            let u = u64::from_be_bytes(bytes[1..9].try_into().ok()?);
+            let decoded = if (u & 0x8000_0000_0000_0000) == 0 {
+                !u
+            } else {
+                u ^ 0x8000_0000_0000_0000
+            };
+            let f = f64::from_bits(decoded);
+            use rust_decimal::prelude::FromPrimitive;
+            let dec = Decimal::from_f64(f).unwrap_or_default();
+            Some((Value::Decimal(dec), 9))
+        }
+        0x0D => {
+            let mut b_bytes = Vec::new();
+            let mut i = 1;
+            while i < bytes.len() {
+                if bytes[i] == 0x00 {
+                    if i + 1 < bytes.len() && bytes[i + 1] == 0xFF {
+                        b_bytes.push(0x00);
+                        i += 2;
+                    } else if i + 1 < bytes.len() && bytes[i + 1] == 0x00 {
+                        i += 2;
+                        break;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    b_bytes.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            Some((Value::Bytes(b_bytes), i))
+        }
+        0x0E => {
+            if bytes.len() < 17 { return None; }
+            let u = uuid::Uuid::from_bytes(bytes[1..17].try_into().ok()?);
+            Some((Value::Uuid(u), 17))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn decode_memcomparable_values(mut bytes: &[u8]) -> Option<Vec<Value>> {
+    let mut vals = Vec::new();
+    while !bytes.is_empty() {
+        let (val, consumed) = decode_memcomparable_value(bytes)?;
+        vals.push(val);
+        bytes = &bytes[consumed..];
+    }
+    Some(vals)
+}
+
+pub(crate) fn encode_index_prefix(vals: &[Value]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vals.len() * 9 + 1);
+    for val in vals {
+        encode_memcomparable_value(val, &mut bytes);
+    }
     bytes.push(0x00);
+    bytes
+}
+
+pub(crate) fn encode_composite_index_key(vals: &[Value], row_id: u64) -> Vec<u8> {
+    let mut bytes = encode_index_prefix(vals);
     bytes.extend_from_slice(&row_id.to_be_bytes());
     bytes
 }
@@ -32,25 +280,37 @@ pub(crate) fn encode_index_key(val: &Value, row_id: u64) -> Vec<u8> {
     encode_composite_index_key(std::slice::from_ref(val), row_id)
 }
 
+pub(crate) fn encode_index_key_max(vals: &[Value]) -> Vec<u8> {
+    let mut bytes = encode_index_prefix(vals);
+    bytes.extend_from_slice(&[0xFF; 8]);
+    bytes
+}
+
 pub(crate) fn decode_composite_index_key(bytes: &[u8]) -> Option<(Vec<Value>, u64)> {
     if bytes.len() < 9 {
         return None;
     }
-    let val_bytes = &bytes[..bytes.len() - 9];
     let row_id_bytes = &bytes[bytes.len() - 8..];
     let row_id = u64::from_be_bytes(row_id_bytes.try_into().ok()?);
-    if let Ok(vals) = serde_json::from_slice::<Vec<Value>>(val_bytes) {
-        return Some((vals, row_id));
-    }
-    if let Ok(val) = serde_json::from_slice::<Value>(val_bytes) {
-        return Some((vec![val], row_id));
-    }
-    None
+    let val_bytes = &bytes[..bytes.len() - 9];
+
+    let vals = decode_memcomparable_values(val_bytes)?;
+    Some((vals, row_id))
 }
 
 pub(crate) fn decode_index_key(bytes: &[u8]) -> Option<(Value, u64)> {
-    let (vals, row_id) = decode_composite_index_key(bytes)?;
-    vals.into_iter().next().map(|v| (v, row_id))
+    if bytes.len() < 9 {
+        return None;
+    }
+    let row_id_bytes = &bytes[bytes.len() - 8..];
+    let row_id = u64::from_be_bytes(row_id_bytes.try_into().ok()?);
+    let val_bytes = &bytes[..bytes.len() - 9];
+
+    if let Some((v, _)) = decode_memcomparable_value(val_bytes) {
+        return Some((v, row_id));
+    }
+
+    Some((Value::Null, row_id))
 }
 
 pub(crate) fn get_index_values(table_def: &TableDef, idx: &IndexDef, row: &Row) -> Option<Vec<Value>> {
@@ -60,6 +320,128 @@ pub(crate) fn get_index_values(table_def: &TableDef, idx: &IndexDef, row: &Row) 
         vals.push(row.values.get(c_idx).cloned().unwrap_or(Value::Null));
     }
     Some(vals)
+}
+
+pub(crate) fn execute_fast_row_aggregate(
+    ops: &[crate::vectorized::VectorAggregateOp],
+    filtered_rows: &[Row],
+) -> Row {
+    use rust_decimal::prelude::ToPrimitive;
+    let count_star = filtered_rows.len() as i64;
+    let mut sums = vec![0.0f64; ops.len()];
+    let mut counts = vec![0i64; ops.len()];
+    let mut mins: Vec<Option<Value>> = vec![None; ops.len()];
+    let mut maxs: Vec<Option<Value>> = vec![None; ops.len()];
+    let mut is_integral = vec![true; ops.len()];
+    let mut int_sums = vec![0i64; ops.len()];
+
+    for row in filtered_rows {
+        for (op_idx, op) in ops.iter().enumerate() {
+            match op {
+                crate::vectorized::VectorAggregateOp::CountStar => {}
+                crate::vectorized::VectorAggregateOp::Count(col_idx) => {
+                    if let Some(v) = row.get(*col_idx) {
+                        if !v.is_null() {
+                            counts[op_idx] += 1;
+                        }
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Sum(col_idx) | crate::vectorized::VectorAggregateOp::Avg(col_idx) => {
+                    if let Some(v) = row.get(*col_idx) {
+                        match v {
+                            Value::SmallInt(i) => {
+                                int_sums[op_idx] = int_sums[op_idx].saturating_add(*i as i64);
+                                sums[op_idx] += *i as f64;
+                                counts[op_idx] += 1;
+                            }
+                            Value::Integer(i) => {
+                                int_sums[op_idx] = int_sums[op_idx].saturating_add(*i as i64);
+                                sums[op_idx] += *i as f64;
+                                counts[op_idx] += 1;
+                            }
+                            Value::BigInt(i) => {
+                                int_sums[op_idx] = int_sums[op_idx].saturating_add(*i);
+                                sums[op_idx] += *i as f64;
+                                counts[op_idx] += 1;
+                            }
+                            Value::Float(f) => {
+                                is_integral[op_idx] = false;
+                                sums[op_idx] += *f as f64;
+                                counts[op_idx] += 1;
+                            }
+                            Value::Double(d) => {
+                                is_integral[op_idx] = false;
+                                sums[op_idx] += *d;
+                                counts[op_idx] += 1;
+                            }
+                            Value::Decimal(dec) => {
+                                is_integral[op_idx] = false;
+                                if let Some(n) = dec.to_f64() {
+                                    sums[op_idx] += n;
+                                    counts[op_idx] += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Min(col_idx) => {
+                    if let Some(v) = row.get(*col_idx) {
+                        if !v.is_null() {
+                            mins[op_idx] = Some(match mins[op_idx].take() {
+                                Some(curr) => if v < &curr { v.clone() } else { curr },
+                                None => v.clone(),
+                            });
+                        }
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Max(col_idx) => {
+                    if let Some(v) = row.get(*col_idx) {
+                        if !v.is_null() {
+                            maxs[op_idx] = Some(match maxs[op_idx].take() {
+                                Some(curr) => if v > &curr { v.clone() } else { curr },
+                                None => v.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut res_values = Vec::with_capacity(ops.len());
+    for (op_idx, op) in ops.iter().enumerate() {
+        let val = match op {
+            crate::vectorized::VectorAggregateOp::CountStar => Value::BigInt(count_star),
+            crate::vectorized::VectorAggregateOp::Count(_) => Value::BigInt(counts[op_idx]),
+            crate::vectorized::VectorAggregateOp::Sum(_) => {
+                if counts[op_idx] == 0 {
+                    Value::Null
+                } else if is_integral[op_idx] {
+                    Value::BigInt(int_sums[op_idx])
+                } else {
+                    Value::Double(sums[op_idx])
+                }
+            }
+            crate::vectorized::VectorAggregateOp::Avg(_) => {
+                if counts[op_idx] == 0 {
+                    Value::Null
+                } else {
+                    Value::Double(sums[op_idx] / counts[op_idx] as f64)
+                }
+            }
+            crate::vectorized::VectorAggregateOp::Min(_) => match mins[op_idx].take() {
+                Some(v) => v,
+                None => Value::Null,
+            },
+            crate::vectorized::VectorAggregateOp::Max(_) => match maxs[op_idx].take() {
+                Some(v) => v,
+                None => Value::Null,
+            },
+        };
+        res_values.push(val);
+    }
+    Row::new(res_values)
 }
 
 pub(crate) fn project_returning(
@@ -738,12 +1120,6 @@ impl SQLEngine {
         base_table_def: &TableDef,
         ctx: &RowContext,
     ) -> Option<(Vec<String>, Vec<Row>)> {
-        let current_mode = self.execution_mode();
-        let should_vectorize = current_mode == "vectorized" || (current_mode == "auto" && filtered_rows.len() >= 64);
-        if !should_vectorize {
-            return None;
-        }
-
         let mut ops = Vec::new();
         let mut col_names = Vec::new();
 
@@ -797,14 +1173,19 @@ impl SQLEngine {
             }
         }
 
-        let schema = crate::vectorized::create_arrow_schema(&base_table_def.columns);
-        let batch = crate::vectorized::rows_to_record_batch(&schema, filtered_rows).ok()?;
-        let chunk = crate::vectorized::VectorChunk::new(batch);
-        let mem_op = Box::new(crate::vectorized::MemoryBatchOperator::single(chunk));
-        let mut agg_op = crate::vectorized::VectorizedAggregate::new(mem_op, ops);
-        let agg_row = agg_op.execute_aggregate().ok()?;
-
-        Some((col_names, vec![agg_row]))
+        let current_mode = self.execution_mode();
+        if current_mode == "vectorized" {
+            let schema = crate::vectorized::create_arrow_schema(&base_table_def.columns);
+            let batch = crate::vectorized::rows_to_record_batch(&schema, filtered_rows).ok()?;
+            let chunk = crate::vectorized::VectorChunk::new(batch);
+            let mem_op = Box::new(crate::vectorized::MemoryBatchOperator::single(chunk));
+            let mut agg_op = crate::vectorized::VectorizedAggregate::new(mem_op, ops);
+            let agg_row = agg_op.execute_aggregate().ok()?;
+            Some((col_names, vec![agg_row]))
+        } else {
+            let agg_row = execute_fast_row_aggregate(&ops, filtered_rows);
+            Some((col_names, vec![agg_row]))
+        }
     }
 
     /// キューテーブルの保持ポリシー（RETENTION_TIME, MAX_BYTES）に基づき古いメッセージをパージ（Head Truncation）
@@ -1684,12 +2065,7 @@ fn apply_join(
                             let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), idx.name.to_lowercase());
                             let has_null = vals.iter().any(|v| v.is_null());
                             if idx.is_unique && !has_null {
-                                let mut prefix = if vals.len() == 1 {
-                                    serde_json::to_vec(&vals[0]).unwrap_or_default()
-                                } else {
-                                    serde_json::to_vec(&vals).unwrap_or_default()
-                                };
-                                prefix.push(0x00);
+                                let prefix = encode_index_prefix(&vals);
                                 let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                 for (k, _) in matched {
                                     if let Some((v, conflicting_row_id)) = decode_composite_index_key(&k) {
@@ -1762,12 +2138,7 @@ fn apply_join(
                                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                                        let mut prefix = if new_vals.len() == 1 {
-                                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
-                                                        } else {
-                                                            serde_json::to_vec(&new_vals).unwrap_or_default()
-                                                        };
-                                                        prefix.push(0x00);
+                                                        let prefix = encode_index_prefix(&new_vals);
                                                         let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                                         for (k, _) in matched {
                                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
@@ -1947,8 +2318,7 @@ fn apply_join(
                                     } else {
                                         val.clone()
                                     };
-                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
-                                    prefix.push(0x00);
+                                    let prefix = encode_index_prefix(std::slice::from_ref(&casted_val));
                                     let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                     let mut fetched = Vec::with_capacity(matched_entries.len());
                                     for (k, _) in matched_entries {
@@ -2099,8 +2469,7 @@ fn apply_join(
                                     } else {
                                         val.clone()
                                     };
-                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
-                                    prefix.push(0x00);
+                                    let prefix = encode_index_prefix(std::slice::from_ref(&casted_val));
                                     let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                     let mut fetched = Vec::with_capacity(matched_entries.len());
                                     for (k, _) in matched_entries {
@@ -2207,12 +2576,7 @@ fn apply_join(
                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let mut prefix = if new_vals.len() == 1 {
-                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
-                                        } else {
-                                            serde_json::to_vec(&new_vals).unwrap_or_default()
-                                        };
-                                        prefix.push(0x00);
+                                        let prefix = encode_index_prefix(&new_vals);
                                         let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                         for (k, _) in matched {
                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
@@ -2280,12 +2644,7 @@ fn apply_join(
                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let mut prefix = if new_vals.len() == 1 {
-                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
-                                        } else {
-                                            serde_json::to_vec(&new_vals).unwrap_or_default()
-                                        };
-                                        prefix.push(0x00);
+                                        let prefix = encode_index_prefix(&new_vals);
                                         let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                         for (k, _) in matched {
                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
@@ -3533,6 +3892,135 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
     }
 }
 
+pub(crate) fn extract_range_predicate(
+    expr: &Expr,
+    target_col: &str,
+) -> Option<(std::ops::Bound<Value>, std::ops::Bound<Value>)> {
+    let get_ident = |e: &Expr| -> Option<String> {
+        match e {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+            _ => None,
+        }
+    };
+
+    match expr {
+        Expr::Between { expr, low, high, negated } => {
+            if !*negated {
+                if let Some(col) = get_ident(expr) {
+                    if col.eq_ignore_ascii_case(target_col) {
+                        if let (Ok(low_val), Ok(high_val)) = (
+                            evaluate_literal_or_unary(low),
+                            evaluate_literal_or_unary(high),
+                        ) {
+                            return Some((std::ops::Bound::Included(low_val), std::ops::Bound::Included(high_val)));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Expr::BinaryOp { left, op, right } => {
+            if *op == BinaryOperator::And {
+                let left_res = Self::extract_range_predicate(left, target_col);
+                let right_res = Self::extract_range_predicate(right, target_col);
+                match (left_res, right_res) {
+                    (Some((l_start, l_end)), Some((r_start, r_end))) => {
+                        let combined_start = match (l_start, r_start) {
+                            (std::ops::Bound::Unbounded, b) | (b, std::ops::Bound::Unbounded) => b,
+                            (std::ops::Bound::Included(v1), std::ops::Bound::Included(v2)) => {
+                                if v1 >= v2 { std::ops::Bound::Included(v1) } else { std::ops::Bound::Included(v2) }
+                            }
+                            (std::ops::Bound::Excluded(v1), std::ops::Bound::Excluded(v2)) => {
+                                if v1 >= v2 { std::ops::Bound::Excluded(v1) } else { std::ops::Bound::Excluded(v2) }
+                            }
+                            (std::ops::Bound::Included(v1), std::ops::Bound::Excluded(v2)) => {
+                                if v1 > v2 { std::ops::Bound::Included(v1) } else { std::ops::Bound::Excluded(v2) }
+                            }
+                            (std::ops::Bound::Excluded(v1), std::ops::Bound::Included(v2)) => {
+                                if v1 >= v2 { std::ops::Bound::Excluded(v1) } else { std::ops::Bound::Included(v2) }
+                            }
+                        };
+                        let combined_end = match (l_end, r_end) {
+                            (std::ops::Bound::Unbounded, b) | (b, std::ops::Bound::Unbounded) => b,
+                            (std::ops::Bound::Included(v1), std::ops::Bound::Included(v2)) => {
+                                if v1 <= v2 { std::ops::Bound::Included(v1) } else { std::ops::Bound::Included(v2) }
+                            }
+                            (std::ops::Bound::Excluded(v1), std::ops::Bound::Excluded(v2)) => {
+                                if v1 <= v2 { std::ops::Bound::Excluded(v1) } else { std::ops::Bound::Excluded(v2) }
+                            }
+                            (std::ops::Bound::Included(v1), std::ops::Bound::Excluded(v2)) => {
+                                if v1 < v2 { std::ops::Bound::Included(v1) } else { std::ops::Bound::Excluded(v2) }
+                            }
+                            (std::ops::Bound::Excluded(v1), std::ops::Bound::Included(v2)) => {
+                                if v1 <= v2 { std::ops::Bound::Excluded(v1) } else { std::ops::Bound::Included(v2) }
+                            }
+                        };
+                        return Some((combined_start, combined_end));
+                    }
+                    (Some(res), None) => return Some(res),
+                    (None, Some(res)) => return Some(res),
+                    (None, None) => return None,
+                }
+            }
+
+            if let Some(col) = get_ident(left) {
+                if col.eq_ignore_ascii_case(target_col) {
+                    if let Ok(val) = evaluate_literal_or_unary(right) {
+                        match op {
+                            BinaryOperator::Gt => return Some((std::ops::Bound::Excluded(val), std::ops::Bound::Unbounded)),
+                            BinaryOperator::GtEq => return Some((std::ops::Bound::Included(val), std::ops::Bound::Unbounded)),
+                            BinaryOperator::Lt => return Some((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(val))),
+                            BinaryOperator::LtEq => return Some((std::ops::Bound::Unbounded, std::ops::Bound::Included(val))),
+                            _ => {}
+                        }
+                    }
+                }
+            } else if let Some(col) = get_ident(right) {
+                if col.eq_ignore_ascii_case(target_col) {
+                    if let Ok(val) = evaluate_literal_or_unary(left) {
+                        match op {
+                            BinaryOperator::Gt => return Some((std::ops::Bound::Unbounded, std::ops::Bound::Excluded(val))),
+                            BinaryOperator::GtEq => return Some((std::ops::Bound::Unbounded, std::ops::Bound::Included(val))),
+                            BinaryOperator::Lt => return Some((std::ops::Bound::Excluded(val), std::ops::Bound::Unbounded)),
+                            BinaryOperator::LtEq => return Some((std::ops::Bound::Included(val), std::ops::Bound::Unbounded)),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn convert_value_bounds_to_bytes(
+    table_def: &TableDef,
+    col_name: &str,
+    start: std::ops::Bound<Value>,
+    end: std::ops::Bound<Value>,
+) -> (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>) {
+    let cast_val = |v: Value| -> Value {
+        if let Some(c_idx) = table_def.column_index(col_name) {
+            v.cast_to(&table_def.columns[c_idx].data_type).unwrap_or(v)
+        } else {
+            v
+        }
+    };
+    let b_start = match start {
+        std::ops::Bound::Included(v) => std::ops::Bound::Included(encode_index_prefix(&[cast_val(v)])),
+        std::ops::Bound::Excluded(v) => std::ops::Bound::Excluded(encode_index_key_max(&[cast_val(v)])),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+    };
+    let b_end = match end {
+        std::ops::Bound::Included(v) => std::ops::Bound::Included(encode_index_key_max(&[cast_val(v)])),
+        std::ops::Bound::Excluded(v) => std::ops::Bound::Excluded(encode_index_prefix(&[cast_val(v)])),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+    };
+    (b_start, b_end)
+}
+
     fn explain_statement(&self, _tx: &Transaction, stmt: Statement) -> H2Result<String> {
         match stmt {
             Statement::Query(query) => {
@@ -4216,8 +4704,7 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
                                                         val.clone()
                                                     };
 
-                                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
-                                                    prefix.push(0x00);
+                                                    let prefix = encode_index_prefix(std::slice::from_ref(&casted_val));
 
                                                     let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
                                                     let mut fetched = Vec::with_capacity(matched_entries.len());
@@ -4236,9 +4723,42 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
                                             }
                                         }
 
-                                        // 2. Range Scan 等のインデックス検索
+                                        // 2. Range Scan 等のインデックス検索 (B+Tree 高速範囲検索)
                                         if index_scanned.is_none() {
                                             for target_idx in &indexes {
+                                                if target_idx.columns.len() == 1 {
+                                                    let col_name = &target_idx.columns[0];
+                                                    if let Some((start_bound, end_bound)) = Self::extract_range_predicate(sel, col_name) {
+                                                        let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                                        let (b_start, b_end) = Self::convert_value_bounds_to_bytes(&table_def, col_name, start_bound, end_bound);
+                                                        let matched = tx.scan_range_visible(
+                                                            &idx_map_name,
+                                                            match &b_start {
+                                                                std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_slice()),
+                                                                std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_slice()),
+                                                                std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                                                            },
+                                                            match &b_end {
+                                                                std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_slice()),
+                                                                std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_slice()),
+                                                                std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                                                            },
+                                                        )?;
+                                                        let mut fetched = Vec::with_capacity(matched.len());
+                                                        for (k, _) in matched {
+                                                            if let Some((_v, r_id)) = decode_index_key(&k) {
+                                                                if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                                    let mut row = Row::from_bytes(&val_bytes)?;
+                                                                    table_def.align_row(&mut row);
+                                                                    fetched.push(row);
+                                                                }
+                                                            }
+                                                        }
+                                                        index_scanned = Some(fetched);
+                                                        break;
+                                                    }
+                                                }
+
                                                 if let Some(filter_fn) = Self::build_index_filter(sel, &target_idx.columns[0]) {
                                                     let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
                                                     let idx_entries = tx.scan_visible(&idx_map_name)?;

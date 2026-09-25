@@ -8,6 +8,7 @@ pub mod storage_engine;
 pub mod store;
 pub mod tree;
 pub mod tx;
+pub mod wal;
 
 pub use buffer_pool::{BufferPoolManager, ClockReplacer, DiskManager, PageFrame, SlottedPage, PAGE_SIZE};
 pub use chunk::{ChunkMeta, ChunkPayload};
@@ -19,6 +20,7 @@ pub use storage_engine::{LocalMVStoreEngine, StorageEngine};
 pub use store::MVStore;
 pub use tree::MVTree;
 pub use tx::{Transaction, TransactionStatus, TransactionStore, VersionedValue};
+pub use wal::{WalChange, WalManager, WalRecord};
 
 #[cfg(test)]
 mod tests {

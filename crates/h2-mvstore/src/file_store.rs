@@ -130,6 +130,10 @@ impl FileStore {
         &self.header
     }
 
+    pub fn sync_on_commit(&self) -> bool {
+        self.sync_on_commit
+    }
+
     /// 最新チャンクをファイル末尾に追記し、ヘッダを更新してコミット
     pub fn append_and_commit(&mut self, chunk: &ChunkPayload) -> H2Result<()> {
         let Some(file) = &mut self.file else {

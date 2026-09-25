@@ -14,6 +14,7 @@ use crate::tree::MVTree;
 /// MVStore 本体
 pub struct MVStore {
     file_store: Arc<RwLock<FileStore>>,
+    wal_manager: Arc<RwLock<crate::wal::WalManager>>,
     maps: Arc<RwLock<HashMap<String, MVMap>>>,
     version: Arc<RwLock<u64>>,
     chunk_id_counter: Arc<RwLock<u32>>,
@@ -23,7 +24,8 @@ pub struct MVStore {
 
 impl MVStore {
     pub fn open<P: AsRef<Path>>(path: P) -> H2Result<Self> {
-        let mut file_store = FileStore::open(path)?;
+        let path_ref = path.as_ref();
+        let mut file_store = FileStore::open(path_ref)?;
         let last_version = file_store.header().version;
 
         let mut maps = HashMap::new();
@@ -39,9 +41,7 @@ impl MVStore {
             // メタデータマップから登録済みマップのルート情報を復元
             for entry in metadata_tree.scan_all() {
                 let map_name = String::from_utf8_lossy(&entry.key).to_string();
-                let root_page_opt = bincode::deserialize::<Page>(&entry.value)
-                    .ok()
-                    .or_else(|| serde_json::from_slice::<Page>(&entry.value).ok());
+                let root_page_opt = bincode::deserialize::<Page>(&entry.value).ok();
                 if let Some(root_page) = root_page_opt {
                     let tree = MVTree {
                         root: Arc::new(root_page),
@@ -53,10 +53,36 @@ impl MVStore {
             }
         }
 
+        // WAL の復元と差分適用（クラッシュリカバリ）
+        let sync_on_commit = file_store.sync_on_commit();
+        let mut wal_manager = crate::wal::WalManager::open(path_ref, sync_on_commit)?;
+        let wal_records = wal_manager.read_all_records()?;
+        let mut max_version = last_version;
+        for record in wal_records {
+            if record.commit_version > max_version {
+                max_version = record.commit_version;
+            }
+            for change in record.changes {
+                let map = if let Some(m) = maps.get(&change.map_name) {
+                    m.clone()
+                } else {
+                    let m = MVMap::new(&change.map_name, MVTree::default());
+                    maps.insert(change.map_name.clone(), m.clone());
+                    m
+                };
+                if let Some(val) = change.value {
+                    map.put(change.key, val);
+                } else {
+                    map.remove(&change.key);
+                }
+            }
+        }
+
         Ok(Self {
             file_store: Arc::new(RwLock::new(file_store)),
+            wal_manager: Arc::new(RwLock::new(wal_manager)),
             maps: Arc::new(RwLock::new(maps)),
-            version: Arc::new(RwLock::new(last_version)),
+            version: Arc::new(RwLock::new(max_version)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
             change_sink: Arc::new(RwLock::new(None)),
             replication_listener: Arc::new(RwLock::new(None)),
@@ -66,6 +92,7 @@ impl MVStore {
     pub fn open_in_memory() -> Self {
         Self {
             file_store: Arc::new(RwLock::new(FileStore::open_in_memory())),
+            wal_manager: Arc::new(RwLock::new(crate::wal::WalManager::open_in_memory())),
             maps: Arc::new(RwLock::new(HashMap::new())),
             version: Arc::new(RwLock::new(0)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
@@ -128,8 +155,50 @@ impl MVStore {
         self.maps.write().remove(name).is_some()
     }
 
-    /// 現在の全マップの変更をファイルに追記コミット
-    pub fn commit(&self) -> H2Result<u64> {
+    /// トランザクション単位の超高速 WAL コミット（数十バイト追記）
+    pub fn commit_wal(
+        &self,
+        tx_id: u64,
+        commit_version: u64,
+        changes: Vec<crate::wal::WalChange>,
+    ) -> H2Result<()> {
+        let mut ver_guard = self.version.write();
+        if commit_version > *ver_guard {
+            *ver_guard = commit_version;
+        }
+
+        let record = crate::wal::WalRecord {
+            tx_id,
+            commit_version,
+            changes,
+        };
+
+        self.wal_manager.write().append(&record)?;
+
+        // 未コミット変更の取り出し
+        if let Some(ref sink) = *self.change_sink.read() {
+            let _ = sink.drain_changes();
+        }
+
+        // レプリケーションリスナー（分散ストレージクォーラム等）が存在する場合に通知
+        let listener_opt = self.replication_listener.read().clone();
+        if let Some(ref listener) = listener_opt {
+            let mut repl_changes = Vec::with_capacity(record.changes.len());
+            for c in &record.changes {
+                if let Some(ref v) = c.value {
+                    repl_changes.push(crate::replication::ReplicationChange::put(c.map_name.clone(), c.key.clone(), v.clone()));
+                } else {
+                    repl_changes.push(crate::replication::ReplicationChange::remove(c.map_name.clone(), c.key.clone()));
+                }
+            }
+            listener.on_commit(commit_version, repl_changes)?;
+        }
+
+        Ok(())
+    }
+
+    /// チェックポイント: 全マップの最新ツリーをファイルに記録し、WAL をクリア
+    pub fn checkpoint(&self) -> H2Result<u64> {
         let mut ver_guard = self.version.write();
         *ver_guard += 1;
         let new_version = *ver_guard;
@@ -158,6 +227,9 @@ impl MVStore {
         let mut fs = self.file_store.write();
         fs.append_and_commit(&payload)?;
 
+        // WAL の切り捨て
+        let _ = self.wal_manager.write().clear();
+
         // レプリケーションリスナーが存在する場合、通知＆同期待機 (remote_apply)
         if let Some(ref listener) = *self.replication_listener.read() {
             listener.on_commit(new_version, changes)?;
@@ -166,12 +238,21 @@ impl MVStore {
         Ok(new_version)
     }
 
+    /// 現在の全マップの変更をファイルに追記コミット（チェックポイント）
+    pub fn commit(&self) -> H2Result<u64> {
+        self.checkpoint()
+    }
+
     pub fn set_sync_on_commit(&self, sync: bool) {
         self.file_store.write().set_sync_on_commit(sync);
+        self.wal_manager.write().set_sync_on_commit(sync);
     }
 
     pub fn sync(&self) -> H2Result<()> {
-        self.file_store.write().sync()
+        self.checkpoint()?;
+        self.file_store.write().sync()?;
+        self.wal_manager.write().sync()?;
+        Ok(())
     }
 
     /// 全マップの全エントリをスキャンして取得（初期スナップショット送信用）
@@ -227,7 +308,7 @@ impl MVStore {
 
             for entry in raw_entries {
                 // VersionedValue（MVCCレコード）の場合
-                if let Ok(vv) = serde_json::from_slice::<crate::tx::versioned_value::VersionedValue>(&entry.value) {
+                if let Ok(vv) = crate::tx::versioned_value::VersionedValue::from_bytes(&entry.value) {
                     // Vacuum時点（current_ver）で確定している最新のコミット値を抽出
                     // 未コミットの変更は含めず、削除済みの場合はツリーから完全に除去（Vacuum）
                     if let Some(visible_val) = vv.read_visible(u64::MAX, current_ver) {
@@ -235,8 +316,7 @@ impl MVStore {
                             visible_val.to_vec(),
                             current_ver,
                         );
-                        let clean_bytes = serde_json::to_vec(&clean_vv)
-                            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+                        let clean_bytes = clean_vv.to_bytes()?;
                         clean_tree.put(entry.key, clean_bytes);
                     }
                 } else {
@@ -245,7 +325,7 @@ impl MVStore {
                 }
             }
 
-            let root_bytes = serde_json::to_vec(&*clean_tree.root)
+            let root_bytes = bincode::serialize(&*clean_tree.root)
                 .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
             metadata_tree.put(name.as_bytes().to_vec(), root_bytes);
         }
@@ -257,6 +337,8 @@ impl MVStore {
 
         // チャンクIDカウンタをリセット
         *self.chunk_id_counter.write() = 1;
+
+        let _ = self.wal_manager.write().clear();
 
         Ok(())
     }

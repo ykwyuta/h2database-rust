@@ -32,14 +32,14 @@ impl FtsIndex {
         for token in unique_tokens {
             let key = token.into_bytes();
             let mut row_ids: Vec<u64> = if let Some(bytes) = tx.get(&map, &key)? {
-                serde_json::from_slice(&bytes).unwrap_or_default()
+                bincode::deserialize(&bytes).unwrap_or_default()
             } else {
                 Vec::new()
             };
 
             if !row_ids.contains(&row_id) {
                 row_ids.push(row_id);
-                let serialized = serde_json::to_vec(&row_ids)
+                let serialized = bincode::serialize(&row_ids)
                     .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
                 tx.put(&map, key, serialized)?;
             }
@@ -66,13 +66,13 @@ impl FtsIndex {
         for token in unique_tokens {
             let key = token.into_bytes();
             if let Some(bytes) = tx.get(&map, &key)? {
-                let mut row_ids: Vec<u64> = serde_json::from_slice(&bytes).unwrap_or_default();
+                let mut row_ids: Vec<u64> = bincode::deserialize(&bytes).unwrap_or_default();
                 if let Some(pos) = row_ids.iter().position(|&id| id == row_id) {
                     row_ids.remove(pos);
                     if row_ids.is_empty() {
                         tx.remove(&map, &key)?;
                     } else {
-                        let serialized = serde_json::to_vec(&row_ids)
+                        let serialized = bincode::serialize(&row_ids)
                             .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
                         tx.put(&map, key, serialized)?;
                     }
@@ -103,7 +103,7 @@ impl FtsIndex {
         for token in tokens {
             let key = token.into_bytes();
             let row_ids: HashSet<u64> = if let Some(bytes) = tx.get(&map, &key)? {
-                let ids: Vec<u64> = serde_json::from_slice(&bytes).unwrap_or_default();
+                let ids: Vec<u64> = bincode::deserialize(&bytes).unwrap_or_default();
                 ids.into_iter().collect()
             } else {
                 HashSet::new()

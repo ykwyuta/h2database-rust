@@ -39,6 +39,18 @@ impl VersionedValue {
         }
     }
 
+    pub fn to_bytes(&self) -> h2_types::H2Result<Vec<u8>> {
+        bincode::serialize(self).map_err(|e| h2_types::H2Error::Serialization(e.to_string()))
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> h2_types::H2Result<Self> {
+        if bytes.is_empty() {
+            return Err(h2_types::H2Error::Serialization("Empty versioned value bytes".to_string()));
+        }
+        bincode::deserialize::<VersionedValue>(bytes)
+            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))
+    }
+
     /// スナップショット分離（Snapshot Isolation）における可視性判定と値の取得
     pub fn read_visible(&self, reader_tx_id: u64, snapshot_version: u64) -> Option<&[u8]> {
         // 1. 自トランザクションの未コミット変更があればそれを返す

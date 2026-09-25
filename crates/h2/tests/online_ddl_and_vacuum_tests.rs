@@ -135,7 +135,9 @@ fn test_online_vacuum_with_concurrent_transactions() {
     }
     conn1.execute("COMMIT").unwrap();
 
-    let initial_size = std::fs::metadata(&db_path).unwrap().len();
+    let wal_path = db_path.with_extension("wal");
+    let initial_size = std::fs::metadata(&db_path).unwrap().len()
+        + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
     // 2. 一部データを削除してコミット（死にレコードを作成）
     conn1.execute("DELETE FROM logs WHERE id > 50").unwrap();
@@ -150,7 +152,8 @@ fn test_online_vacuum_with_concurrent_transactions() {
     // ブロックすることなく安全に未コミットデータを除外してコミット済みデータのみを Vacuum する。
     conn1.execute("VACUUM").unwrap();
 
-    let post_vacuum_size = std::fs::metadata(&db_path).unwrap().len();
+    let post_vacuum_size = std::fs::metadata(&db_path).unwrap().len()
+        + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
     println!("Initial size: {}, Post-vacuum size: {}", initial_size, post_vacuum_size);
     assert!(post_vacuum_size < initial_size, "Vacuum should reduce file size by purging deleted records");
 

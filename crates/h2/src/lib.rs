@@ -880,7 +880,9 @@ mod tests {
             conn.execute(&sql).unwrap();
         }
 
-        let pre_delete_size = std::fs::metadata(&path).unwrap().len();
+        let wal_path = path.with_extension("wal");
+        let pre_delete_size = std::fs::metadata(&path).unwrap().len()
+            + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
         // 2. 180件を削除（死にページが発生）
         conn.execute("DELETE FROM records WHERE id > 20").unwrap();
@@ -888,7 +890,8 @@ mod tests {
         // 3. VACUUM を実行してコンパクション
         conn.vacuum().unwrap();
 
-        let post_vacuum_size = std::fs::metadata(&path).unwrap().len();
+        let post_vacuum_size = std::fs::metadata(&path).unwrap().len()
+            + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
         // コンパクションによりファイルサイズが縮小していることを検証
         assert!(post_vacuum_size < pre_delete_size, "Expected {} < {}", post_vacuum_size, pre_delete_size);

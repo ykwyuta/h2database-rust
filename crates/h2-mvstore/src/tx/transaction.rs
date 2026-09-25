@@ -55,8 +55,7 @@ impl Transaction {
             return Ok(None);
         };
 
-        let vv: VersionedValue = serde_json::from_slice(&val_bytes)
-            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        let vv: VersionedValue = VersionedValue::from_bytes(&val_bytes)?;
 
         Ok(vv.read_visible(self.tx_id, self.snapshot_version).map(|v| v.to_vec()))
     }
@@ -70,8 +69,7 @@ impl Transaction {
             let _key_guard = self.store.lock_manager().lock_key(map_name, &key);
 
             let existing_vv = if let Some(val_bytes) = map.get(&key) {
-                let existing: VersionedValue = serde_json::from_slice(&val_bytes)
-                    .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                let existing: VersionedValue = VersionedValue::from_bytes(&val_bytes)?;
                 Some(existing)
             } else {
                 None
@@ -135,8 +133,7 @@ impl Transaction {
                 value: Some(value),
             });
 
-            let serialized = serde_json::to_vec(&vv)
-                .map_err(|e| H2Error::Serialization(e.to_string()))?;
+            let serialized = vv.to_bytes()?;
 
             self.undo_log.write().push(UndoLogEntry {
                 map_name: map_name.to_string(),
@@ -159,8 +156,7 @@ impl Transaction {
             let _key_guard = self.store.lock_manager().lock_key(map_name, key);
 
             let existing_vv = if let Some(val_bytes) = map.get(key) {
-                let existing: VersionedValue = serde_json::from_slice(&val_bytes)
-                    .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                let existing: VersionedValue = VersionedValue::from_bytes(&val_bytes)?;
                 Some(existing)
             } else {
                 None
@@ -225,8 +221,7 @@ impl Transaction {
                 value: None, // 削除マーク
             });
 
-            let serialized = serde_json::to_vec(&vv)
-                .map_err(|e| H2Error::Serialization(e.to_string()))?;
+            let serialized = vv.to_bytes()?;
 
             self.undo_log.write().push(UndoLogEntry {
                 map_name: map_name.to_string(),
@@ -249,7 +244,7 @@ impl Transaction {
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Ok(vv) = serde_json::from_slice::<VersionedValue>(&entry.value) {
+            if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
                     visible_entries.push((entry.key, val.to_vec()));
                 }
@@ -268,7 +263,31 @@ impl Transaction {
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Ok(vv) = serde_json::from_slice::<VersionedValue>(&entry.value) {
+            if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
+                if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
+                    visible_entries.push((entry.key, val.to_vec()));
+                }
+            }
+        }
+
+        Ok(visible_entries)
+    }
+
+    /// 指定範囲 [start, end] の可視なエントリを高速走査 (B+Tree Range Scan)
+    pub fn scan_range_visible(
+        &self,
+        map_name: &str,
+        start: std::ops::Bound<&[u8]>,
+        end: std::ops::Bound<&[u8]>,
+    ) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_open()?;
+        let map = self.store.mvstore().open_map(map_name);
+        let raw_entries = map.scan_range(start, end);
+
+        let mut visible_entries = Vec::with_capacity(raw_entries.len());
+        for entry in raw_entries {
+            h2_types::check_query_timeout()?;
+            if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
                     visible_entries.push((entry.key, val.to_vec()));
                 }
@@ -293,25 +312,36 @@ impl Transaction {
 
         let has_changes = !undo_logs.is_empty();
 
+        let mut wal_changes = Vec::new();
         for log in undo_logs.iter() {
             let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
             let map = self.store.mvstore().open_map(&log.map_name);
             if let Some(val_bytes) = map.get(&log.key) {
-                if let Ok(mut vv) = serde_json::from_slice::<VersionedValue>(&val_bytes) {
+                if let Ok(mut vv) = VersionedValue::from_bytes(&val_bytes) {
                     if vv.active_tx_id() == Some(self.tx_id) {
                         vv.commit_uncommitted(commit_version);
-                        let serialized = serde_json::to_vec(&vv)
-                            .map_err(|e| H2Error::Serialization(e.to_string()))?;
-                        map.put(log.key.clone(), serialized);
+                        let serialized = vv.to_bytes()?;
+                        map.put(log.key.clone(), serialized.clone());
+                        wal_changes.push(crate::wal::WalChange {
+                            map_name: log.map_name.clone(),
+                            key: log.key.clone(),
+                            value: Some(serialized),
+                        });
                     }
                 }
+            } else {
+                wal_changes.push(crate::wal::WalChange {
+                    map_name: log.map_name.clone(),
+                    key: log.key.clone(),
+                    value: None,
+                });
             }
         }
 
         *status = TransactionStatus::Committed;
         self.store.remove_active_tx(self.tx_id);
         if has_changes {
-            self.store.mvstore().commit()?;
+            self.store.mvstore().commit_wal(self.tx_id, commit_version, wal_changes)?;
         }
         Ok(())
     }
@@ -331,14 +361,13 @@ impl Transaction {
             let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
             let map = self.store.mvstore().open_map(&log.map_name);
             if let Some(val_bytes) = map.get(&log.key) {
-                if let Ok(mut vv) = serde_json::from_slice::<VersionedValue>(&val_bytes) {
+                if let Ok(mut vv) = VersionedValue::from_bytes(&val_bytes) {
                     if vv.active_tx_id() == Some(self.tx_id) {
                         vv.rollback_uncommitted();
                         if vv.committed_history.is_empty() {
                             map.remove(&log.key);
                         } else {
-                            let serialized = serde_json::to_vec(&vv)
-                                .map_err(|e| H2Error::Serialization(e.to_string()))?;
+                            let serialized = vv.to_bytes()?;
                             map.put(log.key, serialized);
                         }
                     }

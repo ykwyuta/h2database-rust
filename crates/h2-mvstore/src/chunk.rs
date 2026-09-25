@@ -75,14 +75,7 @@ impl ChunkPayload {
             )));
         }
 
-        // まず高速なバイナリ (bincode) でデシリアライズを試み、失敗時は後方互換性のため JSON でフォールバック
-        if let Ok(payload) = bincode::deserialize::<Self>(payload_bytes) {
-            return Ok(payload);
-        }
-
-        let payload: ChunkPayload = serde_json::from_slice(payload_bytes)
-            .map_err(|e| H2Error::Serialization(e.to_string()))?;
-
-        Ok(payload)
+        bincode::deserialize::<Self>(payload_bytes)
+            .map_err(|e| H2Error::Serialization(e.to_string()))
     }
 }

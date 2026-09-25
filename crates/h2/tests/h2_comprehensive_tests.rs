@@ -139,7 +139,9 @@ fn test_h2_compaction_vacuum_stress() {
         conn.execute(&sql).unwrap();
     }
 
-    let size_after_insert = std::fs::metadata(&path).unwrap().len();
+    let wal_path = path.with_extension("wal");
+    let size_after_insert = std::fs::metadata(&path).unwrap().len()
+        + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
     // 450件を削除
     conn.execute("DELETE FROM log_entries WHERE id > 50").unwrap();
@@ -147,7 +149,8 @@ fn test_h2_compaction_vacuum_stress() {
     // コンパクション (Vacuum) 実行
     conn.vacuum().unwrap();
 
-    let size_after_vacuum = std::fs::metadata(&path).unwrap().len();
+    let size_after_vacuum = std::fs::metadata(&path).unwrap().len()
+        + std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
     // ファイルサイズが削減されていることを検証
     assert!(

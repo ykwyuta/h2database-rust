@@ -356,6 +356,22 @@ impl Catalog {
             }
         }
 
+        // 各テーブルの next_row_id を実際の tbl_{name} マップの最大キーより大きく補正
+        for table_def in tables.values_mut() {
+            let map_name = table_def.map_name();
+            let tbl_map = store.open_map(&map_name);
+            for entry in tbl_map.scan_all() {
+                if entry.key.len() == 8 {
+                    if let Ok(k_bytes) = entry.key.as_slice().try_into() {
+                        let existing_id = u64::from_le_bytes(k_bytes);
+                        if existing_id >= table_def.next_row_id {
+                            table_def.next_row_id = existing_id + 1;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             store,
             catalog_map,
@@ -412,6 +428,23 @@ impl Catalog {
                 }
             }
         }
+
+        // 各テーブルの next_row_id を実際の tbl_{name} マップの最大キーより大きく補正
+        for table_def in tables.values_mut() {
+            let map_name = table_def.map_name();
+            let tbl_map = self.store.open_map(&map_name);
+            for entry in tbl_map.scan_all() {
+                if entry.key.len() == 8 {
+                    if let Ok(k_bytes) = entry.key.as_slice().try_into() {
+                        let existing_id = u64::from_le_bytes(k_bytes);
+                        if existing_id >= table_def.next_row_id {
+                            table_def.next_row_id = existing_id + 1;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
