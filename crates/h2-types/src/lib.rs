@@ -2,6 +2,7 @@ pub mod data_type;
 pub mod error;
 pub mod storage;
 pub mod timeout;
+pub mod query_metrics;
 pub mod value;
 
 pub use data_type::DataType;

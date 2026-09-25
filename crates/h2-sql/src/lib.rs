@@ -5,6 +5,7 @@ pub mod expression;
 pub mod fts;
 pub mod memory;
 pub mod parser;
+pub mod query_stats;
 pub mod row;
 pub mod stats;
 pub mod vectorized;
@@ -73,6 +74,79 @@ mod tests {
         } else {
             panic!("Expected Query result");
         }
+    }
+
+    #[test]
+    fn test_explain_analyze_and_query_stats() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+        engine.execute("CREATE TABLE metrics_test (id INTEGER PRIMARY KEY, balance INTEGER)").unwrap();
+        engine.execute("INSERT INTO metrics_test VALUES (1, 10), (2, 20)").unwrap();
+
+        let plan = engine.execute("EXPLAIN UPDATE metrics_test SET balance = balance + 1 WHERE id = 1").unwrap();
+        let ExecutionResult::Query { rows, .. } = plan else { panic!("expected plan") };
+        let Value::String(plan_text) = &rows[0].values[0] else { panic!("expected text") };
+        assert!(plan_text.contains("IndexScan"));
+
+        let before = engine.execute("SELECT balance FROM metrics_test WHERE id = 1").unwrap();
+        let ExecutionResult::Query { rows, .. } = before else { panic!("expected rows") };
+        assert_eq!(rows[0].values[0], Value::Integer(10));
+
+        let plan = engine.execute("EXPLAIN ANALYZE UPDATE metrics_test SET balance = balance + 1 WHERE id = 1").unwrap();
+        let ExecutionResult::Query { rows, .. } = plan else { panic!("expected plan") };
+        let Value::String(plan_text) = &rows[0].values[0] else { panic!("expected text") };
+        assert!(plan_text.contains("Actual Rows: 1"));
+        assert!(plan_text.contains("Waits:"));
+        assert!(plan_text.contains("Storage: point_gets=1, scans=1, scan_entries=1"));
+
+        engine.execute("UPDATE metrics_test SET balance = balance + 1 WHERE id = 1").unwrap();
+        engine.execute("update metrics_test set balance=balance+1 where id=2").unwrap();
+        let stats = engine.execute("SHOW QUERY STATS").unwrap();
+        let ExecutionResult::Query { columns, rows } = stats else { panic!("expected stats") };
+        assert!(columns.contains(&"wal_sync_ms".to_string()));
+        assert!(columns.contains(&"wal_durable_wait_ms".to_string()));
+        assert!(rows.iter().any(|r| r.values[0] == Value::String(
+            crate::query_stats::normalize_query("UPDATE metrics_test SET balance=balance+1 WHERE id=1")
+        ) && r.values[1] == Value::BigInt(2)));
+
+        engine.execute("RESET QUERY STATS").unwrap();
+        let stats = engine.execute("SHOW QUERY STATS").unwrap();
+        let ExecutionResult::Query { rows, .. } = stats else { panic!("expected stats") };
+        assert!(rows.is_empty());
+
+        let tx = engine.tx_store().begin();
+        engine.execute_with_tx(&tx, "UPDATE metrics_test SET balance = balance + 1 WHERE id = 1").unwrap();
+        engine.commit_transaction(&tx).unwrap();
+        let stats = engine.execute("SHOW QUERY STATS").unwrap();
+        let ExecutionResult::Query { rows, .. } = stats else { panic!("expected stats") };
+        assert!(rows.iter().any(|r| r.values[0] == Value::String("COMMIT".to_string())));
+    }
+
+    #[test]
+    fn test_explain_analyze_respects_read_only_and_stats_permissions() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+        engine.execute("CREATE TABLE restricted_test (id INTEGER PRIMARY KEY, amount INTEGER)").unwrap();
+        engine.execute("INSERT INTO restricted_test VALUES (1, 5)").unwrap();
+        engine.auth().create_user("reader", None, None, false).unwrap();
+        assert!(matches!(
+            engine.execute_with_user("SHOW QUERY STATS", Some("reader")),
+            Err(h2_types::H2Error::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            engine.execute_with_user("EXPLAIN UPDATE restricted_test SET amount = 6 WHERE id = 1", Some("reader")),
+            Err(h2_types::H2Error::PermissionDenied(_))
+        ));
+
+        engine.set_read_only(true);
+        assert!(engine.execute("EXPLAIN UPDATE restricted_test SET amount = 6 WHERE id = 1").is_ok());
+        assert!(matches!(
+            engine.execute("EXPLAIN ANALYZE UPDATE restricted_test SET amount = 6 WHERE id = 1"),
+            Err(h2_types::H2Error::ReadOnly(_))
+        ));
+        let result = engine.execute("SELECT amount FROM restricted_test WHERE id = 1").unwrap();
+        let ExecutionResult::Query { rows, .. } = result else { panic!("expected rows") };
+        assert_eq!(rows[0].values[0], Value::Integer(5));
     }
 
     #[test]

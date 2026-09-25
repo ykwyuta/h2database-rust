@@ -1,8 +1,8 @@
+use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::RwLock;
 
 use crate::store::MVStore;
 use crate::tx::lock::LockManager;
@@ -60,11 +60,10 @@ impl TransactionStore {
     pub(crate) fn remove_active_tx(&self, tx_id: u64) {
         self.active_transactions.write().remove(&tx_id);
         self.lock_manager.unregister_wait(tx_id);
-        self.lock_manager.notify_lock_released();
+        self.lock_manager.notify_lock_released(tx_id);
     }
 
     pub fn active_tx_count(&self) -> usize {
         self.active_transactions.read().len()
     }
 }
-

@@ -522,6 +522,21 @@ impl Connection {
         self.store.sync()
     }
 
+    /// WAL を同期する。スナップショットは作らない。
+    pub fn sync_wal(&self) -> H2Result<()> {
+        self.store.sync_wal()
+    }
+
+    /// WAL 容量または経過時間の上限に達したときだけチェックポイントを作る。
+    pub fn checkpoint_if_needed(&self, max_wal_bytes: u64, max_interval: std::time::Duration) -> H2Result<bool> {
+        self.store.checkpoint_if_needed(max_wal_bytes, max_interval)
+    }
+
+    /// 差分チェックポイントをまとめ、古いファイル領域を回収する。
+    pub fn reclaim_checkpoint_history(&self) -> H2Result<u64> {
+        self.store.reclaim_checkpoint_history()
+    }
+
     #[cfg(feature = "server")]
     /// バックグラウンドで PostgreSQL 互換ワイヤプロトコルサーバーを起動し、リッスンアドレスを返却
     pub async fn start_pg_server(&self, addr: std::net::SocketAddr) -> H2Result<std::net::SocketAddr> {
@@ -901,4 +916,3 @@ mod tests {
         assert_eq!(remaining.len(), 20);
     }
 }
-

@@ -1,5 +1,5 @@
-use std::net::SocketAddr;
 use h2::{Connection, H2Result};
+use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> H2Result<()> {
@@ -28,7 +28,7 @@ async fn main() -> H2Result<()> {
             status VARCHAR(20) NOT NULL,
             cpu_usage DOUBLE,
             metadata JSON
-        )"
+        )",
     )?;
 
     // 既存行数をチェック
@@ -45,12 +45,18 @@ async fn main() -> H2Result<()> {
     }
 
     // 3. PostgreSQL ワイヤプロトコルサーバーを開始 (ポート 5433 または PG_PORT)
-    let port = std::env::var("PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let port = std::env::var("PG_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(5433);
     let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     let actual_addr = match conn.start_pg_server(bind_addr).await {
         Ok(addr) => addr,
         Err(e) => {
-            eprintln!("[WARN] Port {} might be in use ({e}). Trying automatic port...", port);
+            eprintln!(
+                "[WARN] Port {} might be in use ({e}). Trying automatic port...",
+                port
+            );
             let fallback: SocketAddr = "0.0.0.0:0".parse().unwrap();
             conn.start_pg_server(fallback).await?
         }
@@ -60,7 +66,11 @@ async fn main() -> H2Result<()> {
     println!("  🚀 Server is listening on: {}", actual_addr);
     println!("  ----------------------------------------------------------");
     println!("  Connect with psql:");
-    println!("    psql -h {} -p {} -U postgres -d mydb", actual_addr.ip(), actual_addr.port());
+    println!(
+        "    psql -h {} -p {} -U postgres -d mydb",
+        actual_addr.ip(),
+        actual_addr.port()
+    );
     println!();
     println!("  Connect with GUI (DBeaver / TablePlus / DataGrip):");
     println!("    Host: {}", actual_addr.ip());
@@ -72,23 +82,39 @@ async fn main() -> H2Result<()> {
     println!("  Press Ctrl+C to stop the server.");
     println!();
 
-    // 4. バックグラウンド非同期同期タスク (1秒間隔で OS キャッシュを fsync)
+    // 4. WAL の同期と容量・時間上限に応じたチェックポイント
     let sync_conn = conn.clone();
     let is_memory = db_path == ":memory:";
     let sync_handle = tokio::spawn(async move {
         if is_memory {
             return;
         }
+        const MAX_WAL_BYTES: u64 = 16 * 1024 * 1024;
+        const MAX_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let _ = sync_conn.sync();
+            let conn = sync_conn.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                conn.sync_wal()?;
+                conn.checkpoint_if_needed(MAX_WAL_BYTES, MAX_CHECKPOINT_INTERVAL)
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => eprintln!("[ERROR] Background checkpoint failed: {error}"),
+                Err(error) => eprintln!("[ERROR] Background checkpoint task failed: {error}"),
+            }
         }
     });
 
-    tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+    tokio::signal::ctrl_c()
+        .await
+        .expect("Failed to listen for Ctrl+C");
     println!("\n[INFO] Flushed data and shutting down PG-Wire demo server. Bye!");
     sync_handle.abort();
-    let _ = conn.sync();
+    let _ = sync_handle.await;
+    conn.sync()?;
     Ok(())
 }

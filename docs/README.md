@@ -79,3 +79,13 @@
     - Slotted Page からの直接転置（Direct Column Transposition）によるゼロコピー化
     - 統計情報基盤と CBO を連携した自動実行パス判定（Adaptive Rule & Runtime Promotion）
     - DuckDB, SQL Server (Batch Mode on Rowstore) 等とのアーキテクチャ比較と段階的ロードマップ
+
+### 性能評価・改善提案
+
+- [12. pgbench 性能評価](./12_pgbench_performance_evaluation.md)
+- [13. 性能最適化提案と実施結果](./13_performance_optimization_proposal.md)
+- [14. UPDATE 性能の追加改善案](./14_update_performance_additional_proposals.md)
+- [15. クエリ性能の計測と実行計画の確認](./15_query_performance_metrics.md)
+- [16. UPDATE 性能の再測定と原因評価](./16_update_performance_remeasurement.md)
+- [17. 再測定に基づく UPDATE 性能改善案](./17_update_performance_improvement_plan.md)
+- [18. UPDATE 性能改善の実装結果](./18_update_performance_implementation.md)

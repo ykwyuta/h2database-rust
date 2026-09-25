@@ -7,12 +7,14 @@ use sqlparser::ast::{
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use chrono::Datelike;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
 use h2_types::{H2Error, H2Result, Value};
+use h2_types::query_metrics::QueryMetricsGuard;
 use crate::catalog::{Catalog, ColumnDef, ForeignKeyAction, IndexDef, TableDef};
 use crate::expression::{
     evaluate_expr, evaluate_expr_context, evaluate_literal_or_unary, ColumnBinding, RowContext,
@@ -526,6 +528,7 @@ pub struct SQLEngine {
     admission: Arc<crate::memory::MemoryGrantCoordinator>,
     execution_mode: Arc<parking_lot::RwLock<String>>,
     plan_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<Statement>>>>,
+    query_stats: Arc<crate::query_stats::QueryStats>,
 }
 
 impl SQLEngine {
@@ -550,6 +553,7 @@ impl SQLEngine {
             admission,
             execution_mode,
             plan_cache,
+            query_stats: Arc::new(crate::query_stats::QueryStats::default()),
         })
     }
 
@@ -608,19 +612,23 @@ impl SQLEngine {
 
     /// 暗黙トランザクション（Auto-commit）でユーザー指定でSQLを実行
     pub fn execute_with_user(&self, sql: &str, user: Option<&str>) -> H2Result<ExecutionResult> {
+        let started = Instant::now();
+        let metrics = QueryMetricsGuard::start();
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        if trimmed.eq_ignore_ascii_case("VACUUM") {
-            self.store.compact()?;
-            return Ok(ExecutionResult::Ddl);
-        }
-
-        let tx = self.tx_store.begin();
-        let result = self.execute_with_user_and_tx(&tx, sql, user);
-        if result.is_ok() {
-            tx.commit()?;
+        let result = if trimmed.eq_ignore_ascii_case("VACUUM") {
+            self.store.compact().map(|_| ExecutionResult::Ddl)
         } else {
-            let _ = tx.rollback();
-        }
+            let tx = self.tx_store.begin();
+            let result = self.execute_with_user_and_tx_inner(&tx, sql, user);
+            match result {
+                Ok(value) => tx.commit().map(|_| value),
+                Err(error) => {
+                    let _ = tx.rollback();
+                    Err(error)
+                }
+            }
+        };
+        self.record_query(sql, started, metrics, &result);
         result
     }
 
@@ -629,10 +637,50 @@ impl SQLEngine {
         self.execute_with_user_and_tx(tx, sql, None)
     }
 
+    /// Commit an explicit transaction and attribute WAL waits to COMMIT.
+    pub fn commit_transaction(&self, tx: &Transaction) -> H2Result<()> {
+        let started = Instant::now();
+        let metrics = QueryMetricsGuard::start();
+        let result = tx.commit();
+        self.query_stats.record("COMMIT", started.elapsed(), 0, result.is_err(), metrics.finish());
+        result
+    }
+
     /// ユーザー指定および明示的トランザクションコンテキストでSQLを実行
     pub fn execute_with_user_and_tx(&self, tx: &Transaction, sql: &str, user: Option<&str>) -> H2Result<ExecutionResult> {
+        let started = Instant::now();
+        let metrics = QueryMetricsGuard::start();
+        let result = self.execute_with_user_and_tx_inner(tx, sql, user);
+        self.record_query(sql, started, metrics, &result);
+        result
+    }
+
+    fn record_query(&self, sql: &str, started: Instant, metrics: QueryMetricsGuard, result: &H2Result<ExecutionResult>) {
+        let counters = metrics.finish();
+        let command = sql.trim().trim_end_matches(';').trim();
+        if command.eq_ignore_ascii_case("SHOW QUERY STATS") || command.eq_ignore_ascii_case("RESET QUERY STATS") {
+            return;
+        }
+        let rows = match result {
+            Ok(ExecutionResult::Query { rows, .. }) => rows.len() as u64,
+            Ok(ExecutionResult::Dml { affected_rows }) => *affected_rows,
+            _ => 0,
+        };
+        self.query_stats.record(sql, started.elapsed(), rows, result.is_err(), counters);
+    }
+
+    fn execute_with_user_and_tx_inner(&self, tx: &Transaction, sql: &str, user: Option<&str>) -> H2Result<ExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let trimmed_upper = trimmed.to_uppercase();
+
+        if trimmed_upper == "SHOW QUERY STATS" || trimmed_upper == "RESET QUERY STATS" {
+            self.require_stats_admin(user)?;
+            if trimmed_upper == "RESET QUERY STATS" {
+                self.query_stats.reset();
+                return Ok(ExecutionResult::Ddl);
+            }
+            return Ok(self.show_query_stats());
+        }
 
         if self.is_read_only() {
             if trimmed.eq_ignore_ascii_case("VACUUM")
@@ -767,18 +815,69 @@ impl SQLEngine {
         let mut last_result = ExecutionResult::Ddl;
 
         for stmt in statements {
-            if self.is_read_only() && Self::is_write_statement(&stmt) {
+            let subject = match &stmt {
+                Statement::Explain { statement, .. } => statement.as_ref(),
+                _ => &stmt,
+            };
+            let will_execute = !matches!(&stmt, Statement::Explain { analyze: false, .. });
+            if self.is_read_only() && will_execute && Self::is_write_statement(subject) {
                 return Err(H2Error::ReadOnly(
                     "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
                 ));
             }
             if let Some(username) = user {
-                self.check_statement_privileges(username, &stmt)?;
+                self.check_statement_privileges(username, subject)?;
             }
             last_result = self.execute_statement(tx, stmt)?;
         }
 
         Ok(last_result)
+    }
+
+    fn require_stats_admin(&self, user: Option<&str>) -> H2Result<()> {
+        if !self.auth.is_auth_enabled() || user.is_none() {
+            return Ok(());
+        }
+        let allowed = user.and_then(|name| {
+            self.auth.list_users().into_iter().find(|u| u.username.eq_ignore_ascii_case(name))
+        }).is_some_and(|u| u.is_superuser);
+        if allowed {
+            Ok(())
+        } else {
+            Err(H2Error::PermissionDenied("Query statistics require a superuser".to_string()))
+        }
+    }
+
+    fn show_query_stats(&self) -> ExecutionResult {
+        let columns = [
+            "query", "calls", "errors", "rows", "total_ms", "mean_ms", "min_ms", "max_ms",
+            "lock_wait_ms", "tree_lock_wait_ms", "commit_lock_wait_ms", "wal_lock_wait_ms", "wal_write_ms", "wal_sync_ms", "wal_durable_wait_ms",
+            "point_gets", "scans", "scan_entries",
+        ].into_iter().map(str::to_string).collect();
+        let rows = self.query_stats.snapshot().into_iter().map(|s| {
+            let ms = |ns: u64| ns as f64 / 1_000_000.0;
+            Row::new(vec![
+                Value::String(s.query),
+                Value::BigInt(s.calls as i64),
+                Value::BigInt(s.errors as i64),
+                Value::BigInt(s.rows as i64),
+                Value::Double(ms(s.total_ns)),
+                Value::Double(ms(s.total_ns) / s.calls as f64),
+                Value::Double(ms(s.min_ns)),
+                Value::Double(ms(s.max_ns)),
+                Value::Double(ms(s.counters.lock_wait_ns)),
+                Value::Double(ms(s.counters.tree_lock_wait_ns)),
+                Value::Double(ms(s.counters.commit_lock_wait_ns)),
+                Value::Double(ms(s.counters.wal_lock_wait_ns)),
+                Value::Double(ms(s.counters.wal_write_ns)),
+                Value::Double(ms(s.counters.wal_sync_ns)),
+                Value::Double(ms(s.counters.wal_durable_wait_ns)),
+                Value::BigInt(s.counters.point_gets as i64),
+                Value::BigInt(s.counters.scans as i64),
+                Value::BigInt(s.counters.scan_entries as i64),
+            ])
+        }).collect();
+        ExecutionResult::Query { columns, rows }
     }
 
     fn is_write_statement(stmt: &Statement) -> bool {
@@ -2633,6 +2732,7 @@ fn apply_join(
                 };
                 let mut affected_rows = 0;
                 let mut updated_rows = Vec::new();
+                let collect_returning = returning.as_ref().is_some_and(|items| !items.is_empty());
                 let mut updated_keys = std::collections::HashSet::new();
                 let target_ctx = RowContext::from_table_def(&table_def, target_alias.as_deref());
 
@@ -2739,7 +2839,9 @@ fn apply_join(
                             tx.put(&map_name, key.clone(), row.to_bytes()?)?;
                             updated_keys.insert(key);
                             affected_rows += 1;
-                            updated_rows.push(row);
+                            if collect_returning {
+                                updated_rows.push(row);
+                            }
                         }
                     } else {
                         let matches = if let Some(sel) = &selection {
@@ -2809,7 +2911,9 @@ fn apply_join(
                             tx.put(&map_name, key.clone(), row.to_bytes()?)?;
                             updated_keys.insert(key);
                             affected_rows += 1;
-                            updated_rows.push(row);
+                            if collect_returning {
+                                updated_rows.push(row);
+                            }
                         }
                     }
                 }
@@ -3239,8 +3343,34 @@ fn apply_join(
                 self.store.commit()?;
                 Ok(ExecutionResult::Ddl)
             }
-            Statement::Explain { statement, .. } => {
-                let plan_str = self.explain_statement(tx, *statement)?;
+            Statement::Explain { analyze, statement, format, options, .. } => {
+                if format.is_some() || options.is_some() {
+                    return Err(H2Error::Unsupported("Only text EXPLAIN and EXPLAIN ANALYZE are supported".to_string()));
+                }
+                let mut plan_str = self.explain_statement(tx, *statement.clone())?;
+                if analyze {
+                    let before = QueryMetricsGuard::snapshot();
+                    let started = Instant::now();
+                    let result = self.execute_statement(tx, *statement)?;
+                    let elapsed = started.elapsed();
+                    let counters = QueryMetricsGuard::snapshot().since(before);
+                    let actual_rows = match result {
+                        ExecutionResult::Query { rows, .. } => rows.len() as u64,
+                        ExecutionResult::Dml { affected_rows } => affected_rows,
+                        ExecutionResult::Ddl => 0,
+                    };
+                    plan_str.push_str(&format!(
+                        "\nActual Rows: {}\nExecution Time: {:.3} ms\nWaits: row_lock={:.3} ms, tree_lock={:.3} ms, commit_lock={:.3} ms, wal_lock={:.3} ms, wal_write={:.3} ms, wal_sync={:.3} ms\nStorage: point_gets={}, scans={}, scan_entries={}\nTiming scope: statement execution; auto-commit is excluded",
+                        actual_rows, elapsed.as_secs_f64() * 1000.0,
+                        counters.lock_wait_ns as f64 / 1_000_000.0,
+                        counters.tree_lock_wait_ns as f64 / 1_000_000.0,
+                        counters.commit_lock_wait_ns as f64 / 1_000_000.0,
+                        counters.wal_lock_wait_ns as f64 / 1_000_000.0,
+                        counters.wal_write_ns as f64 / 1_000_000.0,
+                        counters.wal_sync_ns as f64 / 1_000_000.0,
+                        counters.point_gets, counters.scans, counters.scan_entries,
+                    ));
+                }
                 let row = Row::new(vec![Value::String(plan_str)]);
                 Ok(ExecutionResult::Query {
                     columns: vec!["PLAN".to_string()],
@@ -4187,7 +4317,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                         if let Some(ref sel) = select.selection {
                             let indexes = self.catalog.get_table_indexes(&base_table_name);
                             for idx in &indexes {
-                                if !idx.name.starts_with("pk_") && Self::matches_index_condition(sel, &idx.columns[0]) {
+                                if idx.columns.len() == 1 && Self::matches_index_condition(sel, &idx.columns[0]) {
                                     is_index_scan = true;
                                     matched_index_name = idx.name.clone();
                                     break;
@@ -4267,7 +4397,28 @@ pub(crate) fn convert_value_bounds_to_bytes(
                 Ok(lines.join("\n"))
             }
             Statement::Insert(insert) => Ok(format!("Insert into {}", insert.table_name)),
-            Statement::Update { table, .. } => Ok(format!("Update {}", table.relation)),
+            Statement::Update { table, selection, from, .. } => {
+                let table_name = table.relation.to_string();
+                let mut lines = vec![format!("Update {}", table_name)];
+                let index = if from.is_none() {
+                    selection.as_ref().and_then(|sel| Self::extract_equality_predicate(sel)).and_then(|(column, _)| {
+                        self.catalog.get_table_indexes(&table_name).into_iter().find(|idx| {
+                            idx.columns.len() == 1 && idx.columns[0].eq_ignore_ascii_case(&column)
+                        })
+                    })
+                } else {
+                    None
+                };
+                if let Some(index) = index {
+                    lines.push(format!("  -> IndexScan: {} on index {}", table_name, index.name));
+                } else {
+                    lines.push(format!("  -> TableScan: {}", table_name));
+                }
+                if let Some(filter) = selection {
+                    lines.push(format!("Filter: {}", filter));
+                }
+                Ok(lines.join("\n"))
+            }
             Statement::Delete(_) => Ok("Delete".to_string()),
             _ => Ok(format!("Statement: {:?}", stmt)),
         }

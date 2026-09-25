@@ -184,7 +184,8 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     out_buf.extend_from_slice(&PgMessageBuilder::command_complete("BEGIN"));
                 } else if upper == "COMMIT" || upper.starts_with("COMMIT ") || upper == "END" {
                     if let Some(tx) = active_tx.take() {
-                        let res: H2Result<()> = tokio::task::spawn_blocking(move || tx.commit()).await
+                        let eng = Arc::clone(&engine);
+                        let res: H2Result<()> = tokio::task::spawn_blocking(move || eng.commit_transaction(&tx)).await
                             .map_err(|e| H2Error::Execution(e.to_string()))?;
                         if let Err(e) = res {
                             out_buf.extend_from_slice(&PgMessageBuilder::error_response(&e.to_string()));
@@ -201,7 +202,7 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     out_buf.extend_from_slice(&PgMessageBuilder::command_complete("ROLLBACK"));
                 } else if upper.starts_with("SET ") {
                     out_buf.extend_from_slice(&PgMessageBuilder::command_complete("SET"));
-                } else if upper.starts_with("SHOW ") {
+                } else if upper.starts_with("SHOW ") && upper != "SHOW QUERY STATS" {
                     let var = trimmed[5..].trim().to_lowercase();
                     let val = match var.as_str() {
                         "client_encoding" => "UTF8",
@@ -226,14 +227,7 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                             let r = if let Some(ref tx) = current_tx {
                                 eng.execute_with_user_and_tx(tx, &sql_owned, Some(&user_for_exec))
                             } else {
-                                let dummy_tx = eng.tx_store().begin();
-                                let res = eng.execute_with_user_and_tx(&dummy_tx, &sql_owned, Some(&user_for_exec));
-                                if res.is_ok() {
-                                    let _ = dummy_tx.commit();
-                                } else {
-                                    let _ = dummy_tx.rollback();
-                                }
-                                res
+                                eng.execute_with_user(&sql_owned, Some(&user_for_exec))
                             };
                             (r, current_tx)
                         }).await.map_err(|e| H2Error::Execution(e.to_string()))?;
@@ -243,7 +237,8 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     match exec_result {
                         Ok(result) => match result {
                             ExecutionResult::Ddl => {
-                                out_buf.extend_from_slice(&PgMessageBuilder::command_complete("CREATE TABLE"));
+                                let tag = if upper == "RESET QUERY STATS" { "RESET" } else { "CREATE TABLE" };
+                                out_buf.extend_from_slice(&PgMessageBuilder::command_complete(tag));
                             }
                             ExecutionResult::Dml { affected_rows } => {
                                 let tag = if upper.starts_with("INSERT") {

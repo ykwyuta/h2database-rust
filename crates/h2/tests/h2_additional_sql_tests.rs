@@ -122,10 +122,10 @@ fn test_explain_statement() {
     let plan = rows[0].get_as::<String>(0).unwrap();
     assert!(plan.contains("IndexScan"));
 
-    // EXPLAIN SELECT (SeqScan / TableScan)
+    // The primary-key predicate uses an index scan as well.
     let rows = conn.query("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
     let plan = rows[0].get_as::<String>(0).unwrap();
-    assert!(plan.contains("TableScan: users"));
+    assert!(plan.contains("IndexScan: users on index pk_"));
 
     // EXPLAIN SELECT with JOIN
     let rows = conn.query("EXPLAIN SELECT * FROM users JOIN orders ON users.id = orders.user_id").unwrap();

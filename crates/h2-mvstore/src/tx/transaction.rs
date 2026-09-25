@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
-use h2_types::{H2Error, H2Result};
 use crate::tx::store::TransactionStore;
 use crate::tx::versioned_value::{UncommittedRecord, VersionedValue};
+use h2_types::{H2Error, H2Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionStatus {
@@ -29,11 +29,7 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(
-        tx_id: u64,
-        snapshot_version: u64,
-        store: Arc<TransactionStore>,
-    ) -> Self {
+    pub fn new(tx_id: u64, snapshot_version: u64, store: Arc<TransactionStore>) -> Self {
         Self {
             tx_id,
             snapshot_version,
@@ -50,18 +46,23 @@ impl Transaction {
     /// トランザクション分離に基づいてキーを読み取る
     pub fn get(&self, map_name: &str, key: &[u8]) -> H2Result<Option<Vec<u8>>> {
         self.check_open()?;
+        h2_types::query_metrics::record_point_get();
         let map = self.store.mvstore().open_map(map_name);
         let Some(val_bytes) = map.get(key) else {
             return Ok(None);
         };
 
-        if let Some(val) = VersionedValue::read_visible_raw(&val_bytes, self.tx_id, self.snapshot_version) {
+        if let Some(val) =
+            VersionedValue::read_visible_raw(&val_bytes, self.tx_id, self.snapshot_version)
+        {
             return Ok(Some(val.to_vec()));
         }
 
         let vv: VersionedValue = VersionedValue::from_bytes(&val_bytes)?;
 
-        Ok(vv.read_visible(self.tx_id, self.snapshot_version).map(|v| v.to_vec()))
+        Ok(vv
+            .read_visible(self.tx_id, self.snapshot_version)
+            .map(|v| v.to_vec()))
     }
 
     /// トランザクション内でキーバリューを挿入/更新
@@ -89,7 +90,11 @@ impl Transaction {
                     drop(_key_guard);
 
                     // デッドロック（循環依存）チェックと待機関係の登録
-                    if let Err(e) = self.store.lock_manager().register_wait(self.tx_id, holder_tx_id) {
+                    if let Err(e) = self
+                        .store
+                        .lock_manager()
+                        .register_wait(self.tx_id, holder_tx_id)
+                    {
                         // デッドロック検出！自トランザクションを即座に自動ロールバックして片方をキャンセル
                         let _ = self.rollback();
                         return Err(e);
@@ -99,21 +104,31 @@ impl Transaction {
                     let timeout = if let Some(remaining) = h2_types::remaining_query_timeout() {
                         if remaining.is_zero() {
                             let _ = self.rollback();
-                            return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                            return Err(H2Error::QueryTimeout(
+                                "Query execution timed out waiting for lock".to_string(),
+                            ));
                         }
                         self.store.lock_timeout().min(remaining)
                     } else {
                         self.store.lock_timeout()
                     };
 
-                    let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
+                    let not_timed_out = if self.store.is_tx_active(holder_tx_id) {
+                        self.store
+                            .lock_manager()
+                            .wait_timeout(holder_tx_id, timeout)
+                    } else {
+                        true
+                    };
                     self.store.lock_manager().unregister_wait(self.tx_id);
 
                     if !not_timed_out {
                         if let Some(remaining) = h2_types::remaining_query_timeout() {
                             if remaining.is_zero() {
                                 let _ = self.rollback();
-                                return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                                return Err(H2Error::QueryTimeout(
+                                    "Query execution timed out waiting for lock".to_string(),
+                                ));
                             }
                         }
                         return Err(H2Error::LockConflict(format!(
@@ -176,7 +191,11 @@ impl Transaction {
                     drop(_key_guard);
 
                     // デッドロック（循環依存）チェックと待機関係の登録
-                    if let Err(e) = self.store.lock_manager().register_wait(self.tx_id, holder_tx_id) {
+                    if let Err(e) = self
+                        .store
+                        .lock_manager()
+                        .register_wait(self.tx_id, holder_tx_id)
+                    {
                         // デッドロック検出！自トランザクションを即座に自動ロールバックして片方をキャンセル
                         let _ = self.rollback();
                         return Err(e);
@@ -186,21 +205,31 @@ impl Transaction {
                     let timeout = if let Some(remaining) = h2_types::remaining_query_timeout() {
                         if remaining.is_zero() {
                             let _ = self.rollback();
-                            return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                            return Err(H2Error::QueryTimeout(
+                                "Query execution timed out waiting for lock".to_string(),
+                            ));
                         }
                         self.store.lock_timeout().min(remaining)
                     } else {
                         self.store.lock_timeout()
                     };
 
-                    let not_timed_out = self.store.lock_manager().wait_timeout(timeout);
+                    let not_timed_out = if self.store.is_tx_active(holder_tx_id) {
+                        self.store
+                            .lock_manager()
+                            .wait_timeout(holder_tx_id, timeout)
+                    } else {
+                        true
+                    };
                     self.store.lock_manager().unregister_wait(self.tx_id);
 
                     if !not_timed_out {
                         if let Some(remaining) = h2_types::remaining_query_timeout() {
                             if remaining.is_zero() {
                                 let _ = self.rollback();
-                                return Err(H2Error::QueryTimeout("Query execution timed out waiting for lock".to_string()));
+                                return Err(H2Error::QueryTimeout(
+                                    "Query execution timed out waiting for lock".to_string(),
+                                ));
                             }
                         }
                         return Err(H2Error::LockConflict(format!(
@@ -215,7 +244,10 @@ impl Transaction {
             }
 
             // もし可視な値が存在しなければ削除対象なし
-            if existing_vv.read_visible(self.tx_id, self.snapshot_version).is_none() {
+            if existing_vv
+                .read_visible(self.tx_id, self.snapshot_version)
+                .is_none()
+            {
                 return Ok(false);
             }
 
@@ -244,6 +276,7 @@ impl Transaction {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
         let raw_entries = map.scan_all();
+        h2_types::query_metrics::record_scan(raw_entries.len());
 
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
@@ -259,11 +292,19 @@ impl Transaction {
     }
 
     /// 可視な全エントリをゼロコピーで走査 (ゼロアロケーション)
-    pub fn for_each_visible<F: FnMut(&[u8], &[u8])>(&self, map_name: &str, mut f: F) -> H2Result<()> {
+    pub fn for_each_visible<F: FnMut(&[u8], &[u8])>(
+        &self,
+        map_name: &str,
+        mut f: F,
+    ) -> H2Result<()> {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
+        let mut scanned = 0usize;
         map.for_each_entry(|k, raw_v| {
-            if let Some(val) = VersionedValue::read_visible_raw(raw_v, self.tx_id, self.snapshot_version) {
+            scanned += 1;
+            if let Some(val) =
+                VersionedValue::read_visible_raw(raw_v, self.tx_id, self.snapshot_version)
+            {
                 f(k, val);
             } else if let Ok(vv) = VersionedValue::from_bytes(raw_v) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
@@ -271,19 +312,27 @@ impl Transaction {
                 }
             }
         });
+        h2_types::query_metrics::record_scan(scanned);
         Ok(())
     }
 
     /// 指定プレフィックスで始まる可視なエントリを高速走査 (B+Tree Prefix Scan)
-    pub fn scan_prefix_visible(&self, map_name: &str, prefix: &[u8]) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    pub fn scan_prefix_visible(
+        &self,
+        map_name: &str,
+        prefix: &[u8],
+    ) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
         let raw_entries = map.scan_prefix(prefix);
+        h2_types::query_metrics::record_scan(raw_entries.len());
 
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Some(val) = VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version) {
+            if let Some(val) =
+                VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version)
+            {
                 visible_entries.push((entry.key, val.to_vec()));
             } else if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
@@ -305,11 +354,14 @@ impl Transaction {
         self.check_open()?;
         let map = self.store.mvstore().open_map(map_name);
         let raw_entries = map.scan_range(start, end);
+        h2_types::query_metrics::record_scan(raw_entries.len());
 
         let mut visible_entries = Vec::with_capacity(raw_entries.len());
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Some(val) = VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version) {
+            if let Some(val) =
+                VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version)
+            {
                 visible_entries.push((entry.key, val.to_vec()));
             } else if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
@@ -328,45 +380,58 @@ impl Transaction {
             return Ok(());
         }
         if *status != TransactionStatus::Open {
-            return Err(H2Error::Transaction("Transaction is already closed".to_string()));
+            return Err(H2Error::Transaction(
+                "Transaction is already closed".to_string(),
+            ));
         }
 
-        let commit_version = self.store.mvstore().current_version() + 1;
         let undo_logs = self.undo_log.read();
 
         let has_changes = !undo_logs.is_empty();
-
-        let mut wal_changes = Vec::new();
-        for log in undo_logs.iter() {
-            let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
-            let map = self.store.mvstore().open_map(&log.map_name);
-            if let Some(val_bytes) = map.get(&log.key) {
-                if let Ok(mut vv) = VersionedValue::from_bytes(&val_bytes) {
-                    if vv.active_tx_id() == Some(self.tx_id) {
-                        vv.commit_uncommitted(commit_version);
-                        let serialized = vv.to_bytes()?;
-                        map.put(log.key.clone(), serialized.clone());
-                        wal_changes.push(crate::wal::WalChange {
-                            map_name: log.map_name.clone(),
-                            key: log.key.clone(),
-                            value: Some(serialized),
-                        });
+        if has_changes {
+            let result = self
+                .store
+                .mvstore()
+                .commit_with(self.tx_id, |commit_version| {
+                    let mut wal_changes = Vec::with_capacity(undo_logs.len());
+                    for log in undo_logs.iter() {
+                        let _key_guard =
+                            self.store.lock_manager().lock_key(&log.map_name, &log.key);
+                        let map = self.store.mvstore().open_map(&log.map_name);
+                        if let Some(val_bytes) = map.get(&log.key) {
+                            let mut vv = VersionedValue::from_bytes(&val_bytes)?;
+                            if vv.active_tx_id() == Some(self.tx_id) {
+                                vv.commit_uncommitted(commit_version);
+                                wal_changes.push(crate::wal::WalChange {
+                                    map_name: log.map_name.clone(),
+                                    key: log.key.clone(),
+                                    value: Some(vv.to_bytes()?),
+                                });
+                            }
+                        } else {
+                            wal_changes.push(crate::wal::WalChange {
+                                map_name: log.map_name.clone(),
+                                key: log.key.clone(),
+                                value: None,
+                            });
+                        }
                     }
-                }
-            } else {
-                wal_changes.push(crate::wal::WalChange {
-                    map_name: log.map_name.clone(),
-                    key: log.key.clone(),
-                    value: None,
+                    Ok(wal_changes)
                 });
+            if let Err(failure) = result {
+                if failure.durable {
+                    *status = TransactionStatus::Committed;
+                    self.store.remove_active_tx(self.tx_id);
+                } else {
+                    drop(undo_logs);
+                    drop(status);
+                    self.rollback()?;
+                }
+                return Err(failure.error);
             }
         }
-
         *status = TransactionStatus::Committed;
         self.store.remove_active_tx(self.tx_id);
-        if has_changes {
-            self.store.mvstore().commit_wal(self.tx_id, commit_version, wal_changes)?;
-        }
         Ok(())
     }
 
@@ -377,7 +442,9 @@ impl Transaction {
             return Ok(());
         }
         if *status != TransactionStatus::Open {
-            return Err(H2Error::Transaction("Transaction is already closed".to_string()));
+            return Err(H2Error::Transaction(
+                "Transaction is already closed".to_string(),
+            ));
         }
 
         let mut undo_logs = self.undo_log.write();

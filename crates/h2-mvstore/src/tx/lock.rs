@@ -1,15 +1,21 @@
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
-use parking_lot::{Condvar, Mutex};
 use h2_types::{H2Error, H2Result};
+use parking_lot::{Condvar, Mutex};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 /// トランザクション間のロック待機関係（Wait-For Graph）およびデッドロック検出器
 pub struct LockManager {
     /// waiter_tx_id -> holder_tx_id
     wait_for: Mutex<HashMap<u64, u64>>,
-    wait_mutex: Mutex<()>,
-    condvar: Condvar,
+    wait_cells: Mutex<HashMap<u64, Arc<WaitCell>>>,
     stripes: Vec<Mutex<()>>,
+}
+
+struct WaitCell {
+    released: Mutex<bool>,
+    condvar: Condvar,
 }
 
 impl LockManager {
@@ -21,8 +27,7 @@ impl LockManager {
         }
         Self {
             wait_for: Mutex::new(HashMap::new()),
-            wait_mutex: Mutex::new(()),
-            condvar: Condvar::new(),
+            wait_cells: Mutex::new(HashMap::new()),
             stripes,
         }
     }
@@ -34,7 +39,17 @@ impl LockManager {
         map_name.hash(&mut hasher);
         key.hash(&mut hasher);
         let idx = (hasher.finish() as usize) % self.stripes.len();
-        self.stripes[idx].lock()
+        if h2_types::query_metrics::enabled() {
+            if let Some(guard) = self.stripes[idx].try_lock() {
+                return guard;
+            }
+            let start = Instant::now();
+            let guard = self.stripes[idx].lock();
+            h2_types::query_metrics::record_lock_wait(start.elapsed());
+            guard
+        } else {
+            self.stripes[idx].lock()
+        }
     }
 
     /// 待機エッジを追加。デッドロック（サイクル）を検知した場合は Err(H2Error::LockConflict) を返す
@@ -47,13 +62,23 @@ impl LockManager {
             )));
         }
         wait_for.insert(waiter, holder);
+        self.wait_cells.lock().entry(holder).or_insert_with(|| {
+            Arc::new(WaitCell {
+                released: Mutex::new(false),
+                condvar: Condvar::new(),
+            })
+        });
         Ok(())
     }
 
     /// 待機エッジを削除
     pub fn unregister_wait(&self, waiter: u64) {
         let mut wait_for = self.wait_for.lock();
-        wait_for.remove(&waiter);
+        if let Some(holder) = wait_for.remove(&waiter) {
+            if !wait_for.values().any(|&other| other == holder) {
+                self.wait_cells.lock().remove(&holder);
+            }
+        }
     }
 
     /// Wait-For Graph における循環（サイクル）探索
@@ -80,15 +105,31 @@ impl LockManager {
     }
 
     /// ロック解放を待機（Condvar）
-    pub fn wait_timeout(&self, timeout: Duration) -> bool {
-        let mut guard = self.wait_mutex.lock();
-        let res = self.condvar.wait_for(&mut guard, timeout);
-        !res.timed_out()
+    pub fn wait_timeout(&self, holder: u64, timeout: Duration) -> bool {
+        let Some(cell) = self.wait_cells.lock().get(&holder).cloned() else {
+            return true;
+        };
+        let mut released = cell.released.lock();
+        let start = h2_types::query_metrics::enabled().then(Instant::now);
+        let waiting_since = Instant::now();
+        while !*released {
+            let remaining = timeout.saturating_sub(waiting_since.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            cell.condvar.wait_for(&mut released, remaining);
+        }
+        if let Some(start) = start {
+            h2_types::query_metrics::record_lock_wait(start.elapsed());
+        }
+        *released
     }
 
-    /// ロック解放通知を全待機スレッドにブロードキャスト
-    pub fn notify_lock_released(&self) {
-        let _guard = self.wait_mutex.lock();
-        self.condvar.notify_all();
+    /// 指定したトランザクションを待つスレッドだけに通知する。
+    pub fn notify_lock_released(&self, holder: u64) {
+        if let Some(cell) = self.wait_cells.lock().remove(&holder) {
+            *cell.released.lock() = true;
+            cell.condvar.notify_all();
+        }
     }
 }

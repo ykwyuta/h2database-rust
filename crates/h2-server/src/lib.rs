@@ -79,6 +79,13 @@ mod tests {
         // メッセージ中に 'Widget' が含まれていることを確認
         let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
         assert!(resp_str.contains("Widget"));
+
+        // The statistics command must reach the SQL engine rather than the
+        // server's generic SHOW variable handler.
+        send_query(&mut client, "SHOW QUERY STATS").await;
+        let n = client.read(&mut resp_buf).await.unwrap();
+        assert_eq!(resp_buf[0], b'T');
+        assert!(String::from_utf8_lossy(&resp_buf[..n]).contains("query"));
     }
 
     async fn send_query(stream: &mut TcpStream, sql: &str) {
