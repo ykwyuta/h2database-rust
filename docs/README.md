@@ -63,5 +63,13 @@
    - 現状の 5 つの重大な課題（RAM上限、全ツリー書き出し、Heap Churn、メモリ肥大化、OOMリスク）
    - 4フェーズにわたる段階的改善ロードマップ（アリーナ・Slotted Row、Buffer Pool、外部ソート・Memory Grant、ベクトル化）
 
+10. [10. 統計情報収集・更新機構の調査報告 (10_statistics_and_query_optimizer.md)](./10_statistics_and_query_optimizer.md)
+    - 現行実装に統計情報収集・更新機構が**完全に存在しない**ことの確認（全キーワード検索 0 件）
+    - カタログ構造（TableDef / IndexDef）における統計フィールドの欠落分析
+    - EXPLAIN 実装の実態（コストなし・構文整形のみ）とインデックス選択のルールベース判定
+    - PostgreSQL (`pg_statistic`, autovacuum ANALYZE) / SQL Server / Java 版 H2 との機能比較
+    - 4 つの問題点（行数不明・カーディナリティ不明・JOIN 順序固定・Range Scan 未対応）
+    - 段階的改善ロードマップ（近似行数カウンタ・ANALYZE 文・選択率推定・コストベース JOIN 最適化）
+
 
 
