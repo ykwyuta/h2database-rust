@@ -235,6 +235,11 @@ impl SQLEngine {
             return self.execute_alter_sequence(trimmed);
         }
 
+        if trimmed_upper.starts_with("CREATE QUEUE TABLE") {
+            return self.execute_create_queue_table(tx, trimmed);
+        }
+
+
         let mut sql_to_parse = trimmed.to_string();
         if trimmed_upper.starts_with("FETCH RELATIVE -") {
             let num_part = trimmed["FETCH RELATIVE -".len()..].trim();
@@ -460,7 +465,181 @@ impl SQLEngine {
         }
     }
 
+    fn execute_create_queue_table(&self, _tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        if self.is_read_only() {
+            return Err(H2Error::ReadOnly(
+                "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
+            ));
+        }
+
+        let (cleaned_sql, retention_ms, max_bytes) = parse_queue_with_clause(sql)?;
+
+        let regex_cqt = regex::Regex::new(r"(?i)^CREATE\s+QUEUE\s+TABLE").unwrap();
+        let create_table_sql = regex_cqt.replace(&cleaned_sql, "CREATE TABLE").to_string();
+
+        let statements = parse_sql(&create_table_sql)?;
+        let stmt = statements.into_iter().next().ok_or_else(|| {
+            H2Error::Execution("Failed to parse CREATE QUEUE TABLE".to_string())
+        })?;
+
+        match stmt {
+            Statement::CreateTable(create_table) => {
+                let table_def = extract_create_table(
+                    &create_table.name,
+                    &create_table.columns,
+                    &create_table.constraints,
+                )?;
+                let tbl_name = table_def.name.clone();
+                let queue_def = TableDef::new_queue(
+                    tbl_name.clone(),
+                    table_def.columns,
+                    retention_ms,
+                    max_bytes,
+                );
+
+                self.catalog.create_table(queue_def)?;
+
+                // 主キー用ユニークインデックス作成 (_offset)
+                let pk_index_name = format!("pk_{}", tbl_name.to_lowercase());
+                let _ = self.catalog.create_index(IndexDef {
+                    name: pk_index_name,
+                    table_name: tbl_name.clone(),
+                    columns: vec!["_offset".to_string()],
+                    is_unique: true,
+                });
+
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            _ => Err(H2Error::Execution("Expected CREATE TABLE statement".to_string())),
+        }
+    }
+
+    /// キューテーブルの保持ポリシー（RETENTION_TIME, MAX_BYTES）に基づき古いメッセージをパージ（Head Truncation）
+    pub fn purge_queue_retention(&self, tx: &Transaction, table_name: &str) -> H2Result<usize> {
+        let table_def = match self.catalog.get_table(table_name) {
+            Some(t) => t,
+            None => return Ok(0),
+        };
+        if !table_def.is_queue {
+            return Ok(0);
+        }
+        if table_def.retention_duration_ms.is_none() && table_def.max_bytes.is_none() {
+            return Ok(0);
+        }
+
+        let map_name = table_def.map_name();
+        let entries = tx.scan_visible(&map_name)?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        struct QueueRowItem {
+            key: Vec<u8>,
+            row_id: u64,
+            offset: i64,
+            timestamp_ms: i64,
+            byte_size: usize,
+            row: Row,
+        }
+
+        let mut items = Vec::with_capacity(entries.len());
+        let mut total_bytes: u64 = 0;
+
+        for (k, val_bytes) in entries {
+            let byte_size = k.len() + val_bytes.len();
+            total_bytes += byte_size as u64;
+            let mut row = Row::from_bytes(&val_bytes)?;
+            table_def.align_row(&mut row);
+
+            let row_id = if k.len() == 8 {
+                u64::from_le_bytes(k.as_slice().try_into().unwrap())
+            } else {
+                0
+            };
+
+            let offset = match row.values.get(0) {
+                Some(Value::BigInt(v)) => *v,
+                _ => row_id as i64,
+            };
+
+            let timestamp_ms = match row.values.get(1) {
+                Some(Value::Timestamp(ts)) => ts.timestamp_millis(),
+                _ => 0,
+            };
+
+
+            items.push(QueueRowItem {
+                key: k,
+                row_id,
+                offset,
+                timestamp_ms,
+                byte_size,
+                row,
+            });
+        }
+
+        // offset 昇順にソート
+        items.sort_by_key(|it| it.offset);
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut to_purge_keys: Vec<(Vec<u8>, u64, Row, usize)> = Vec::new();
+        let mut purged_key_set: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+        // 1. 時間基準パージ
+        if let Some(retention_ms) = table_def.retention_duration_ms {
+            let cutoff = now_ms.saturating_sub(retention_ms as i64);
+            for item in &items {
+                if item.timestamp_ms < cutoff {
+                    if purged_key_set.insert(item.key.clone()) {
+                        to_purge_keys.push((item.key.clone(), item.row_id, item.row.clone(), item.byte_size));
+                    }
+                }
+            }
+        }
+
+        // 2. 容量基準パージ
+        if let Some(max_b) = table_def.max_bytes {
+            let mut current_bytes = total_bytes;
+            for (_, _, _, size) in &to_purge_keys {
+                current_bytes = current_bytes.saturating_sub(*size as u64);
+            }
+
+            if current_bytes > max_b {
+                for item in &items {
+                    if current_bytes <= max_b {
+                        break;
+                    }
+                    if purged_key_set.insert(item.key.clone()) {
+                        current_bytes = current_bytes.saturating_sub(item.byte_size as u64);
+                        to_purge_keys.push((item.key.clone(), item.row_id, item.row.clone(), item.byte_size));
+                    }
+                }
+            }
+        }
+
+        let purged_count = to_purge_keys.len();
+        if purged_count == 0 {
+            return Ok(0);
+        }
+
+        let indexes = self.catalog.get_table_indexes(table_name);
+        for (k, r_id, row, _) in to_purge_keys {
+            for idx in &indexes {
+                if let Some(vals) = get_index_values(&table_def, idx, &row) {
+                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), idx.name.to_lowercase());
+                    let idx_key = encode_composite_index_key(&vals, r_id);
+                    let _ = tx.remove(&idx_map_name, &idx_key);
+                }
+            }
+            tx.remove(&map_name, &k)?;
+        }
+
+        Ok(purged_count)
+    }
+
     fn resolve_view_query(
+
         &self,
         tx: &Transaction,
         view: &crate::catalog::ViewDef,
@@ -983,6 +1162,14 @@ fn apply_join(
                     H2Error::Catalog(format!("Table '{}' not found", table_name))
                 })?;
 
+                if table_def.is_queue {
+                    return Err(H2Error::Unsupported(format!(
+                        "Secondary indexes are not allowed on Queue Table '{}'",
+                        table_name
+                    )));
+                }
+
+
                 let index_name = create_index.name.map(|n| n.to_string()).unwrap_or_else(|| {
                     let first_col = create_index.columns.first().map(|c| c.expr.to_string()).unwrap_or_else(|| "col".to_string());
                     format!("idx_{}_{}", table_name, first_col)
@@ -1060,7 +1247,28 @@ fn apply_join(
                 let indexes = self.catalog.get_table_indexes(&table_name);
 
                 let target_indices: Vec<usize> = if insert.columns.is_empty() {
-                    (0..table_def.columns.len()).collect()
+                    if table_def.is_queue {
+                        let first_len = if let Some(ref source) = insert.source {
+                            if matches!(*source.body, SetExpr::Values(ref v) if !v.rows.is_empty()) {
+                                if let SetExpr::Values(ref v) = *source.body {
+                                    v.rows[0].len()
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if first_len == table_def.columns.len().saturating_sub(4) {
+                            (4..table_def.columns.len()).collect()
+                        } else {
+                            (0..table_def.columns.len()).collect()
+                        }
+                    } else {
+                        (0..table_def.columns.len()).collect()
+                    }
                 } else {
                     let mut indices = Vec::with_capacity(insert.columns.len());
                     for col in &insert.columns {
@@ -1072,6 +1280,7 @@ fn apply_join(
                     }
                     indices
                 };
+
 
                 let rows_to_insert: Vec<Vec<Value>> = if let Some(source) = insert.source {
                     if source.with.is_none() && matches!(*source.body, SetExpr::Values(_)) {
@@ -1144,7 +1353,29 @@ fn apply_join(
                         }
                     }
 
+                    // キューテーブルのシステム列（_offset, _timestamp, _msg_id）の自動補完
+                    let mut allocated_row_id = None;
+                    if table_def.is_queue {
+                        let r_id = self.catalog.allocate_row_id(&table_name)?;
+                        if full_row_values[0].is_null() {
+                            full_row_values[0] = Value::BigInt(r_id as i64);
+                        }
+                        if full_row_values[1].is_null() {
+                            full_row_values[1] = Value::Timestamp(chrono::Utc::now());
+                        }
+                        if full_row_values[2].is_null() {
+                            let offset_val = match &full_row_values[0] {
+                                Value::BigInt(v) => *v,
+                                _ => r_id as i64,
+                            };
+                            let uid = uuid::Uuid::new_v4().to_string();
+                            full_row_values[2] = Value::String(format!("ID:h2-mq-{}-{}", offset_val, &uid[..8]));
+                        }
+                        allocated_row_id = Some(r_id);
+                    }
+
                     let row = Row::new(full_row_values);
+
 
                     // 外部キー制約の検証
                     self.validate_foreign_keys_for_row(tx, &table_def, &row)?;
@@ -1302,7 +1533,11 @@ fn apply_join(
                     }
 
                     // 競合なし: 通常挿入
-                    let row_id = self.catalog.allocate_row_id(&table_name)?;
+                    let row_id = if let Some(r_id) = allocated_row_id {
+                        r_id
+                    } else {
+                        self.catalog.allocate_row_id(&table_name)?
+                    };
                     for idx in &indexes {
                         if let Some(vals) = get_index_values(&table_def, idx, &row) {
                             let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), idx.name.to_lowercase());
@@ -1314,6 +1549,10 @@ fn apply_join(
                     tx.put(&map_name, row_id.to_le_bytes().to_vec(), row.to_bytes()?)?;
                     affected_rows += 1;
                     returning_rows.push(row);
+                }
+
+                if table_def.is_queue && (table_def.retention_duration_ms.is_some() || table_def.max_bytes.is_some()) {
+                    let _ = self.purge_queue_retention(tx, &table_name);
                 }
 
                 if let Some(ref returning) = insert.returning {
@@ -1342,6 +1581,14 @@ fn apply_join(
                 let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
                     H2Error::Catalog(format!("Table '{}' not found", table_name))
                 })?;
+
+                if table_def.is_queue {
+                    return Err(H2Error::Unsupported(format!(
+                        "DELETE is not allowed on Queue Table '{}'",
+                        table_name
+                    )));
+                }
+
 
                 let using_data: Option<(RowContext, Vec<Row>)> = if let Some(ref using_tables) = delete.using {
                     if !using_tables.is_empty() {
@@ -1473,6 +1720,14 @@ fn apply_join(
                 let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
                     H2Error::Catalog(format!("Table '{}' not found", table_name))
                 })?;
+
+                if table_def.is_queue {
+                    return Err(H2Error::Unsupported(format!(
+                        "UPDATE is not allowed on Queue Table '{}'",
+                        table_name
+                    )));
+                }
+
 
                 let from_data: Option<(RowContext, Vec<Row>)> = if let Some(ref from_twj) = from {
                     Some(self.evaluate_table_with_joins(tx, from_twj, &HashMap::new())?)
@@ -1962,6 +2217,14 @@ fn apply_join(
                     let mut table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
                         H2Error::Catalog(format!("Table '{}' not found", table_name))
                     })?;
+
+                    if table_def.is_queue {
+                        return Err(H2Error::Unsupported(format!(
+                            "TRUNCATE is not allowed on Queue Table '{}'",
+                            table_name
+                        )));
+                    }
+
 
                     let referencing = self.catalog.get_tables_referencing(&table_name);
                     for (child_def, fk) in referencing {
@@ -3395,6 +3658,13 @@ fn apply_join(
                                     H2Error::Catalog(format!("Table '{}' not found", base_table_name))
                                 })?;
 
+                                if table_def.is_queue {
+                                    if let Some(selection) = &select.selection {
+                                        validate_queue_where_clause(selection)?;
+                                    }
+                                }
+
+
                                 let map_name = table_def.map_name();
 
                                 // IndexScan の最適化
@@ -4400,6 +4670,153 @@ fn parse_csv_line(line: &str, delimiter: char) -> Vec<String> {
     fields.push(current);
     fields
 }
+
+fn parse_duration_to_ms(s: &str) -> H2Result<u64> {
+    let s = s.trim().trim_matches('\'').trim_matches('"').trim();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(H2Error::Execution("Empty RETENTION_TIME".to_string()));
+    }
+    let (num_str, unit_str) = if parts.len() == 1 {
+        let val = parts[0];
+        let num_end = val.find(|c: char| !c.is_numeric() && c != '.').unwrap_or(val.len());
+        (&val[..num_end], &val[num_end..])
+    } else {
+        (parts[0], parts[1])
+    };
+
+    let num: f64 = num_str.parse().map_err(|_| {
+        H2Error::Execution(format!("Invalid number in RETENTION_TIME: '{}'", num_str))
+    })?;
+
+    let unit = unit_str.to_ascii_uppercase();
+    let multiplier = match unit.as_str() {
+        "" | "MS" | "MILLIS" | "MILLISECOND" | "MILLISECONDS" => 1.0,
+        "S" | "SEC" | "SECS" | "SECOND" | "SECONDS" => 1000.0,
+        "M" | "MIN" | "MINS" | "MINUTE" | "MINUTES" => 60_000.0,
+        "H" | "HR" | "HRS" | "HOUR" | "HOURS" => 3_600_000.0,
+        "D" | "DAY" | "DAYS" => 86_400_000.0,
+        _ => return Err(H2Error::Execution(format!("Unknown time unit in RETENTION_TIME: '{}'", unit_str))),
+    };
+
+    Ok((num * multiplier) as u64)
+}
+
+fn parse_bytes_to_u64(s: &str) -> H2Result<u64> {
+    let s = s.trim().trim_matches('\'').trim_matches('"').trim();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.is_empty() {
+        return Err(H2Error::Execution("Empty MAX_BYTES".to_string()));
+    }
+    let (num_str, unit_str) = if parts.len() == 1 {
+        let val = parts[0];
+        let num_end = val.find(|c: char| !c.is_numeric() && c != '.').unwrap_or(val.len());
+        (&val[..num_end], &val[num_end..])
+    } else {
+        (parts[0], parts[1])
+    };
+
+    let num: f64 = num_str.parse().map_err(|_| {
+        H2Error::Execution(format!("Invalid number in MAX_BYTES: '{}'", num_str))
+    })?;
+
+    let unit = unit_str.to_ascii_uppercase();
+    let multiplier: f64 = match unit.as_str() {
+        "" | "B" | "BYTE" | "BYTES" => 1.0,
+        "K" | "KB" | "KIB" => 1024.0,
+        "M" | "MB" | "MIB" => 1024.0 * 1024.0,
+        "G" | "GB" | "GIB" => 1024.0 * 1024.0 * 1024.0,
+        "T" | "TB" | "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(H2Error::Execution(format!("Unknown bytes unit in MAX_BYTES: '{}'", unit_str))),
+    };
+
+    Ok((num * multiplier) as u64)
+}
+
+fn parse_queue_with_clause(sql: &str) -> H2Result<(String, Option<u64>, Option<u64>)> {
+    let upper = sql.to_uppercase();
+    if let Some(pos) = upper.rfind("WITH") {
+        let before = sql[..pos].trim();
+        let after = sql[pos + 4..].trim();
+        if after.starts_with('(') && after.ends_with(')') {
+            let inner = after[1..after.len() - 1].trim();
+            let mut retention_ms = None;
+            let mut max_bytes = None;
+
+            for item in inner.split(',') {
+                let kv: Vec<&str> = item.splitn(2, '=').collect();
+                if kv.len() == 2 {
+                    let key = kv[0].trim().to_ascii_uppercase();
+                    let val = kv[1].trim();
+                    if key == "RETENTION_TIME" {
+                        retention_ms = Some(parse_duration_to_ms(val)?);
+                    } else if key == "MAX_BYTES" {
+                        max_bytes = Some(parse_bytes_to_u64(val)?);
+                    }
+                }
+            }
+            return Ok((before.to_string(), retention_ms, max_bytes));
+        }
+    }
+    Ok((sql.to_string(), None, None))
+}
+
+fn validate_queue_where_clause(expr: &sqlparser::ast::Expr) -> H2Result<()> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(ident) => {
+            if !ident.value.eq_ignore_ascii_case("_offset") {
+                return Err(H2Error::Unsupported(
+                    "Only '_offset' column is allowed in WHERE clause on Queue Table".to_string(),
+                ));
+            }
+        }
+        sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+            if let Some(col) = idents.last() {
+                if !col.value.eq_ignore_ascii_case("_offset") {
+                    return Err(H2Error::Unsupported(
+                        "Only '_offset' column is allowed in WHERE clause on Queue Table".to_string(),
+                    ));
+                }
+            }
+        }
+        sqlparser::ast::Expr::BinaryOp { left, right, .. } => {
+            validate_queue_where_clause(left)?;
+            validate_queue_where_clause(right)?;
+        }
+        sqlparser::ast::Expr::UnaryOp { expr, .. } => {
+            validate_queue_where_clause(expr)?;
+        }
+        sqlparser::ast::Expr::Between { expr, low, high, .. } => {
+            validate_queue_where_clause(expr)?;
+            validate_queue_where_clause(low)?;
+            validate_queue_where_clause(high)?;
+        }
+        sqlparser::ast::Expr::Nested(e) => {
+            validate_queue_where_clause(e)?;
+        }
+        sqlparser::ast::Expr::InList { expr, list, .. } => {
+            validate_queue_where_clause(expr)?;
+            for item in list {
+                validate_queue_where_clause(item)?;
+            }
+        }
+        sqlparser::ast::Expr::IsNull(e) | sqlparser::ast::Expr::IsNotNull(e) => {
+            validate_queue_where_clause(e)?;
+        }
+        sqlparser::ast::Expr::Like { expr, pattern, .. }
+        | sqlparser::ast::Expr::ILike { expr, pattern, .. } => {
+            validate_queue_where_clause(expr)?;
+            validate_queue_where_clause(pattern)?;
+        }
+        sqlparser::ast::Expr::Cast { expr, .. } => {
+            validate_queue_where_clause(expr)?;
+        }
+        sqlparser::ast::Expr::Value(_) | sqlparser::ast::Expr::TypedString { .. } => {}
+        _ => {}
+    }
+    Ok(())
+}
+
 
 
 

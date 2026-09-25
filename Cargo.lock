@@ -324,6 +324,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]

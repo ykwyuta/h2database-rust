@@ -115,6 +115,12 @@ pub struct TableDef {
     pub primary_key: Vec<String>,
     #[serde(default)]
     pub unique_constraints: Vec<UniqueConstraintDef>,
+    #[serde(default)]
+    pub is_queue: bool,
+    #[serde(default)]
+    pub retention_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<u64>,
 }
 
 impl TableDef {
@@ -137,6 +143,49 @@ impl TableDef {
             foreign_keys: Vec::new(),
             primary_key: pk_cols,
             unique_constraints: Vec::new(),
+            is_queue: false,
+            retention_duration_ms: None,
+            max_bytes: None,
+        }
+    }
+
+    pub fn new_queue(
+        name: impl Into<String>,
+        user_columns: Vec<ColumnDef>,
+        retention_duration_ms: Option<u64>,
+        max_bytes: Option<u64>,
+    ) -> Self {
+        // システム擬似列: _offset, _timestamp, _msg_id, _correlation_id
+        let mut columns = vec![
+            ColumnDef::new("_offset", DataType::BigInt, false, true),
+            ColumnDef::new("_timestamp", DataType::TimestampTz, false, false),
+            ColumnDef::new("_msg_id", DataType::VarChar(None), true, false),
+            ColumnDef::new("_correlation_id", DataType::VarChar(None), true, false),
+        ];
+
+        for (idx, col) in columns.iter_mut().enumerate() {
+            col.physical_index = Some(idx);
+        }
+
+        let base_idx = columns.len();
+        for (idx, mut col) in user_columns.into_iter().enumerate() {
+            if !col.name.starts_with('_') {
+                col.physical_index = Some(base_idx + idx);
+                columns.push(col);
+            }
+        }
+
+        Self {
+            name: name.into(),
+            schema: default_schema(),
+            columns,
+            next_row_id: 1,
+            foreign_keys: Vec::new(),
+            primary_key: vec!["_offset".to_string()],
+            unique_constraints: Vec::new(),
+            is_queue: true,
+            retention_duration_ms,
+            max_bytes,
         }
     }
 
@@ -457,6 +506,10 @@ impl Catalog {
             }
         }
         None
+    }
+
+    pub fn is_queue_table(&self, name: &str) -> bool {
+        self.get_table(name).map(|t| t.is_queue).unwrap_or(false)
     }
 
     pub fn all_tables(&self) -> Vec<TableDef> {

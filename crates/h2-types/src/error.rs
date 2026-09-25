@@ -40,6 +40,12 @@ pub enum H2Error {
 
     #[error("Replication error: {0}")]
     Replication(String),
+
+    #[error("Unsupported operation: {0}")]
+    Unsupported(String),
+
+    #[error("Offset out of range: {0}")]
+    OffsetOutOfRange(String),
 }
 
 pub type H2Result<T> = Result<T, H2Error>;

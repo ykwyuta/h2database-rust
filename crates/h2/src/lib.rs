@@ -9,10 +9,14 @@ pub use h2_types::{DataType, FromSql, H2Error, H2Result, Value};
 pub mod replication;
 pub use replication::{Instance, InstanceConfig, InstanceRole, SyncReplicationMode};
 
+pub mod jms;
+pub use jms::*;
+
 #[cfg(feature = "async")]
 pub mod async_conn;
 #[cfg(feature = "async")]
 pub use async_conn::{AsyncConnection, AsyncTransaction};
+
 
 use std::time::Duration;
 
@@ -422,7 +426,16 @@ impl Connection {
         });
         Ok(local_addr)
     }
+
+    pub fn engine(&self) -> &Arc<SQLEngine> {
+        &self.engine
+    }
+
+    pub fn store(&self) -> &Arc<MVStore> {
+        &self.store
+    }
 }
+
 
 /// rusqlite 風の型安全なトランザクションハンドル
 pub struct Transaction {
@@ -531,7 +544,16 @@ impl Transaction {
     pub fn snapshot_version(&self) -> Option<u64> {
         self.inner.as_ref().map(|tx| tx.snapshot_version)
     }
+
+    pub fn inner_tx(&self) -> Option<&h2_mvstore::Transaction> {
+        self.inner.as_ref()
+    }
+
+    pub fn engine(&self) -> &Arc<SQLEngine> {
+        &self.engine
+    }
 }
+
 
 impl Drop for Transaction {
     fn drop(&mut self) {
