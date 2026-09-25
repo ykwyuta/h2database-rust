@@ -5,6 +5,7 @@ use sqlparser::ast::{
 
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use h2_mvstore::{MVStore, Transaction, TransactionStore};
@@ -138,6 +139,7 @@ pub struct SQLEngine {
     catalog: Arc<Catalog>,
     cursors: Arc<parking_lot::RwLock<HashMap<String, CursorState>>>,
     read_only: Arc<std::sync::atomic::AtomicBool>,
+    auth: Arc<crate::auth::AuthManager>,
 }
 
 impl SQLEngine {
@@ -146,13 +148,19 @@ impl SQLEngine {
         let catalog = Arc::new(Catalog::new(Arc::clone(&store))?);
         let cursors = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let read_only = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let auth = Arc::new(crate::auth::AuthManager::new());
         Ok(Self {
             store,
             tx_store,
             catalog,
             cursors,
             read_only,
+            auth,
         })
+    }
+
+    pub fn auth(&self) -> &Arc<crate::auth::AuthManager> {
+        &self.auth
     }
 
     pub fn set_read_only(&self, ro: bool) {
@@ -177,6 +185,11 @@ impl SQLEngine {
 
     /// 暗黙トランザクション（Auto-commit）でSQLを実行
     pub fn execute(&self, sql: &str) -> H2Result<ExecutionResult> {
+        self.execute_with_user(sql, None)
+    }
+
+    /// 暗黙トランザクション（Auto-commit）でユーザー指定でSQLを実行
+    pub fn execute_with_user(&self, sql: &str, user: Option<&str>) -> H2Result<ExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         if trimmed.eq_ignore_ascii_case("VACUUM") {
             self.store.compact()?;
@@ -184,13 +197,22 @@ impl SQLEngine {
         }
 
         let tx = self.tx_store.begin();
-        let result = self.execute_with_tx(&tx, sql)?;
-        tx.commit()?;
-        Ok(result)
+        let result = self.execute_with_user_and_tx(&tx, sql, user);
+        if result.is_ok() {
+            tx.commit()?;
+        } else {
+            let _ = tx.rollback();
+        }
+        result
     }
 
-    /// 明示的トランザクションコンテキストでSQLを実行
+    /// 明示的トランザクションコンテキストでSQLを実行 (デフォルトユーザー)
     pub fn execute_with_tx(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        self.execute_with_user_and_tx(tx, sql, None)
+    }
+
+    /// ユーザー指定および明示的トランザクションコンテキストでSQLを実行
+    pub fn execute_with_user_and_tx(&self, tx: &Transaction, sql: &str, user: Option<&str>) -> H2Result<ExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let trimmed_upper = trimmed.to_uppercase();
 
@@ -199,6 +221,11 @@ impl SQLEngine {
                 || trimmed_upper.starts_with("RESTORE FROM ")
                 || trimmed_upper.starts_with("RUNSCRIPT FROM ")
                 || trimmed_upper.starts_with("ALTER SEQUENCE")
+                || trimmed_upper.starts_with("CREATE USER")
+                || trimmed_upper.starts_with("ALTER USER")
+                || trimmed_upper.starts_with("DROP USER")
+                || trimmed_upper.starts_with("GRANT ")
+                || trimmed_upper.starts_with("REVOKE ")
             {
                 return Err(H2Error::ReadOnly(
                     "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
@@ -209,6 +236,30 @@ impl SQLEngine {
         if trimmed.eq_ignore_ascii_case("VACUUM") {
             self.store.compact()?;
             return Ok(ExecutionResult::Ddl);
+        }
+
+        // ================= DCL コマンド (ユーザー・権限管理) =================
+        if trimmed_upper.starts_with("CREATE USER ") {
+            return self.execute_create_user(trimmed);
+        }
+        if trimmed_upper.starts_with("ALTER USER ") {
+            return self.execute_alter_user(trimmed);
+        }
+        if trimmed_upper.starts_with("DROP USER ") {
+            return self.execute_drop_user(trimmed);
+        }
+        if trimmed_upper.starts_with("GRANT ") {
+            return self.execute_grant(trimmed);
+        }
+        if trimmed_upper.starts_with("REVOKE ") {
+            return self.execute_revoke(trimmed);
+        }
+        if trimmed_upper == "SHOW USERS" {
+            return self.execute_show_users();
+        }
+        if trimmed_upper.starts_with("SHOW GRANTS FOR ") {
+            let u = trimmed["SHOW GRANTS FOR ".len()..].trim().trim_matches('\'').trim_matches('"');
+            return self.execute_show_grants(u);
         }
 
         if trimmed_upper.starts_with("BACKUP TO ") {
@@ -254,6 +305,9 @@ impl SQLEngine {
                 return Err(H2Error::ReadOnly(
                     "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
                 ));
+            }
+            if let Some(username) = user {
+                self.check_statement_privileges(username, &stmt)?;
             }
             last_result = self.execute_statement(tx, stmt)?;
         }
@@ -4032,6 +4086,237 @@ fn apply_join(
             _ => Err(H2Error::Execution("Only SELECT queries or UNION are supported".to_string())),
         }
     }
+
+    // ================= DCL (ユーザー・権限管理) 実装 =================
+
+    fn execute_create_user(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let rest = if upper.starts_with("CREATE USER IF NOT EXISTS ") {
+            &trimmed["CREATE USER IF NOT EXISTS ".len()..]
+        } else if upper.starts_with("CREATE USER ") {
+            &trimmed["CREATE USER ".len()..]
+        } else {
+            return Err(H2Error::SqlParse("Invalid CREATE USER syntax".to_string()));
+        };
+
+        let mut parts = rest.split_whitespace();
+        let username = parts.next().ok_or_else(|| H2Error::SqlParse("Missing username in CREATE USER".to_string()))?
+            .trim_matches('\'').trim_matches('"');
+
+        let mut password = None;
+        let mut host = None;
+        let is_superuser = rest.to_uppercase().contains("SUPERUSER");
+
+        let upper_rest = rest.to_uppercase();
+        if let Some(pos) = upper_rest.find("PASSWORD") {
+            let sub = rest[pos + "PASSWORD".len()..].trim();
+            if let Some(start) = sub.find('\'') {
+                if let Some(end) = sub[start + 1..].find('\'') {
+                    password = Some(&sub[start + 1..start + 1 + end]);
+                }
+            }
+        }
+
+        if let Some(pos) = upper_rest.find("HOST") {
+            let sub = rest[pos + "HOST".len()..].trim();
+            if let Some(start) = sub.find('\'') {
+                if let Some(end) = sub[start + 1..].find('\'') {
+                    host = Some(&sub[start + 1..start + 1 + end]);
+                }
+            }
+        }
+
+        self.auth.create_user(username, password, host, is_superuser)?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_alter_user(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let rest = trimmed["ALTER USER ".len()..].trim();
+        let username = rest.split_whitespace().next().ok_or_else(|| H2Error::SqlParse("Missing username in ALTER USER".to_string()))?
+            .trim_matches('\'').trim_matches('"');
+
+        let mut password = None;
+        let mut host = None;
+        let upper_rest = rest.to_uppercase();
+
+        if let Some(pos) = upper_rest.find("PASSWORD") {
+            let sub = rest[pos + "PASSWORD".len()..].trim();
+            if let Some(start) = sub.find('\'') {
+                if let Some(end) = sub[start + 1..].find('\'') {
+                    password = Some(&sub[start + 1..start + 1 + end]);
+                }
+            }
+        }
+
+        if let Some(pos) = upper_rest.find("HOST") {
+            let sub = rest[pos + "HOST".len()..].trim();
+            if let Some(start) = sub.find('\'') {
+                if let Some(end) = sub[start + 1..].find('\'') {
+                    host = Some(&sub[start + 1..start + 1 + end]);
+                }
+            }
+        }
+
+        self.auth.alter_user(username, password, host)?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_drop_user(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let (username, if_exists) = if upper.starts_with("DROP USER IF EXISTS ") {
+            (&trimmed["DROP USER IF EXISTS ".len()..].trim(), true)
+        } else {
+            (&trimmed["DROP USER ".len()..].trim(), false)
+        };
+        let name = username.trim_matches('\'').trim_matches('"');
+        self.auth.drop_user(name, if_exists)?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_grant(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let on_pos = upper.find(" ON ").ok_or_else(|| H2Error::SqlParse("Missing ON in GRANT statement".to_string()))?;
+        let to_pos = upper.find(" TO ").ok_or_else(|| H2Error::SqlParse("Missing TO in GRANT statement".to_string()))?;
+
+        let privs_str = trimmed["GRANT ".len()..on_pos].trim();
+        let table_raw = trimmed[on_pos + " ON ".len()..to_pos].trim();
+        let table_name = if table_raw.to_uppercase().starts_with("TABLE ") {
+            table_raw["TABLE ".len()..].trim()
+        } else {
+            table_raw
+        }.trim_matches('\'').trim_matches('"');
+
+        let username = trimmed[to_pos + " TO ".len()..].trim().trim_matches('\'').trim_matches('"');
+
+        let mut privileges = Vec::new();
+        for p in privs_str.split(',') {
+            privileges.push(crate::auth::Privilege::from_str(p.trim())?);
+        }
+
+        self.auth.grant(username, table_name, privileges)?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_revoke(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let on_pos = upper.find(" ON ").ok_or_else(|| H2Error::SqlParse("Missing ON in REVOKE statement".to_string()))?;
+        let from_pos = upper.find(" FROM ").ok_or_else(|| H2Error::SqlParse("Missing FROM in REVOKE statement".to_string()))?;
+
+        let privs_str = trimmed["REVOKE ".len()..on_pos].trim();
+        let table_raw = trimmed[on_pos + " ON ".len()..from_pos].trim();
+        let table_name = if table_raw.to_uppercase().starts_with("TABLE ") {
+            table_raw["TABLE ".len()..].trim()
+        } else {
+            table_raw
+        }.trim_matches('\'').trim_matches('"');
+
+        let username = trimmed[from_pos + " FROM ".len()..].trim().trim_matches('\'').trim_matches('"');
+
+        let mut privileges = Vec::new();
+        for p in privs_str.split(',') {
+            privileges.push(crate::auth::Privilege::from_str(p.trim())?);
+        }
+
+        self.auth.revoke(username, table_name, privileges)?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_show_users(&self) -> H2Result<ExecutionResult> {
+        let users = self.auth.list_users();
+        let columns = vec!["username".to_string(), "allowed_hosts".to_string(), "is_superuser".to_string()];
+        let mut rows = Vec::new();
+        for u in users {
+            let hosts = u.allowed_hosts.join(", ");
+            let superuser_str = if u.is_superuser { "true" } else { "false" };
+            rows.push(crate::row::Row::new(vec![
+                Value::String(u.username),
+                Value::String(hosts),
+                Value::String(superuser_str.to_string()),
+            ]));
+        }
+        Ok(ExecutionResult::Query { columns, rows })
+    }
+
+    fn execute_show_grants(&self, user: &str) -> H2Result<ExecutionResult> {
+        let grants = self.auth.get_user_grants(user)?;
+        let columns = vec!["table_name".to_string(), "privileges".to_string()];
+        let mut rows = Vec::new();
+        for (tbl, privs) in grants {
+            let priv_str = privs.iter().map(|p: &crate::auth::Privilege| p.to_string()).collect::<Vec<_>>().join(", ");
+            rows.push(crate::row::Row::new(vec![
+                Value::String(tbl),
+                Value::String(priv_str),
+            ]));
+        }
+        Ok(ExecutionResult::Query { columns, rows })
+    }
+
+    fn check_statement_privileges(&self, user: &str, stmt: &Statement) -> H2Result<()> {
+        if !self.auth.is_auth_enabled() {
+            return Ok(());
+        }
+
+        let users = self.auth.list_users();
+        if let Some(u) = users.into_iter().find(|u| u.username.eq_ignore_ascii_case(user)) {
+            if u.is_superuser {
+                return Ok(());
+            }
+        }
+
+        match stmt {
+            Statement::Query(query) => {
+                let tables = extract_tables_from_query(query);
+                for t in tables {
+                    self.auth.check_privilege(user, &t, crate::auth::Privilege::Select)?;
+                }
+            }
+            Statement::Insert(insert) => {
+                let t = insert.table_name.to_string();
+                self.auth.check_privilege(user, &t, crate::auth::Privilege::Insert)?;
+                if let Some(ref src) = insert.source {
+                    let select_tables = extract_tables_from_query(src);
+                    for st in select_tables {
+                        self.auth.check_privilege(user, &st, crate::auth::Privilege::Select)?;
+                    }
+                }
+            }
+            Statement::Update { table, .. } => {
+                let t = match &table.relation {
+                    TableFactor::Table { name, .. } => name.to_string(),
+                    _ => table.relation.to_string(),
+                };
+                self.auth.check_privilege(user, &t, crate::auth::Privilege::Update)?;
+            }
+            Statement::Delete(delete) => {
+                let from_table = match &delete.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables) => tables.first(),
+                    sqlparser::ast::FromTable::WithoutKeyword(tables) => tables.first(),
+                };
+                if let Some(from_tbl) = from_table {
+                    let t = match &from_tbl.relation {
+                        TableFactor::Table { name, .. } => name.to_string(),
+                        _ => from_tbl.relation.to_string(),
+                    };
+                    self.auth.check_privilege(user, &t, crate::auth::Privilege::Delete)?;
+                }
+            }
+            Statement::CreateTable { .. }
+            | Statement::AlterTable { .. }
+            | Statement::Drop { .. }
+            | Statement::Truncate { .. } => {
+                return Err(H2Error::PermissionDenied(format!(
+                    "Permission denied: User '{}' does not have administrative privileges for DDL", user
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 fn has_aggregate_func(expr: &Expr) -> bool {
@@ -4608,6 +4893,8 @@ fn compute_window_functions(
     Ok(results)
 }
 
+
+
 fn extract_file_path(param: &str) -> String {
     let p = param.trim().trim_end_matches(';').trim();
     p.trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string()
@@ -4833,6 +5120,28 @@ fn validate_queue_where_clause(expr: &sqlparser::ast::Expr) -> H2Result<()> {
     Ok(())
 }
 
+fn extract_tables_from_query(query: &sqlparser::ast::Query) -> Vec<String> {
+    let mut tables = Vec::new();
+    if let sqlparser::ast::SetExpr::Select(ref select) = *query.body {
+        for from_item in &select.from {
+            extract_tables_from_table_factor(&from_item.relation, &mut tables);
+            for join in &from_item.joins {
+                extract_tables_from_table_factor(&join.relation, &mut tables);
+            }
+        }
+    }
+    tables
+}
 
-
-
+fn extract_tables_from_table_factor(tf: &sqlparser::ast::TableFactor, tables: &mut Vec<String>) {
+    match tf {
+        sqlparser::ast::TableFactor::Table { name, .. } => {
+            let t = name.0.last().map(|i| i.value.clone()).unwrap_or_else(|| name.to_string());
+            tables.push(t);
+        }
+        sqlparser::ast::TableFactor::Derived { subquery, .. } => {
+            tables.extend(extract_tables_from_query(subquery));
+        }
+        _ => {}
+    }
+}

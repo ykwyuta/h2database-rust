@@ -46,6 +46,12 @@ pub enum H2Error {
 
     #[error("Offset out of range: {0}")]
     OffsetOutOfRange(String),
+
+    #[error("Authentication error: {0}")]
+    Authentication(String),
+
+    #[error("Permission denied: {0}")]
+    PermissionDenied(String),
 }
 
 pub type H2Result<T> = Result<T, H2Error>;

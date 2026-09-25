@@ -104,6 +104,15 @@ impl PgMessageBuilder {
         buf
     }
 
+    /// AuthenticationCleartextPassword ('R' with code 3)
+    pub fn authentication_cleartext_password() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(9);
+        buf.push(b'R');
+        buf.extend_from_slice(&8u32.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes()); // 3 = CleartextPassword
+        buf
+    }
+
     /// ParameterStatus ('S')
     pub fn parameter_status(key: &str, value: &str) -> Vec<u8> {
         let key_bytes = key.as_bytes();

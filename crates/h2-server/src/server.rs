@@ -31,7 +31,7 @@ impl PgServer {
             let engine = Arc::clone(&self.engine);
 
             tokio::spawn(async move {
-                if let Err(e) = handle_client(socket, engine).await {
+                if let Err(e) = handle_client(socket, client_addr, engine).await {
                     error!("Error handling client {}: {:?}", client_addr, e);
                 }
             });
@@ -39,7 +39,7 @@ impl PgServer {
     }
 }
 
-async fn handle_client(mut stream: TcpStream, engine: Arc<SQLEngine>) -> H2Result<()> {
+async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: Arc<SQLEngine>) -> H2Result<()> {
     // 1. ハンドシェイク (SSLRequest & StartupMessage)
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf).await?;
@@ -62,9 +62,70 @@ async fn handle_client(mut stream: TcpStream, engine: Arc<SQLEngine>) -> H2Resul
     }
 
     // 残りの StartupMessage パラメータを読み取り
+    let mut startup_params = std::collections::HashMap::new();
     if msg_len > 8 {
         let mut rest_buf = vec![0u8; msg_len - 8];
         stream.read_exact(&mut rest_buf).await?;
+        let mut offset = 0;
+        while offset < rest_buf.len() {
+            let mut end = offset;
+            while end < rest_buf.len() && rest_buf[end] != 0 {
+                end += 1;
+            }
+            if end >= rest_buf.len() {
+                break;
+            }
+            let key = String::from_utf8_lossy(&rest_buf[offset..end]).to_string();
+            offset = end + 1;
+            if key.is_empty() {
+                break;
+            }
+            let mut val_end = offset;
+            while val_end < rest_buf.len() && rest_buf[val_end] != 0 {
+                val_end += 1;
+            }
+            if val_end >= rest_buf.len() {
+                break;
+            }
+            let val = String::from_utf8_lossy(&rest_buf[offset..val_end]).to_string();
+            offset = val_end + 1;
+            startup_params.insert(key, val);
+        }
+    }
+
+    let username = startup_params.get("user").cloned().unwrap_or_else(|| "postgres".to_string());
+    let client_ip = client_addr.ip().to_string();
+
+    // ユーザー情報確認 & 認証フロー
+    let user_info = engine.auth().list_users().into_iter().find(|u| u.username.eq_ignore_ascii_case(&username));
+    let has_password = user_info.as_ref().and_then(|u| u.password.as_ref()).is_some();
+
+    let authenticated_password = if has_password {
+        stream.write_all(&PgMessageBuilder::authentication_cleartext_password()).await?;
+        stream.flush().await?;
+
+        let mut p_type = [0u8; 1];
+        stream.read_exact(&mut p_type).await?;
+        if p_type[0] != b'p' {
+            stream.write_all(&PgMessageBuilder::error_response("Password authentication expected")).await?;
+            stream.flush().await?;
+            return Err(H2Error::Authentication("Password expected".to_string()));
+        }
+        let mut p_len_buf = [0u8; 4];
+        stream.read_exact(&mut p_len_buf).await?;
+        let p_len = (u32::from_be_bytes(p_len_buf) as usize).saturating_sub(4);
+        let mut p_buf = vec![0u8; p_len];
+        stream.read_exact(&mut p_buf).await?;
+        let pwd = String::from_utf8_lossy(&p_buf).trim_matches('\0').to_string();
+        Some(pwd)
+    } else {
+        None
+    };
+
+    if let Err(e) = engine.auth().authenticate(&username, authenticated_password.as_deref(), &client_ip) {
+        stream.write_all(&PgMessageBuilder::error_response(&e.to_string())).await?;
+        stream.flush().await?;
+        return Err(e);
     }
 
     // 認証成功と初期パラメータ、ReadyForQuery を送信
@@ -156,13 +217,21 @@ async fn handle_client(mut stream: TcpStream, engine: Arc<SQLEngine>) -> H2Resul
                     let eng = Arc::clone(&engine);
                     let sql_owned = trimmed.to_string();
                     let current_tx = active_tx.take();
+                    let user_for_exec = username.clone();
 
                     let (exec_result, returned_tx): (H2Result<ExecutionResult>, Option<h2_mvstore::Transaction>) =
                         tokio::task::spawn_blocking(move || {
                             let r = if let Some(ref tx) = current_tx {
-                                eng.execute_with_tx(tx, &sql_owned)
+                                eng.execute_with_user_and_tx(tx, &sql_owned, Some(&user_for_exec))
                             } else {
-                                eng.execute(&sql_owned)
+                                let dummy_tx = eng.tx_store().begin();
+                                let res = eng.execute_with_user_and_tx(&dummy_tx, &sql_owned, Some(&user_for_exec));
+                                if res.is_ok() {
+                                    let _ = dummy_tx.commit();
+                                } else {
+                                    let _ = dummy_tx.rollback();
+                                }
+                                res
                             };
                             (r, current_tx)
                         }).await.map_err(|e| H2Error::Execution(e.to_string()))?;

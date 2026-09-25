@@ -33,6 +33,7 @@ pub struct Connection {
     engine: Arc<SQLEngine>,
     current_tx: Arc<parking_lot::Mutex<Option<h2_mvstore::Transaction>>>,
     default_query_timeout: Arc<parking_lot::RwLock<Option<Duration>>>,
+    current_user: Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -215,6 +216,7 @@ impl Connection {
             engine,
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
             default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
+            current_user: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -227,6 +229,7 @@ impl Connection {
             engine,
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
             default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
+            current_user: Arc::new(parking_lot::RwLock::new(None)),
         })
     }
 
@@ -237,7 +240,30 @@ impl Connection {
             engine,
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
             default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
+            current_user: Arc::new(parking_lot::RwLock::new(None)),
         }
+    }
+
+    /// 認証マネージャへの参照を取得
+    pub fn auth(&self) -> &Arc<h2_sql::AuthManager> {
+        self.engine.auth()
+    }
+
+    /// 現在のセッションのユーザー名を設定（None で認証チェックをスキップ/スーパーユーザー扱い）
+    pub fn set_current_user(&self, username: Option<&str>) {
+        *self.current_user.write() = username.map(|s| s.to_string());
+    }
+
+    /// 現在のセッションのユーザー名を取得
+    pub fn current_user(&self) -> Option<String> {
+        self.current_user.read().clone()
+    }
+
+    /// ユーザー名、パスワード、クライアントIPで認証を行い、成功時にセッションのユーザーとして設定
+    pub fn authenticate(&self, username: &str, password: Option<&str>, client_ip: &str) -> H2Result<()> {
+        self.engine.auth().authenticate(username, password, client_ip)?;
+        self.set_current_user(Some(username));
+        Ok(())
     }
 
     /// インスタンスが Read-Only かどうかを確認
@@ -252,6 +278,7 @@ impl Connection {
             engine: Arc::clone(&self.engine),
             current_tx: Arc::new(parking_lot::Mutex::new(None)),
             default_query_timeout: Arc::new(parking_lot::RwLock::new(*self.default_query_timeout.read())),
+            current_user: Arc::new(parking_lot::RwLock::new((*self.current_user.read()).clone())),
         }
     }
 
@@ -328,10 +355,12 @@ impl Connection {
             }
             TxCommand::Other => {
                 let guard = self.current_tx.lock();
+                let user_guard = self.current_user.read();
+                let user_ref = user_guard.as_deref();
                 let res = if let Some(ref tx) = *guard {
-                    self.engine.execute_with_tx(tx, sql)?
+                    self.engine.execute_with_user_and_tx(tx, sql, user_ref)?
                 } else {
-                    self.engine.execute(sql)?
+                    self.engine.execute_with_user(sql, user_ref)?
                 };
                 match res {
                     ExecutionResult::Ddl => Ok(0),
@@ -367,10 +396,12 @@ impl Connection {
     pub fn query(&self, sql: &str) -> H2Result<Vec<Row>> {
         let _guard = self.setup_timeout_guard();
         let guard = self.current_tx.lock();
+        let user_guard = self.current_user.read();
+        let user_ref = user_guard.as_deref();
         let res = if let Some(ref tx) = *guard {
-            self.engine.execute_with_tx(tx, sql)?
+            self.engine.execute_with_user_and_tx(tx, sql, user_ref)?
         } else {
-            self.engine.execute(sql)?
+            self.engine.execute_with_user(sql, user_ref)?
         };
         match res {
             ExecutionResult::Query { rows, .. } => Ok(rows),
@@ -420,10 +451,12 @@ impl Connection {
             }
             TxCommand::Other => {
                 let guard = self.current_tx.lock();
+                let user_guard = self.current_user.read();
+                let user_ref = user_guard.as_deref();
                 if let Some(ref tx) = *guard {
-                    self.engine.execute_with_tx(tx, sql)
+                    self.engine.execute_with_user_and_tx(tx, sql, user_ref)
                 } else {
-                    self.engine.execute(sql)
+                    self.engine.execute_with_user(sql, user_ref)
                 }
             }
         }

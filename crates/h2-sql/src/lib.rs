@@ -1,9 +1,12 @@
+pub mod auth;
 pub mod catalog;
 pub mod executor;
 pub mod expression;
 pub mod fts;
 pub mod parser;
 pub mod row;
+
+pub use auth::{AuthManager, Privilege, UserInfo};
 
 
 
