@@ -28,6 +28,7 @@ pub enum DataType {
     Uuid,
     Json,
     Array(Box<DataType>),
+    Interval,
 }
 
 impl std::fmt::Display for DataType {
@@ -54,6 +55,7 @@ impl std::fmt::Display for DataType {
             DataType::Uuid => write!(f, "UUID"),
             DataType::Json => write!(f, "JSON"),
             DataType::Array(inner) => write!(f, "{}[]", inner),
+            DataType::Interval => write!(f, "INTERVAL"),
         }
     }
 }

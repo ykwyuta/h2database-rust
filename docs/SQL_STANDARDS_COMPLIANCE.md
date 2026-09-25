@@ -10,12 +10,13 @@
 
 | 分野 | 主な標準規格 | 実装完了 (Supported) | 未実装 / 制限事項 (Unsupported / Limitations) |
 | :--- | :--- | :--- | :--- |
-| **データ型** | SQL-92 / SQL:1999 / SQL:2016 | 真偽値, 整数各種, 浮動小数, 高精度数値(Decimal), 文字列(Varchar/Text), バイナリ, 日付時刻(Date/Time/Timestamp), **TIMESTAMPTZ (タイムゾーン保持型)**, UUID, JSON/JSONB, 配列 | `INTERVAL`, `ENUM`, 複合型/ユーザー定義型(UDT), 空間型 |
-| **DDL (定義)** | SQL-92 / SQL:2008 | `CREATE TABLE` (PK, Not Null, **Foreign Key/参照整合性**), `DROP TABLE`, **`ALTER TABLE` (Instant Add Col, Instant Drop Col, Online Rename Table)**, **`TRUNCATE TABLE` (Online Truncate)**, **`CREATE INDEX CONCURRENTLY` (Online Index)**, `DROP INDEX`, **`CREATE/DROP VIEW` (仮想ビュー)**, **`VACUUM` (Concurrent Vacuum)** | `CHECK` 制約, 複合主キー制約, `CREATE SCHEMA` |
-| **DML (操作)** | SQL-92 / SQL:2003 | 単行/複数行 `INSERT`, **`INSERT INTO ... SELECT`**, `UPDATE` (複数列代入・自己参照式・FK検証), `DELETE` (連動削除 CASCADE/SET NULL/RESTRICT) | `UPSERT` (`ON CONFLICT DO UPDATE`), `RETURNING` 句 |
-| **DQL (検索)** | SQL-92 / SQL:1999 / SQL:2003 | FROM なし `SELECT`, 列射影・エイリアス, **共通テーブル式 (`WITH` / CTE)**, `WHERE`, `IN`, `BETWEEN`, `CASE WHEN`, `JOIN` (Inner, Left Outer, View/Chained Join), `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, **集合演算 (`UNION`, `INTERSECT`, `EXCEPT` / ALL)**, **ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `DENSE_RANK`)**, サブクエリ (Derived Table, IN, EXISTS, スカラ) | 再帰 CTE (`WITH RECURSIVE`), `RIGHT/FULL OUTER JOIN`, `CROSS JOIN` |
+| **データ型** | SQL-92 / SQL:1999 / SQL:2016 | 真偽値, 整数各種, 浮動小数, 高精度数値(Decimal), 文字列(Varchar/Text), バイナリ, 日付時刻(Date/Time/Timestamp), **TIMESTAMPTZ (タイムゾーン保持型)**, **時間間隔型 (`INTERVAL`)**, **明示的シリアル型 (`SERIAL`, `BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY`)**, UUID, JSON/JSONB, 配列 | `ENUM`, 複合型/ユーザー定義型(UDT), 空間型 |
+| **DDL (定義)** | SQL-92 / SQL:2008 | `CREATE TABLE` (PK, Not Null, **Foreign Key/参照整合性**, **複合主キー・一意制約**), `DROP TABLE`, **`ALTER TABLE` (Instant Add Col, Instant Drop Col, Online Rename Table)**, **`TRUNCATE TABLE` (Online Truncate)**, **`CREATE INDEX CONCURRENTLY` (Online Index)**, `DROP INDEX`, **`CREATE/DROP VIEW` (仮想ビュー)**, **スキーマ管理 (`CREATE/DROP SCHEMA`)**, **シーケンス管理 (`CREATE/ALTER/DROP SEQUENCE`)**, **`VACUUM` (Concurrent Vacuum)** | `CHECK` 制約, 列型変更(`ALTER COLUMN TYPE`) |
+| **DML (操作)** | SQL-92 / SQL:2003 | 単行/複数行 `INSERT`, **`INSERT INTO ... SELECT`**, `UPDATE` (複数列代入・自己参照式・FK検証), `DELETE` (連動削除 CASCADE/SET NULL/RESTRICT), **条件付き挿入・更新 (`UPSERT` / `MERGE`)**, **DML 戻り値句 (`RETURNING`)**, **結合を伴う更新・削除 (`UPDATE ... FROM`, `DELETE ... USING`)** | なし（主要DML構文完備） |
+| **DQL (検索)** | SQL-92 / SQL:1999 / SQL:2003 | FROM なし `SELECT`, 列射影・エイリアス, **共通テーブル式 (`WITH` / CTE)**, **再帰 CTE (`WITH RECURSIVE`)**, `WHERE`, `IN`, `BETWEEN`, `CASE WHEN`, **行値式タプル比較 (`(a, b) = (1, 2)`, `IN`)**, **全種結合 (`INNER`, `LEFT`, `RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`)**, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT/OFFSET`, `DISTINCT`, **集合演算 (`UNION`, `INTERSECT`, `EXCEPT` / ALL)**, **全種ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `DENSE_RANK`, `LEAD`, `LAG`, `FIRST_VALUE`, `LAST_VALUE`, `NTILE`)**, サブクエリ (Derived Table, IN, EXISTS, スカラ) | `GROUP BY ROLLUP/CUBE` |
 | **TCL (トランザクション)** | SQL-92 | `BEGIN`, `COMMIT`, `ROLLBACK`, MVCC スナップショット分離, 自動 Undo Log 復元, **デッドロック検出・自動キャンセル (Victim Rollback)**, **クエリ単位実行タイムアウト (`SET statement_timeout`)** | **`SAVEPOINT` (設計方針として実装対象外)**, 動的分離レベル変更 (`SET TRANSACTION ISOLATION LEVEL`) |
-| **関数・演算子** | SQL-92 / 拡張 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COALESCE`, `UPPER`, `LOWER`, `CONCAT`, `LENGTH`, `ABS`, `NOW`, JSON 演算子 (`->`, `->>`), 日本語全文検索 (`FT_SEARCH`) | 三角関数/指数関数, 正規表現関数 (`REGEXP`), 日付間隔演算 (`DATE_ADD`) |
+| **関数・演算子** | SQL-92 / 拡張 | **高度な数学関数 (SIN, COS, TAN, LN, LOG, EXP, SQRT, POWER, ROUND, CEIL, FLOOR, TRUNC, MOD, PI等)**, **高度な文字列関数 (SUBSTR, TRIM, REPLACE, LPAD, RPAD, INITCAP, REVERSE, TRANSLATE, SPLIT_PART, `||`等)**, **正規表現演算 (`~`, `~*`, `!~`, `!~*`, `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`)**, **日付計算関数 (`DATE_ADD`, `DATE_SUB`, `DATEDIFF`, `DATE_PART`, `DATE_TRUNC`, `AGE`, `EXTRACT`)**, **シーケンス関数 (`NEXTVAL`, `CURRVAL`, `SETVAL`, Oracle記法)**, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COALESCE`, JSON 演算子 (`->`, `->>`), 日本語全文検索 (`FT_SEARCH`) | ユーザー定義関数(UDF) |
+| **データ管理・保守・カーソル** | SQL-92 / SQL:2003 / 拡張 | **バックアップ・リストア (`BACKUP TO`, `RESTORE FROM`, `SCRIPT TO`, `RUNSCRIPT FROM`)**, **COPY文 (`COPY tbl TO/FROM 'path' [WITH (FORMAT CSV, HEADER, DELIMITER)]`)**, **カーソル (`DECLARE cur CURSOR FOR query`, `FETCH ... FROM cur`, `CLOSE cur`)** | バックグラウンド非同期自動バックアップ |
 | **メタデータ・診断** | SQL-92 / SQL:2008 / MySQL互換 | `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `SHOW TABLES`, `SHOW COLUMNS`, `EXPLAIN` | `INFORMATION_SCHEMA.VIEWS / CONSTRAINTS`, `EXPLAIN ANALYZE` (実測プロファイリング) |
 
 ---
@@ -48,16 +49,21 @@
   - `TIMESTAMP` (日時: `YYYY-MM-DD HH:MM:SS`)
   - **`TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE`**:
     - タイムゾーンオフセット（`+09:00`, `-05:00`, `Z` 等）を保持・解析し、内部で UTC に正規化して正確な比較・格納を実施。
+  - **時間間隔型 (`INTERVAL`) (SQL-92 / SQL:1999)**:
+    - 期間・時間差を年・月・日・秒・ナノ秒単位で厳密に保持。
+    - リテラル記法: `INTERVAL '1 day'`, `INTERVAL '2 hours'`, `INTERVAL '30 minutes'`, `INTERVAL '5 seconds'`, `INTERVAL '1 year 2 months'`
+    - 日付・時刻との加減算: `DATE '2026-01-01' + INTERVAL '10 days'`, `NOW() - INTERVAL '1 hour'`
+    - INTERVAL 同士の加減算: `INTERVAL '1 day' + INTERVAL '12 hours'`
+  - **明示的シリアル型・自動採番 (SQL:2003 / PG互換)**:
+    - `SERIAL`: 32-bit 自動連番整数（内部で専用シーケンスを自動生成しデフォルト値にバインド）
+    - `BIGSERIAL`: 64-bit 自動連番大整数
+    - `GENERATED ALWAYS AS IDENTITY` / `GENERATED BY DEFAULT AS IDENTITY`: 標準 SQL 準拠の自動採番列
 - **最新標準・拡張型**:
   - `UUID` (128-bit RFC 4122 準拠)
   - `JSON`, `JSONB` (バイナリ JSON 構造化データ)
   - `ARRAY` (同種要素のリスト)
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
-- ❌ **時間間隔型 (`INTERVAL`)**:
-  - `INTERVAL '1 day'` などの期間表現型および日付演算構文は未実装。
-- ❌ **明示的シリアル型 (`SERIAL`, `BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY`)**:
-  - 内部的には 64-bit Row ID による自動採番機構が稼働していますが、DDL 構文としての `SERIAL` や明示的な `SEQUENCE` オブジェクト構文（`CREATE SEQUENCE`）は未実装。
 - ❌ **ユーザー定義型・列挙型 (`CREATE TYPE ... AS ENUM`)**:
   - 独自ドメイン型や ENUM 型の定義は未対応（`VARCHAR` + アプリケーション層または `IN` 述語で代替）。
 - ❌ **空間型 (GIS / Spatial)**:
@@ -108,6 +114,13 @@
   - `CREATE SCHEMA [IF NOT EXISTS] schema_name`: スキーマの作成とカタログ永続化
   - `DROP SCHEMA [IF EXISTS] schema_name [CASCADE | RESTRICT]`: スキーマの安全な削除および配下テーブルの一括破棄
   - `schema.table` 形式の修飾テーブル名解決、スキーマごとのテーブル・インデックス分離に対応。
+- **シーケンス管理 (`CREATE SEQUENCE`, `ALTER SEQUENCE`, `DROP SEQUENCE`) (SQL:2003 / PG互換)**:
+  - `CREATE SEQUENCE [IF NOT EXISTS] seq_name [START WITH n] [INCREMENT BY m] [MINVALUE min] [MAXVALUE max] [CYCLE | NO CYCLE]`
+  - `ALTER SEQUENCE seq_name [RESTART [WITH n]] [INCREMENT BY m]`
+  - `DROP SEQUENCE [IF EXISTS] seq_name`
+  - カタログへのアトミック永続化、クラッシュ復旧に対応。
+  - シーケンス評価関数 `NEXTVAL('seq')`, `CURRVAL('seq')`, `SETVAL('seq', n)` および Oracle 互換記法 `seq.NEXTVAL`, `seq.CURRVAL` に対応。
+  - `SERIAL`, `BIGSERIAL`, `GENERATED ALWAYS AS IDENTITY` 列作成時に暗黙シーケンスを自動定義し、`DEFAULT` 式として連動。
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
 - ❌ **CHECK 制約 (`CHECK (expr)`)**:
@@ -274,14 +287,36 @@
 
 ### 実装できている機能 (Supported)
 - **集約関数**: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- **制御関数**: `COALESCE(val1, val2, ...)`
-- **文字列関数**:
-  - `UPPER(str)`: 大文字変換
-  - `LOWER(str)`: 小文字変換
-  - `CONCAT(s1, s2, ...)`: 文字列連結
-  - `LENGTH(str)`, `CHAR_LENGTH(str)`: 文字列の文字数カウント
-- **数学関数**: `ABS(num)` (絶対値)
-- **日時関数**: `NOW()`, `CURRENT_TIMESTAMP` (ISO 8601 / RFC 3339 形式の日時)
+- **制御関数**: `COALESCE(val1, val2, ...)`, `NULLIF(v1, v2)`
+- **高度な数学関数 (SQL:1999 / SQL:2003 / 拡張)**:
+  - 三角関数: `SIN(x)`, `COS(x)`, `TAN(x)`, `ASIN(x)`, `ACOS(x)`, `ATAN(x)`, `ATAN2(y, x)`
+  - 指数・対数・平方根: `LN(x)`, `LOG(x)` (自然対数), `LOG(b, x)`, `LOG10(x)`, `EXP(x)`, `SQRT(x)`, `POWER(x, y)` / `POW(x, y)`
+  - 丸め・切捨て・絶対値・符号・剰余: `ROUND(x [, d])`, `TRUNC(x [, d])` / `TRUNCATE(x, d)`, `CEIL(x)` / `CEILING(x)`, `FLOOR(x)`, `ABS(x)`, `SIGN(x)`, `MOD(x, y)`
+  - 角度・定数: `DEGREES(rad)`, `RADIANS(deg)`, `PI()`
+- **高度な文字列関数 (SQL-92 / SQL:1999 / PG互換)**:
+  - 抽出・トリム: `SUBSTR(s, start [, len])` / `SUBSTRING(s FROM start [FOR len])`, `TRIM(s)`, `LTRIM(s)`, `RTRIM(s)`, `BTRIM(s)`
+  - 変換・充填: `REPLACE(s, from, to)`, `LPAD(s, len [, pad])`, `RPAD(s, len [, pad])`, `INITCAP(s)`, `REVERSE(s)`, `REPEAT(s, count)`
+  - 分割・部分文字列・文字コード: `TRANSLATE(s, from, to)`, `SPLIT_PART(s, delim, n)`, `LEFT(s, n)`, `RIGHT(s, n)`, `CHR(code)`, `ASCII(s)`
+  - 文字列連結: `CONCAT(s1, s2, ...)`, 文字列連結演算子 `||` (`'Hello' || ' ' || 'World'`)
+  - ケース・長さ: `UPPER(s)`, `LOWER(s)`, `LENGTH(s)`, `CHAR_LENGTH(s)`
+- **正規表現演算子・関数 (SQL:2008 / POSIX / PG互換)**:
+  - 正規表現マッチ演算子: `col ~ 'pattern'` (大文字小文字区別あり一致), `col ~* 'pattern'` (区別なし一致)
+  - 正規表現不一致演算子: `col !~ 'pattern'` (区別あり不一致), `col !~* 'pattern'` (区別なし不一致)
+  - `REGEXP_LIKE(s, pattern [, flags])`: パターンマッチ判定（真偽値）
+  - `REGEXP_REPLACE(s, pattern, replacement [, flags])`: パターン置換
+  - `REGEXP_SUBSTR(s, pattern)`: パターン抽出
+- **日付・時刻計算関数 (SQL-92 / SQL:2003 / PG・MySQL互換)**:
+  - 加減算: `DATE_ADD(date, interval)`, `DATE_SUB(date, interval)`, 日付演算子 `date + interval`, `date - interval`
+  - 差分計算: `DATEDIFF(unit, d1, d2)` (`'year'`, `'month'`, `'day'`, `'hour'`, `'minute'`, `'second'`)
+  - フィールド抽出: `EXTRACT(field FROM date)` / `DATE_PART(field, date)` (`YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `DOW`)
+  - 切り捨て: `DATE_TRUNC(unit, date)`
+  - 年齢計算: `AGE(d1, d2)`
+  - 現在時刻: `NOW()`, `CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`
+- **シーケンス操作関数 (SQL:2003 / PG・Oracle互換)**:
+  - `NEXTVAL('seq_name')`: 次の値を採番
+  - `CURRVAL('seq_name')`: カレントセッションでの現在値を取得
+  - `SETVAL('seq_name', n)`: シーケンスの現在値を任意指定
+  - Oracle スタイル擬似列アクセス: `seq_name.NEXTVAL`, `seq_name.CURRVAL`
 - **JSON 処理 (SQL:2016 / PG互換)**:
   - `->` (JSON オブジェクトの抽出・JSON型返却)
   - `->>` (JSON オブジェクトの抽出・文字列返却)
@@ -291,25 +326,58 @@
   - `FT_SEARCH_MORPH(col, '形態素')`: 文字種境界解析による高精度単語走査
 
 ### 実装できていない機能・制限事項 (Unsupported / Limitations)
-- ❌ **高度な数学関数**: `POWER()`, `SQRT()`, `MOD()` (演算子 `%` で代替可能), 三角関数 (`SIN`, `COS`)
-- ❌ **高度な文字列関数**: `SUBSTRING()`, `TRIM()`, `REPLACE()`, `LPAD()`, `RPAD()`
-- ❌ **正規表現演算**: `~` (正規表現マッチ), `REGEXP_LIKE()`
-- ❌ **日付計算関数**: `DATE_ADD()`, `DATE_SUB()`, `EXTRACT(YEAR FROM date)`
+- ❌ **ユーザー定義関数 (UDF / `CREATE FUNCTION`)**:
+  - PL/pgSQL や WebAssembly によるユーザー定義手続き・関数定義は未実装。
 
 ---
 
-## 🚀 8. 今後のロードマップと拡張優先度
+## 🛠️ 8. データ管理・保守・カーソル (Maintenance, Backup, COPY & Cursors)
 
-P1（高優先度）、P2（中優先度）、および P3 の `CREATE VIEW` までの機能群は**すべて実装完了**しました。
+### 実装できている機能 (Supported)
+- **バックアップ・リストア (Physical Storage Backup)**:
+  - `BACKUP TO 'backup.db'`: MVStore のコミット済み全ツリー（全テーブル・インデックス・カタログ）を安全に物理ダンプ。
+  - `RESTORE FROM 'backup.db'`: バックアップファイルからストレージを完全復元し、カタログを自動再ロード。
+- **スクリプト出力・実行 (Logical SQL Dump & Run)**:
+  - `SCRIPT TO 'dump.sql'`: データベース内のスキーマ、シーケンス、テーブルDDL、および全データの INSERT 文を論理 SQL スクリプトとして一括生成。
+  - `RUNSCRIPT FROM 'dump.sql'`: 外部 SQL スクリプトファイルを読み込み、トランザクション内で一括流し込み実行。
+- **データ高速一括入出力 (`COPY` コマンド / PG互換)**:
+  - `COPY tbl TO 'data.csv' WITH (FORMAT CSV, HEADER, DELIMITER ',')`: テーブルの全データを CSV ファイルへエクスポート。
+  - `COPY tbl FROM 'data.csv' WITH (FORMAT CSV, HEADER, DELIMITER ',')`: CSV ファイルから全データをパースし、型推論・キャストして高速バルクインポート。
+  - RFC 4180 準拠の CSV エスケープ（クォート、改行、カンマ含有値）に対応。
+- **カーソル (Cursors: `DECLARE`, `FETCH`, `CLOSE` / SQL:1999, SQL:2003)**:
+  - `DECLARE cur CURSOR FOR SELECT ...`: クエリ結果に対するスクロール可能カーソルの宣言と生成。
+  - `FETCH NEXT FROM cur`: 次の1行を取得
+  - `FETCH PRIOR FROM cur`: 前の1行を取得
+  - `FETCH FIRST FROM cur`: 先頭行を取得
+  - `FETCH LAST FROM cur`: 最終行を取得
+  - `FETCH ABSOLUTE <n> FROM cur`: 1始まりの絶対位置行を取得
+  - `FETCH RELATIVE <n> FROM cur`: 現在位置からの相対移動行を取得
+  - `FETCH ALL FROM cur`: 現在位置から末尾までの全行を一括フェッチ
+  - `FETCH FORWARD <n> FROM cur` / `FETCH BACKWARD <n> FROM cur`: 指定行数の前方/後方フェッチ
+  - `CLOSE cur`: カーソルリソースの解放。
 
-| 状態 | 対象機能 | 開発難易度 | 主な利用用途・効果 |
+---
+
+## 🚀 9. ロードマップと開発実績
+
+SQL 標準規格、PostgreSQL 互換構文、および Java版 H2 Database の主要機能は**すべて実装・統合テスト完了**しました。
+
+| 状態 | 対象機能 | 分野 | 主な利用用途・効果 |
 | :---: | :--- | :---: | :--- |
-| ✅ **完了** | `INSERT INTO ... SELECT ...` | 中 | データ移行、サマリテーブル生成、バッチ処理 |
-| ✅ **完了** | `WITH` 句 (非再帰 CTE) | 中 | 複雑な多段サブクエリの可読性・メンテナンス性向上 |
-| ✅ **完了** | 外部キー制約 (`FOREIGN KEY`) | 高 | 親子テーブル間のリレーショナル整合性保証 (CASCADE/SET NULL/RESTRICT) |
-| ✅ **完了** | ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `DENSE_RANK`) | 高 | ランキング集計、ページ内ナンバリング、タイ順位計算 |
-| ✅ **完了** | `INTERSECT`, `EXCEPT` (DISTINCT / ALL) | 低 | 集合演算の完全性（積集合・差集合） |
-| ✅ **完了** | `TIMESTAMPTZ` (タイムゾーン保持型) | 中 | 国際化対応・タイムゾーン跨ぎの監査ログ |
-| ✅ **完了** | `CREATE VIEW` / `DROP VIEW` (仮想ビュー) | 中 | クエリ共通化・結合ビュー・アクセス集約 |
-| ⛔ **対象外** | `SAVEPOINT` (セーブポイント) | 中 | ※高速MVCCとUndo Log簡潔性維持のため設計上対象外 |
-| **P3 (低)** | 再帰 CTE (`WITH RECURSIVE`) | 高 | 組織階層ツリーやグラフ構造の再帰探索 |
+| ✅ **完了** | `INSERT INTO ... SELECT ...` | DML | データ移行、サマリテーブル生成、バッチ処理 |
+| ✅ **完了** | `WITH` 句 (非再帰 CTE) | DQL | 複雑な多段サブクエリの可読性・メンテナンス性向上 |
+| ✅ **完了** | 外部キー制約 (`FOREIGN KEY`) | DDL | 親子テーブル間のリレーショナル整合性保証 (CASCADE/SET NULL/RESTRICT) |
+| ✅ **完了** | 全種ウィンドウ関数 (`ROW_NUMBER`, `RANK`, `LEAD`, `LAG`, `NTILE` 等) | DQL | ランキング集計、タイ順位計算、前後の行参照 |
+| ✅ **完了** | `INTERSECT`, `EXCEPT` (DISTINCT / ALL) | DQL | 集合演算の完全性（積集合・差集合） |
+| ✅ **完了** | `TIMESTAMPTZ` (タイムゾーン保持型) | 型 | 国際化対応・タイムゾーン跨ぎの監査ログ |
+| ✅ **完了** | `CREATE VIEW` / `DROP VIEW` (仮想ビュー) | DDL | クエリ共通化・結合ビュー・アクセス集約 |
+| ✅ **完了** | 再帰 CTE (`WITH RECURSIVE`) | DQL | 組織階層ツリーやグラフ構造の再帰探索・数列生成 |
+| ✅ **完了** | 複合主キー・一意制約、スキーマ管理 (`CREATE/DROP SCHEMA`) | DDL | 複数列キー、スキーマ分離・マルチテナント |
+| ✅ **完了** | `UPSERT` (`ON CONFLICT`) / `MERGE INTO` | DML | 冪等なデータ同期、重複キー時自動更新 |
+| ✅ **完了** | `RETURNING` 句、結合更新・削除 (`UPDATE FROM`, `DELETE USING`) | DML | 更新直後データ取得、多表連携バッチ更新 |
+| ✅ **完了** | 全種 JOIN (`RIGHT`, `FULL`, `CROSS`, `NATURAL`, `USING`)、行値式 | DQL | 高度なリレーショナル結合、タプル一括比較 |
+| ✅ **完了** | 高度な数学・文字列・正規表現・日付計算関数 | 関数 | 科学計算、テキスト加工、正規表現マッチ、期間演算 |
+| ✅ **完了** | 時間間隔型 (`INTERVAL`) | 型 | 期間リテラル、日付と期間の柔軟な算術 |
+| ✅ **完了** | シーケンス管理 (`SEQUENCE`, `SERIAL`, `IDENTITY`) | DDL/関数 | 自動採番、連番生成、Oracle/PG構文両対応 |
+| ✅ **完了** | バックアップ・リストア、COPY文 (CSV)、カーソル (`CURSOR`) | 保守/DQL | 物理/論理バックアップ、CSV高速入出力、スクロール行フェッチ |
+| ⛔ **対象外** | `SAVEPOINT` (セーブポイント) | TCL | ※高速MVCCとUndo Log簡潔性維持のため設計上対象外 |

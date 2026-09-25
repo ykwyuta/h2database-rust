@@ -57,10 +57,17 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
         }
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Json),
+        SqlDataType::Interval => Ok(DataType::Interval),
         SqlDataType::Custom(name, _) => {
             let type_name = name.to_string().to_uppercase();
             if type_name == "TIMESTAMPTZ" {
                 Ok(DataType::TimestampTz)
+            } else if type_name == "INTERVAL" {
+                Ok(DataType::Interval)
+            } else if type_name == "SERIAL" {
+                Ok(DataType::Integer)
+            } else if type_name == "BIGSERIAL" {
+                Ok(DataType::BigInt)
             } else {
                 Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
             }
@@ -86,7 +93,10 @@ pub fn extract_create_table(
 ) -> H2Result<TableDef> {
     let (schema_name, table_name) = match name.0.len() {
         2 => (name.0[0].value.clone(), name.0[1].value.clone()),
-        _ => ("public".to_string(), name.to_string()),
+        _ => (
+            "public".to_string(),
+            name.0.last().map(|i| i.value.clone()).unwrap_or_else(|| name.to_string()),
+        ),
     };
     let mut col_defs = Vec::new();
     let mut pk_columns: Vec<String> = Vec::new();
@@ -133,8 +143,21 @@ pub fn extract_create_table(
         let mut is_pk = pk_columns.iter().any(|pk| pk.eq_ignore_ascii_case(&col_name));
         let mut is_nullable = true;
 
+        let is_custom_serial = match &col.data_type {
+            SqlDataType::Custom(c_name, _) => {
+                let upper = c_name.to_string().to_uppercase();
+                upper == "SERIAL" || upper == "BIGSERIAL"
+            }
+            _ => false,
+        };
+
+        let mut has_identity = false;
         for opt in &col.options {
             match &opt.option {
+                sqlparser::ast::ColumnOption::Generated { .. }
+                | sqlparser::ast::ColumnOption::Identity(..) => {
+                    has_identity = true;
+                }
                 sqlparser::ast::ColumnOption::Unique { is_primary, .. } => {
                     if *is_primary {
                         is_pk = true;
@@ -166,11 +189,19 @@ pub fn extract_create_table(
             }
         }
 
+        let mut seq_name = None;
+        if is_custom_serial || has_identity {
+            seq_name = Some(format!("{}_{}_seq", table_name.to_lowercase(), col_name.to_lowercase()));
+            is_nullable = false;
+        }
+
         if is_pk {
             is_nullable = false;
         }
 
-        col_defs.push(ColumnDef::new(col_name, dt, is_nullable, is_pk));
+        let mut column_def = ColumnDef::new(col_name, dt, is_nullable, is_pk);
+        column_def.sequence_name = seq_name;
+        col_defs.push(column_def);
     }
 
     let mut t_def = TableDef::new(table_name, col_defs);

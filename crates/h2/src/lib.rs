@@ -188,6 +188,7 @@ fn value_to_sql_literal(val: &Value) -> String {
             "[{}]",
             arr.iter().map(value_to_sql_literal).collect::<Vec<_>>().join(", ")
         ),
+        Value::Interval(iv) => format!("INTERVAL '{}'", iv),
     }
 }
 

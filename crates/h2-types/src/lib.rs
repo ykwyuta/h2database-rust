@@ -6,7 +6,7 @@ pub mod value;
 pub use data_type::DataType;
 pub use error::{H2Error, H2Result};
 pub use timeout::{check_query_timeout, remaining_query_timeout, set_query_timeout, TimeoutGuard};
-pub use value::{FromSql, Value};
+pub use value::{FromSql, Value, IntervalValue};
 
 
 #[cfg(test)]

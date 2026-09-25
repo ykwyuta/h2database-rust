@@ -19,6 +19,8 @@ pub struct ColumnDef {
     pub is_primary_key: bool,
     #[serde(default)]
     pub physical_index: Option<usize>,
+    #[serde(default)]
+    pub sequence_name: Option<String>,
 }
 
 impl ColumnDef {
@@ -29,7 +31,46 @@ impl ColumnDef {
             is_nullable,
             is_primary_key,
             physical_index: None,
+            sequence_name: None,
         }
+    }
+}
+
+/// シーケンス定義
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SequenceDef {
+    pub name: String,
+    #[serde(default = "default_schema")]
+    pub schema: String,
+    pub current_value: i64,
+    pub increment_by: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub start_with: i64,
+    pub cycle: bool,
+    pub is_called: bool,
+    #[serde(default)]
+    pub owner_table: Option<String>,
+}
+
+impl SequenceDef {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            schema: default_schema(),
+            current_value: 1,
+            increment_by: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            start_with: 1,
+            cycle: false,
+            is_called: false,
+            owner_table: None,
+        }
+    }
+
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema.to_lowercase(), self.name.to_lowercase())
     }
 }
 
@@ -180,6 +221,16 @@ pub struct Catalog {
     indexes: Arc<RwLock<HashMap<String, IndexDef>>>,
     views: Arc<RwLock<HashMap<String, ViewDef>>>,
     schemas: Arc<RwLock<HashSet<String>>>,
+    sequences: Arc<RwLock<HashMap<String, SequenceDef>>>,
+}
+
+impl std::fmt::Debug for Catalog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Catalog")
+            .field("tables_count", &self.tables.read().len())
+            .field("sequences_count", &self.sequences.read().len())
+            .finish()
+    }
 }
 
 impl Catalog {
@@ -189,6 +240,7 @@ impl Catalog {
         let mut indexes = HashMap::new();
         let mut views = HashMap::new();
         let mut schemas = HashSet::new();
+        let mut sequences = HashMap::new();
         schemas.insert("public".to_string());
 
         // 永続化されたカタログ情報をロード
@@ -212,6 +264,11 @@ impl Catalog {
                 if let Ok(view_def) = serde_json::from_slice::<ViewDef>(&entry.value) {
                     views.insert(view_name.to_lowercase(), view_def);
                 }
+            } else if key_str.starts_with("seq:") {
+                let seq_name = &key_str[4..];
+                if let Ok(seq_def) = serde_json::from_slice::<SequenceDef>(&entry.value) {
+                    sequences.insert(seq_name.to_lowercase(), seq_def);
+                }
             } else {
                 // 以前の形式（tbl:プレフィックスなし）との互換性
                 if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
@@ -227,7 +284,56 @@ impl Catalog {
             indexes: Arc::new(RwLock::new(indexes)),
             views: Arc::new(RwLock::new(views)),
             schemas: Arc::new(RwLock::new(schemas)),
+            sequences: Arc::new(RwLock::new(sequences)),
         })
+    }
+
+    pub fn reload(&self) -> H2Result<()> {
+        let mut tables = self.tables.write();
+        let mut indexes = self.indexes.write();
+        let mut views = self.views.write();
+        let mut schemas = self.schemas.write();
+        let mut sequences = self.sequences.write();
+
+        tables.clear();
+        indexes.clear();
+        views.clear();
+        schemas.clear();
+        sequences.clear();
+        schemas.insert("public".to_string());
+
+        for entry in self.catalog_map.scan_all() {
+            let key_str = String::from_utf8_lossy(&entry.key).to_string();
+            if key_str.starts_with("schema:") {
+                let schema_name = &key_str[7..];
+                schemas.insert(schema_name.to_lowercase());
+            } else if key_str.starts_with("tbl:") {
+                let table_name = &key_str[4..];
+                if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
+                    tables.insert(table_name.to_lowercase(), table_def);
+                }
+            } else if key_str.starts_with("idx:") {
+                let index_name = &key_str[4..];
+                if let Ok(index_def) = serde_json::from_slice::<IndexDef>(&entry.value) {
+                    indexes.insert(index_name.to_lowercase(), index_def);
+                }
+            } else if key_str.starts_with("view:") {
+                let view_name = &key_str[5..];
+                if let Ok(view_def) = serde_json::from_slice::<ViewDef>(&entry.value) {
+                    views.insert(view_name.to_lowercase(), view_def);
+                }
+            } else if key_str.starts_with("seq:") {
+                let seq_name = &key_str[4..];
+                if let Ok(seq_def) = serde_json::from_slice::<SequenceDef>(&entry.value) {
+                    sequences.insert(seq_name.to_lowercase(), seq_def);
+                }
+            } else {
+                if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
+                    tables.insert(key_str.to_lowercase(), table_def);
+                }
+            }
+        }
+        Ok(())
     }
 
 
@@ -610,6 +716,228 @@ impl Catalog {
         }
 
         Ok(id)
+    }
+
+    // ================= SEQUENCE 管理 =================
+
+    pub fn create_sequence(&self, seq_def: SequenceDef, if_not_exists: bool) -> H2Result<()> {
+        let full_key = seq_def.full_name();
+        let simple_key = seq_def.name.to_lowercase();
+        let mut sequences = self.sequences.write();
+
+        if sequences.contains_key(&full_key) || (seq_def.schema == "public" && sequences.contains_key(&simple_key)) {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(H2Error::Catalog(format!("Sequence '{}' already exists", seq_def.name)));
+        }
+
+        let serialized = serde_json::to_vec(&seq_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("seq:{}", full_key).into_bytes(), serialized.clone());
+        if seq_def.schema == "public" {
+            self.catalog_map.put(format!("seq:{}", simple_key).into_bytes(), serialized);
+            sequences.insert(simple_key, seq_def.clone());
+        }
+        sequences.insert(full_key, seq_def);
+
+        Ok(())
+    }
+
+    pub fn drop_sequence(&self, name: &str, if_exists: bool) -> H2Result<()> {
+        let name_key = name.to_lowercase();
+        let mut sequences = self.sequences.write();
+        let seq_def = sequences.remove(&name_key).or_else(|| {
+            if !name_key.contains('.') {
+                sequences.remove(&format!("public.{}", name_key))
+            } else {
+                let parts: Vec<&str> = name_key.splitn(2, '.').collect();
+                if parts[0] == "public" {
+                    sequences.remove(parts[1])
+                } else {
+                    None
+                }
+            }
+        });
+
+        if let Some(s) = seq_def {
+            let full_key = s.full_name();
+            let simple_key = s.name.to_lowercase();
+            sequences.remove(&full_key);
+            sequences.remove(&simple_key);
+            self.catalog_map.remove(format!("seq:{}", full_key).as_bytes());
+            self.catalog_map.remove(format!("seq:{}", simple_key).as_bytes());
+            Ok(())
+        } else if if_exists {
+            Ok(())
+        } else {
+            Err(H2Error::Catalog(format!("Sequence '{}' not found", name)))
+        }
+    }
+
+    pub fn alter_sequence(
+        &self,
+        name: &str,
+        restart: Option<i64>,
+        increment: Option<i64>,
+        min_value: Option<i64>,
+        max_value: Option<i64>,
+        cycle: Option<bool>,
+    ) -> H2Result<()> {
+        let name_key = name.to_lowercase();
+        let mut sequences = self.sequences.write();
+        let key = if sequences.contains_key(&name_key) {
+            name_key
+        } else if !name_key.contains('.') && sequences.contains_key(&format!("public.{}", name_key)) {
+            format!("public.{}", name_key)
+        } else {
+            return Err(H2Error::Catalog(format!("Sequence '{}' not found", name)));
+        };
+
+        let seq_def = sequences.get_mut(&key).unwrap();
+        if let Some(r) = restart {
+            seq_def.current_value = r;
+            seq_def.is_called = false;
+        }
+        if let Some(inc) = increment {
+            seq_def.increment_by = inc;
+        }
+        if let Some(min_v) = min_value {
+            seq_def.min_value = min_v;
+        }
+        if let Some(max_v) = max_value {
+            seq_def.max_value = max_v;
+        }
+        if let Some(cyc) = cycle {
+            seq_def.cycle = cyc;
+        }
+
+        let serialized = serde_json::to_vec(&*seq_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("seq:{}", seq_def.full_name()).into_bytes(), serialized.clone());
+        if seq_def.schema == "public" {
+            self.catalog_map.put(format!("seq:{}", seq_def.name.to_lowercase()).into_bytes(), serialized);
+        }
+        Ok(())
+    }
+
+    pub fn nextval(&self, name: &str) -> H2Result<i64> {
+        let name_key = name.to_lowercase();
+        let mut sequences = self.sequences.write();
+        let key = if sequences.contains_key(&name_key) {
+            name_key
+        } else if !name_key.contains('.') && sequences.contains_key(&format!("public.{}", name_key)) {
+            format!("public.{}", name_key)
+        } else {
+            return Err(H2Error::Catalog(format!("Sequence '{}' not found", name)));
+        };
+
+        let seq = sequences.get_mut(&key).unwrap();
+        let val = if !seq.is_called {
+            seq.is_called = true;
+            seq.current_value
+        } else {
+            let next = seq.current_value.saturating_add(seq.increment_by);
+            if seq.increment_by > 0 && next > seq.max_value {
+                if seq.cycle {
+                    seq.min_value
+                } else {
+                    return Err(H2Error::Execution(format!("Sequence '{}' reached maximum value", name)));
+                }
+            } else if seq.increment_by < 0 && next < seq.min_value {
+                if seq.cycle {
+                    seq.max_value
+                } else {
+                    return Err(H2Error::Execution(format!("Sequence '{}' reached minimum value", name)));
+                }
+            } else {
+                next
+            }
+        };
+
+        seq.current_value = val;
+        let serialized = serde_json::to_vec(&*seq)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        let full = seq.full_name();
+        let simple = seq.name.to_lowercase();
+        let is_public = seq.schema == "public";
+        self.catalog_map.put(format!("seq:{}", full).into_bytes(), serialized.clone());
+        if is_public {
+            self.catalog_map.put(format!("seq:{}", simple).into_bytes(), serialized);
+        }
+
+        Ok(val)
+    }
+
+    pub fn currval(&self, name: &str) -> H2Result<i64> {
+        let name_key = name.to_lowercase();
+        let sequences = self.sequences.read();
+        let seq = sequences.get(&name_key).or_else(|| {
+            if !name_key.contains('.') {
+                sequences.get(&format!("public.{}", name_key))
+            } else {
+                None
+            }
+        }).ok_or_else(|| H2Error::Catalog(format!("Sequence '{}' not found", name)))?;
+
+        if !seq.is_called {
+            return Err(H2Error::Execution(format!("currval of sequence '{}' is not yet defined in this session", name)));
+        }
+        Ok(seq.current_value)
+    }
+
+    pub fn setval(&self, name: &str, val: i64, is_called: bool) -> H2Result<i64> {
+        let name_key = name.to_lowercase();
+        let mut sequences = self.sequences.write();
+        let key = if sequences.contains_key(&name_key) {
+            name_key
+        } else if !name_key.contains('.') && sequences.contains_key(&format!("public.{}", name_key)) {
+            format!("public.{}", name_key)
+        } else {
+            return Err(H2Error::Catalog(format!("Sequence '{}' not found", name)));
+        };
+
+        let seq = sequences.get_mut(&key).unwrap();
+        seq.current_value = val;
+        seq.is_called = is_called;
+
+        let serialized = serde_json::to_vec(&*seq)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        let full = seq.full_name();
+        let simple = seq.name.to_lowercase();
+        let is_public = seq.schema == "public";
+        self.catalog_map.put(format!("seq:{}", full).into_bytes(), serialized.clone());
+        if is_public {
+            self.catalog_map.put(format!("seq:{}", simple).into_bytes(), serialized);
+        }
+
+        Ok(val)
+    }
+
+    pub fn get_sequence(&self, name: &str) -> Option<SequenceDef> {
+        let name_key = name.to_lowercase();
+        let sequences = self.sequences.read();
+        sequences.get(&name_key).cloned().or_else(|| {
+            if !name_key.contains('.') {
+                sequences.get(&format!("public.{}", name_key)).cloned()
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn all_sequences(&self) -> Vec<SequenceDef> {
+        let sequences = self.sequences.read();
+        let mut seen = HashSet::new();
+        let mut list = Vec::new();
+        for s in sequences.values() {
+            let full = s.full_name();
+            if !seen.contains(&full) {
+                seen.insert(full);
+                list.push(s.clone());
+            }
+        }
+        list
     }
 
     pub fn create_view(&self, view_def: ViewDef, or_replace: bool) -> H2Result<()> {

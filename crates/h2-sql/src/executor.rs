@@ -123,21 +123,32 @@ pub enum ExecutionResult {
     Query { columns: Vec<String>, rows: Vec<Row> },
 }
 
+#[derive(Debug, Clone)]
+pub struct CursorState {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub rows: Vec<Row>,
+    pub current_pos: isize,
+    pub scroll: bool,
+}
 
 pub struct SQLEngine {
     store: Arc<MVStore>,
     tx_store: Arc<TransactionStore>,
     catalog: Arc<Catalog>,
+    cursors: Arc<parking_lot::RwLock<HashMap<String, CursorState>>>,
 }
 
 impl SQLEngine {
     pub fn new(store: Arc<MVStore>) -> H2Result<Self> {
         let tx_store = TransactionStore::new(Arc::clone(&store));
         let catalog = Arc::new(Catalog::new(Arc::clone(&store))?);
+        let cursors = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         Ok(Self {
             store,
             tx_store,
             catalog,
+            cursors,
         })
     }
 
@@ -175,7 +186,38 @@ impl SQLEngine {
             return Ok(ExecutionResult::Ddl);
         }
 
-        let statements = parse_sql(sql)?;
+        let trimmed_upper = trimmed.to_uppercase();
+        if trimmed_upper.starts_with("BACKUP TO ") {
+            let path = extract_file_path(&trimmed[10..]);
+            self.backup_to(&path)?;
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("RESTORE FROM ") {
+            let path = extract_file_path(&trimmed[13..]);
+            self.restore_from(&path)?;
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("SCRIPT TO ") {
+            let path = extract_file_path(&trimmed[10..]);
+            self.script_to(tx, &path)?;
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("RUNSCRIPT FROM ") {
+            let path = extract_file_path(&trimmed[15..]);
+            return self.runscript_from(&path);
+        }
+
+        if trimmed_upper.starts_with("ALTER SEQUENCE") {
+            return self.execute_alter_sequence(trimmed);
+        }
+
+        let mut sql_to_parse = trimmed.to_string();
+        if trimmed_upper.starts_with("FETCH RELATIVE -") {
+            let num_part = trimmed["FETCH RELATIVE -".len()..].trim();
+            sql_to_parse = format!("FETCH BACKWARD {}", num_part);
+        }
+
+        let statements = parse_sql(&sql_to_parse)?;
         let mut last_result = ExecutionResult::Ddl;
 
         for stmt in statements {
@@ -183,6 +225,194 @@ impl SQLEngine {
         }
 
         Ok(last_result)
+    }
+
+    pub fn backup_to(&self, path: &str) -> H2Result<()> {
+        self.store.dump_backup(path)
+    }
+
+    pub fn restore_from(&self, path: &str) -> H2Result<()> {
+        self.store.restore_backup(path)?;
+        self.catalog.reload()?;
+        Ok(())
+    }
+
+    pub fn script_to(&self, tx: &Transaction, path: &str) -> H2Result<()> {
+        let mut sql = String::new();
+
+        // 1. スキーマ
+        for schema in self.catalog.get_schemas() {
+            if schema != "public" {
+                sql.push_str(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\";\n", schema));
+            }
+        }
+
+        // 2. シーケンス
+        for seq in self.catalog.all_sequences() {
+            if seq.owner_table.is_none() {
+                sql.push_str(&format!(
+                    "CREATE SEQUENCE IF NOT EXISTS \"{}\" INCREMENT BY {} START WITH {};\n",
+                    seq.name, seq.increment_by, seq.current_value
+                ));
+            }
+        }
+
+        // 3. テーブル & データ
+        for tbl in self.catalog.all_tables() {
+            let mut col_strs = Vec::new();
+            for col in &tbl.columns {
+                let mut c_str = format!("\"{}\" {}", col.name, col.data_type);
+                if !col.is_nullable {
+                    c_str.push_str(" NOT NULL");
+                }
+                if col.is_primary_key && tbl.primary_key.len() == 1 {
+                    c_str.push_str(" PRIMARY KEY");
+                }
+                col_strs.push(c_str);
+            }
+            if tbl.primary_key.len() > 1 {
+                let pk_cols = tbl.primary_key.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join(", ");
+                col_strs.push(format!("PRIMARY KEY ({})", pk_cols));
+            }
+            for u in &tbl.unique_constraints {
+                let u_cols = u.columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+                col_strs.push(format!("UNIQUE ({})", u_cols));
+            }
+            sql.push_str(&format!("CREATE TABLE IF NOT EXISTS {} ({});\n", tbl.name, col_strs.join(", ")));
+
+            // データ INSERT
+            let map_name = tbl.map_name();
+            let entries = tx.scan_visible(&map_name)?;
+            for (_k, val_bytes) in entries {
+                let mut row = Row::from_bytes(&val_bytes)?;
+                tbl.align_row(&mut row);
+                let val_strs: Vec<String> = row.values.iter().map(|v| v.to_sql_literal()).collect();
+                sql.push_str(&format!("INSERT INTO {} VALUES ({});\n", tbl.name, val_strs.join(", ")));
+            }
+        }
+
+        // 4. 二次インデックス
+        for idx in self.catalog.all_indexes() {
+            if !idx.name.starts_with("pk_") && !idx.name.starts_with("uniq_") {
+                let cols = idx.columns.iter().map(|c| format!("\"{}\"", c)).collect::<Vec<_>>().join(", ");
+                let unique_kw = if idx.is_unique { "UNIQUE " } else { "" };
+                sql.push_str(&format!("CREATE {}INDEX IF NOT EXISTS \"{}\" ON \"{}\" ({});\n", unique_kw, idx.name, idx.table_name, cols));
+            }
+        }
+
+        // 5. ビュー
+        for view in self.catalog.all_views() {
+            sql.push_str(&format!("CREATE VIEW IF NOT EXISTS \"{}\" AS {};\n", view.name, view.query_sql));
+        }
+
+        std::fs::write(path, sql).map_err(|e| H2Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    pub fn runscript_from(&self, path: &str) -> H2Result<ExecutionResult> {
+        let content = std::fs::read_to_string(path).map_err(|e| H2Error::Storage(e.to_string()))?;
+        let statements = split_sql_script(&content);
+        let mut last_res = ExecutionResult::Ddl;
+        for stmt in statements {
+            last_res = self.execute(&stmt)?;
+        }
+        Ok(last_res)
+    }
+
+    fn execute_alter_sequence(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let tokens: Vec<&str> = sql.split_whitespace().collect();
+        if tokens.len() < 3 {
+            return Err(H2Error::SqlParse("Invalid ALTER SEQUENCE statement".to_string()));
+        }
+        let mut idx = 2;
+        let mut if_exists = false;
+        if tokens[idx].eq_ignore_ascii_case("IF") && idx + 1 < tokens.len() && tokens[idx + 1].eq_ignore_ascii_case("EXISTS") {
+            if_exists = true;
+            idx += 2;
+        }
+        if idx >= tokens.len() {
+            return Err(H2Error::SqlParse("Missing sequence name in ALTER SEQUENCE".to_string()));
+        }
+        let seq_name = tokens[idx].trim_matches(|c| c == '"' || c == '\'' || c == '`');
+        idx += 1;
+
+        let mut restart_val: Option<i64> = None;
+        let mut increment_by: Option<i64> = None;
+        let mut min_val: Option<i64> = None;
+        let mut max_val: Option<i64> = None;
+        let mut cycle: Option<bool> = None;
+
+        while idx < tokens.len() {
+            let tok = tokens[idx].to_uppercase();
+            if tok == "RESTART" {
+                idx += 1;
+                if idx < tokens.len() && tokens[idx].eq_ignore_ascii_case("WITH") {
+                    idx += 1;
+                }
+                if idx < tokens.len() {
+                    if let Ok(v) = tokens[idx].parse::<i64>() {
+                        restart_val = Some(v);
+                        idx += 1;
+                    } else {
+                        restart_val = Some(1);
+                    }
+                } else {
+                    restart_val = Some(1);
+                }
+            } else if tok == "INCREMENT" {
+                idx += 1;
+                if idx < tokens.len() && tokens[idx].eq_ignore_ascii_case("BY") {
+                    idx += 1;
+                }
+                if idx < tokens.len() {
+                    let v = tokens[idx].parse::<i64>().map_err(|e| H2Error::SqlParse(e.to_string()))?;
+                    increment_by = Some(v);
+                    idx += 1;
+                }
+            } else if tok == "MINVALUE" {
+                idx += 1;
+                if idx < tokens.len() {
+                    let v = tokens[idx].parse::<i64>().map_err(|e| H2Error::SqlParse(e.to_string()))?;
+                    min_val = Some(v);
+                    idx += 1;
+                }
+            } else if tok == "NO" && idx + 1 < tokens.len() && tokens[idx + 1].eq_ignore_ascii_case("MINVALUE") {
+                min_val = Some(1);
+                idx += 2;
+            } else if tok == "MAXVALUE" {
+                idx += 1;
+                if idx < tokens.len() {
+                    let v = tokens[idx].parse::<i64>().map_err(|e| H2Error::SqlParse(e.to_string()))?;
+                    max_val = Some(v);
+                    idx += 1;
+                }
+            } else if tok == "NO" && idx + 1 < tokens.len() && tokens[idx + 1].eq_ignore_ascii_case("MAXVALUE") {
+                max_val = Some(i64::MAX);
+                idx += 2;
+            } else if tok == "CYCLE" {
+                cycle = Some(true);
+                idx += 1;
+            } else if tok == "NO" && idx + 1 < tokens.len() && tokens[idx + 1].eq_ignore_ascii_case("CYCLE") {
+                cycle = Some(false);
+                idx += 2;
+            } else {
+                idx += 1;
+            }
+        }
+
+        match self.catalog.alter_sequence(seq_name, restart_val, increment_by, min_val, max_val, cycle) {
+            Ok(_) => {
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            Err(e) => {
+                if if_exists && e.to_string().contains("not found") {
+                    Ok(ExecutionResult::Ddl)
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     fn resolve_view_query(
@@ -570,6 +800,81 @@ fn apply_join(
                 self.store.commit()?;
                 Ok(ExecutionResult::Ddl)
             }
+            Statement::CreateSequence {
+                name,
+                if_not_exists,
+                sequence_options,
+                ..
+            } => {
+                let (schema, seq_name) = match name.0.len() {
+                    2 => (name.0[0].value.clone(), name.0[1].value.clone()),
+                    _ => ("public".to_string(), name.to_string()),
+                };
+
+                let mut increment_by = 1i64;
+                let mut min_value = None;
+                let mut max_value = None;
+                let mut start_with = 1i64;
+                let mut cycle = false;
+
+                for opt in sequence_options {
+                    match opt {
+                        sqlparser::ast::SequenceOptions::IncrementBy(expr, _) => {
+                            if let Ok(Value::Integer(v)) = evaluate_literal_or_unary(&expr) {
+                                increment_by = v as i64;
+                            } else if let Ok(Value::BigInt(v)) = evaluate_literal_or_unary(&expr) {
+                                increment_by = v;
+                            }
+                        }
+                        sqlparser::ast::SequenceOptions::MinValue(opt_expr) => {
+                            min_value = opt_expr.and_then(|expr| {
+                                evaluate_literal_or_unary(&expr).ok().and_then(|v| match v {
+                                    Value::Integer(i) => Some(i as i64),
+                                    Value::BigInt(i) => Some(i),
+                                    _ => None,
+                                })
+                            });
+                        }
+                        sqlparser::ast::SequenceOptions::MaxValue(opt_expr) => {
+                            max_value = opt_expr.and_then(|expr| {
+                                evaluate_literal_or_unary(&expr).ok().and_then(|v| match v {
+                                    Value::Integer(i) => Some(i as i64),
+                                    Value::BigInt(i) => Some(i),
+                                    _ => None,
+                                })
+                            });
+                        }
+                        sqlparser::ast::SequenceOptions::StartWith(expr, _) => {
+                            if let Ok(Value::Integer(v)) = evaluate_literal_or_unary(&expr) {
+                                start_with = v as i64;
+                            } else if let Ok(Value::BigInt(v)) = evaluate_literal_or_unary(&expr) {
+                                start_with = v;
+                            }
+                        }
+                        sqlparser::ast::SequenceOptions::Cycle(b) => {
+                            cycle = b;
+                        }
+                        _ => {}
+                    }
+                }
+
+                let seq_def = crate::catalog::SequenceDef {
+                    name: seq_name,
+                    schema,
+                    current_value: start_with,
+                    increment_by,
+                    min_value: min_value.unwrap_or(1),
+                    max_value: max_value.unwrap_or(i64::MAX),
+                    start_with,
+                    cycle,
+                    is_called: false,
+                    owner_table: None,
+                };
+
+                self.catalog.create_sequence(seq_def, if_not_exists)?;
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
             Statement::CreateTable(create_table) => {
                 let table_def = extract_create_table(
                     &create_table.name,
@@ -579,6 +884,24 @@ fn apply_join(
                 let tbl_name = table_def.name.clone();
                 let pk = table_def.primary_key.clone();
                 let unique_constraints = table_def.unique_constraints.clone();
+
+                for col in &table_def.columns {
+                    if let Some(ref seq_name) = col.sequence_name {
+                        let seq_def = crate::catalog::SequenceDef {
+                            name: seq_name.clone(),
+                            schema: table_def.schema.clone(),
+                            current_value: 1,
+                            increment_by: 1,
+                            min_value: 1,
+                            max_value: i64::MAX,
+                            start_with: 1,
+                            cycle: false,
+                            is_called: false,
+                            owner_table: Some(tbl_name.clone()),
+                        };
+                        let _ = self.catalog.create_sequence(seq_def, true);
+                    }
+                }
 
                 self.catalog.create_table(table_def)?;
 
@@ -709,10 +1032,22 @@ fn apply_join(
                     if source.with.is_none() && matches!(*source.body, SetExpr::Values(_)) {
                         if let SetExpr::Values(values) = *source.body {
                             let mut list = Vec::with_capacity(values.rows.len());
+                            let eval_ctx = RowContext {
+                                columns: Vec::new(),
+                                catalog: Some(Arc::clone(&self.catalog)),
+                            };
+                            let dummy_row = Row::new(vec![]);
                             for row_exprs in values.rows {
                                 let mut row_vals = Vec::with_capacity(row_exprs.len());
                                 for expr in row_exprs {
-                                    let val = evaluate_literal_or_unary(&expr)?;
+                                    if let Expr::Identifier(ident) = &expr {
+                                        if ident.value.eq_ignore_ascii_case("DEFAULT") {
+                                            row_vals.push(Value::Null);
+                                            continue;
+                                        }
+                                    }
+                                    let val = evaluate_literal_or_unary(&expr)
+                                        .or_else(|_| evaluate_expr_context(&expr, &eval_ctx, &dummy_row))?;
                                     row_vals.push(val);
                                 }
                                 list.push(row_vals);
@@ -748,8 +1083,20 @@ fn apply_join(
                     let mut full_row_values = vec![Value::Null; table_def.columns.len()];
                     for (i, val) in raw_values.into_iter().enumerate() {
                         let col_idx = target_indices[i];
-                        let casted = val.cast_to(&table_def.columns[col_idx].data_type)?;
-                        full_row_values[col_idx] = casted;
+                        if !val.is_null() {
+                            let casted = val.cast_to(&table_def.columns[col_idx].data_type)?;
+                            full_row_values[col_idx] = casted;
+                        }
+                    }
+
+                    // シーケンス列（SERIAL, BIGSERIAL, IDENTITY）の自動採番
+                    for (col_idx, col_def) in table_def.columns.iter().enumerate() {
+                        if full_row_values[col_idx].is_null() {
+                            if let Some(ref seq_name) = col_def.sequence_name {
+                                let next_v = self.catalog.nextval(seq_name)?;
+                                full_row_values[col_idx] = Value::BigInt(next_v).cast_to(&col_def.data_type)?;
+                            }
+                        }
                     }
 
                     let row = Row::new(full_row_values);
@@ -1326,6 +1673,11 @@ fn apply_join(
                             self.catalog.drop_view(&name.to_string(), if_exists)?;
                         }
                     }
+                    sqlparser::ast::ObjectType::Sequence => {
+                        for name in names {
+                            self.catalog.drop_sequence(&name.to_string(), if_exists)?;
+                        }
+                    }
                     sqlparser::ast::ObjectType::Schema => {
                         for name in names {
                             let schema_name = name.to_string();
@@ -1746,6 +2098,351 @@ fn apply_join(
                     ],
                     rows,
                 })
+            }
+            Statement::Copy {
+                source,
+                to,
+                target,
+                options,
+                legacy_options,
+                ..
+            } => {
+                let file_path = match target {
+                    sqlparser::ast::CopyTarget::File { filename } => filename,
+                    _ => return Err(H2Error::Execution("Only COPY to/from file is supported".to_string())),
+                };
+
+                let mut delimiter = ',';
+                let mut header = false;
+
+                for opt in options {
+                    match opt {
+                        sqlparser::ast::CopyOption::Delimiter(c) => delimiter = c,
+                        sqlparser::ast::CopyOption::Header(b) => header = b,
+                        _ => {}
+                    }
+                }
+                for opt in legacy_options {
+                    match opt {
+                        sqlparser::ast::CopyLegacyOption::Delimiter(c) => delimiter = c,
+                        sqlparser::ast::CopyLegacyOption::Csv(csv_opts) => {
+                            for c_opt in csv_opts {
+                                if let sqlparser::ast::CopyLegacyCsvOption::Header = c_opt {
+                                    header = true;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if to {
+                    // COPY ... TO <file>
+                    let (cols, rows) = match source {
+                        sqlparser::ast::CopySource::Table { table_name, columns } => {
+                            let tbl_name_str = table_name.to_string();
+                            let t_def = self.catalog.get_table(&tbl_name_str).ok_or_else(|| {
+                                H2Error::Catalog(format!("Table '{}' not found in COPY", tbl_name_str))
+                            })?;
+                            let map_name = t_def.map_name();
+                            let entries = tx.scan_visible(&map_name)?;
+                            let col_indices: Vec<usize> = if columns.is_empty() {
+                                (0..t_def.columns.len()).collect()
+                            } else {
+                                let mut idxs = Vec::new();
+                                for col in &columns {
+                                    let c_idx = t_def.column_index(&col.value).ok_or_else(|| {
+                                        H2Error::Catalog(format!("Column '{}' not found in table '{}'", col.value, tbl_name_str))
+                                    })?;
+                                    idxs.push(c_idx);
+                                }
+                                idxs
+                            };
+                            let mut rows = Vec::new();
+                            for (_k, val_bytes) in entries {
+                                let mut r = Row::from_bytes(&val_bytes)?;
+                                t_def.align_row(&mut r);
+                                let projected = col_indices.iter().map(|&i| r.get(i).cloned().unwrap_or(Value::Null)).collect();
+                                rows.push(Row::new(projected));
+                            }
+                            let c_names = if columns.is_empty() {
+                                t_def.columns.iter().map(|c| c.name.clone()).collect()
+                            } else {
+                                columns.into_iter().map(|c| c.value).collect()
+                            };
+                            (c_names, rows)
+                        }
+                        sqlparser::ast::CopySource::Query(query) => {
+                            let exec_res = self.execute_query(tx, *query)?;
+                            match exec_res {
+                                ExecutionResult::Query { columns, rows } => (columns, rows),
+                                _ => return Err(H2Error::Execution("COPY source query must return rows".to_string())),
+                            }
+                        }
+                    };
+
+                    let mut out = String::new();
+                    if header {
+                        out.push_str(&cols.join(&delimiter.to_string()));
+                        out.push('\n');
+                    }
+                    for row in &rows {
+                        let fields: Vec<String> = row.values.iter().map(|v| format_csv_field(v, delimiter)).collect();
+                        out.push_str(&fields.join(&delimiter.to_string()));
+                        out.push('\n');
+                    }
+                    std::fs::write(&file_path, out).map_err(|e| H2Error::Storage(e.to_string()))?;
+                    Ok(ExecutionResult::Dml { affected_rows: rows.len() as u64 })
+                } else {
+                    // COPY ... FROM <file>
+                    let (table_name, columns) = match source {
+                        sqlparser::ast::CopySource::Table { table_name, columns } => (table_name.to_string(), columns),
+                        _ => return Err(H2Error::Execution("COPY FROM requires table target".to_string())),
+                    };
+                    let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
+                        H2Error::Catalog(format!("Table '{}' not found in COPY", table_name))
+                    })?;
+                    let target_indices: Vec<usize> = if columns.is_empty() {
+                        (0..table_def.columns.len()).collect()
+                    } else {
+                        let mut idxs = Vec::new();
+                        for col in &columns {
+                            let c_idx = table_def.column_index(&col.value).ok_or_else(|| {
+                                H2Error::Catalog(format!("Column '{}' not found in table '{}'", col.value, table_name))
+                            })?;
+                            idxs.push(c_idx);
+                        }
+                        idxs
+                    };
+
+                    let content = std::fs::read_to_string(&file_path).map_err(|e| H2Error::Storage(e.to_string()))?;
+                    let mut lines = content.lines();
+                    if header {
+                        lines.next();
+                    }
+
+                    let mut affected_rows = 0;
+                    for line in lines {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() { continue; }
+                        let fields = parse_csv_line(trimmed, delimiter);
+                        if fields.len() != target_indices.len() {
+                            return Err(H2Error::Execution(format!(
+                                "Column count mismatch in CSV import: expected {}, got {}",
+                                target_indices.len(), fields.len()
+                            )));
+                        }
+
+                        let mut full_row_values = vec![Value::Null; table_def.columns.len()];
+                        for (i, field_str) in fields.into_iter().enumerate() {
+                            let col_idx = target_indices[i];
+                            let col_type = &table_def.columns[col_idx].data_type;
+                            let val = Value::String(field_str).cast_to(col_type)?;
+                            full_row_values[col_idx] = val;
+                        }
+
+                        for (col_idx, col_def) in table_def.columns.iter().enumerate() {
+                            if full_row_values[col_idx].is_null() {
+                                if let Some(ref seq_name) = col_def.sequence_name {
+                                    let next_v = self.catalog.nextval(seq_name)?;
+                                    full_row_values[col_idx] = Value::BigInt(next_v).cast_to(&col_def.data_type)?;
+                                }
+                            }
+                        }
+
+                        let row = Row::new(full_row_values);
+                        let row_id = self.catalog.allocate_row_id(&table_name)?;
+                        let row_bytes = row.to_bytes()?;
+                        tx.put(&table_def.map_name(), row_id.to_le_bytes().to_vec(), row_bytes)?;
+
+                        for idx in self.catalog.get_table_indexes(&table_name) {
+                            if let Some(vals) = get_index_values(&table_def, &idx, &row) {
+                                let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                let idx_key = encode_composite_index_key(&vals, row_id);
+                                tx.put(&idx_map_name, idx_key, vec![])?;
+                            }
+                        }
+                        affected_rows += 1;
+                    }
+                    self.store.commit()?;
+                    Ok(ExecutionResult::Dml { affected_rows })
+                }
+            }
+            Statement::Declare { stmts } => {
+                for stmt in stmts {
+                    let cursor_name = stmt.names.first().map(|n| n.value.to_lowercase()).unwrap_or_else(|| "cur".to_string());
+                    let query = stmt.for_query.ok_or_else(|| {
+                        H2Error::Execution("DECLARE cursor requires FOR <query> clause".to_string())
+                    })?;
+                    let scroll = stmt.scroll.unwrap_or(true);
+                    let exec_res = self.execute_query(tx, *query)?;
+                    let (cols, rows) = match exec_res {
+                        ExecutionResult::Query { columns, rows } => (columns, rows),
+                        _ => return Err(H2Error::Execution("Cursor query must return rows".to_string())),
+                    };
+                    let state = CursorState {
+                        name: cursor_name.clone(),
+                        columns: cols,
+                        rows,
+                        current_pos: -1,
+                        scroll,
+                    };
+                    self.cursors.write().insert(cursor_name, state);
+                }
+                Ok(ExecutionResult::Ddl)
+            }
+            Statement::Fetch { name, direction, .. } => {
+                let cursor_name = name.value.to_lowercase();
+                let mut cursors = self.cursors.write();
+                let cursor = cursors.get_mut(&cursor_name).ok_or_else(|| {
+                    H2Error::Execution(format!("Cursor '{}' does not exist", name.value))
+                })?;
+
+                let total = cursor.rows.len() as isize;
+                let fetched_rows: Vec<Row> = match direction {
+                    sqlparser::ast::FetchDirection::Next => {
+                        cursor.current_pos += 1;
+                        if cursor.current_pos >= 0 && cursor.current_pos < total {
+                            vec![cursor.rows[cursor.current_pos as usize].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::Prior => {
+                        cursor.current_pos -= 1;
+                        if cursor.current_pos >= 0 && cursor.current_pos < total {
+                            vec![cursor.rows[cursor.current_pos as usize].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::First => {
+                        cursor.current_pos = 0;
+                        if total > 0 {
+                            vec![cursor.rows[0].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::Last => {
+                        cursor.current_pos = total - 1;
+                        if total > 0 {
+                            vec![cursor.rows[(total - 1) as usize].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::Absolute { limit } => {
+                        let n: isize = match limit {
+                            sqlparser::ast::Value::Number(s, _) => s.parse().unwrap_or(1),
+                            _ => 1,
+                        };
+                        let target_idx = if n > 0 { n - 1 } else { total + n };
+                        cursor.current_pos = target_idx;
+                        if target_idx >= 0 && target_idx < total {
+                            vec![cursor.rows[target_idx as usize].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::Relative { limit } => {
+                        let n: isize = match limit {
+                            sqlparser::ast::Value::Number(s, _) => s.parse().unwrap_or(1),
+                            _ => 1,
+                        };
+                        cursor.current_pos += n;
+                        if cursor.current_pos >= 0 && cursor.current_pos < total {
+                            vec![cursor.rows[cursor.current_pos as usize].clone()]
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::All | sqlparser::ast::FetchDirection::ForwardAll => {
+                        let start = (cursor.current_pos + 1).max(0) as usize;
+                        cursor.current_pos = total;
+                        if start < cursor.rows.len() {
+                            cursor.rows[start..].to_vec()
+                        } else {
+                            vec![]
+                        }
+                    }
+                    sqlparser::ast::FetchDirection::Forward { limit } => {
+                        let count: usize = match limit {
+                            Some(sqlparser::ast::Value::Number(s, _)) => s.parse().unwrap_or(1),
+                            _ => 1,
+                        };
+                        let mut result = Vec::new();
+                        for _ in 0..count {
+                            cursor.current_pos += 1;
+                            if cursor.current_pos >= 0 && cursor.current_pos < total {
+                                result.push(cursor.rows[cursor.current_pos as usize].clone());
+                            } else {
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    sqlparser::ast::FetchDirection::Count { limit } => {
+                        let count: usize = match limit {
+                            sqlparser::ast::Value::Number(s, _) => s.parse().unwrap_or(1),
+                            _ => 1,
+                        };
+                        let mut result = Vec::new();
+                        for _ in 0..count {
+                            cursor.current_pos += 1;
+                            if cursor.current_pos >= 0 && cursor.current_pos < total {
+                                result.push(cursor.rows[cursor.current_pos as usize].clone());
+                            } else {
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    sqlparser::ast::FetchDirection::Backward { limit } => {
+                        let count: usize = match limit {
+                            Some(sqlparser::ast::Value::Number(s, _)) => s.parse().unwrap_or(1),
+                            _ => 1,
+                        };
+                        let mut result = Vec::new();
+                        for _ in 0..count {
+                            cursor.current_pos -= 1;
+                            if cursor.current_pos >= 0 && cursor.current_pos < total {
+                                result.push(cursor.rows[cursor.current_pos as usize].clone());
+                            } else {
+                                break;
+                            }
+                        }
+                        result
+                    }
+                    sqlparser::ast::FetchDirection::BackwardAll => {
+                        let mut result = Vec::new();
+                        while cursor.current_pos > 0 {
+                            cursor.current_pos -= 1;
+                            result.push(cursor.rows[cursor.current_pos as usize].clone());
+                        }
+                        cursor.current_pos = -1;
+                        result
+                    }
+                };
+
+                Ok(ExecutionResult::Query {
+                    columns: cursor.columns.clone(),
+                    rows: fetched_rows,
+                })
+            }
+            Statement::Close { cursor } => {
+                match cursor {
+                    sqlparser::ast::CloseCursor::All => {
+                        self.cursors.write().clear();
+                    }
+                    sqlparser::ast::CloseCursor::Specific { name } => {
+                        let removed = self.cursors.write().remove(&name.value.to_lowercase());
+                        if removed.is_none() {
+                            return Err(H2Error::Execution(format!("Cursor '{}' does not exist", name.value)));
+                        }
+                    }
+                }
+                Ok(ExecutionResult::Ddl)
             }
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }
@@ -2425,6 +3122,7 @@ fn apply_join(
                             column_name: name.clone(),
                             index: i,
                         }).collect(),
+                        catalog: Some(Arc::clone(&self.catalog)),
                     };
                     rows.sort_by(|a, b| {
                         for order_expr in &order_by.exprs {
@@ -2481,7 +3179,8 @@ fn apply_join(
             SetExpr::Select(select) => {
                 let select = *select;
                 if select.from.is_empty() {
-                    let ctx = RowContext::new();
+                    let mut ctx = RowContext::new();
+                    ctx.catalog = Some(Arc::clone(&self.catalog));
                     let dummy_row = Row::new(vec![]);
 
                     // WHERE 句の評価（サブクエリ展開含む）
@@ -2709,6 +3408,7 @@ fn apply_join(
 
                 let mut current_rows = current_rows;
                 let mut ctx = RowContext::from_table_def(&base_table_def, base_table_alias.as_deref());
+                ctx.catalog = Some(Arc::clone(&self.catalog));
 
                 // JOIN の処理
                 for join in &from_table.joins {
@@ -2824,6 +3524,7 @@ fn apply_join(
                                 column_name: name.clone(),
                                 index: i,
                             }).collect(),
+                            catalog: Some(Arc::clone(&self.catalog)),
                         };
 
                         rows.sort_by(|a, b| {
@@ -3574,6 +4275,85 @@ fn compute_window_functions(
     }
 
     Ok(results)
+}
+
+fn extract_file_path(param: &str) -> String {
+    let p = param.trim().trim_end_matches(';').trim();
+    p.trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string()
+}
+
+fn split_sql_script(content: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut prev_char = '\0';
+
+    for ch in content.chars() {
+        if ch == '\'' && prev_char != '\\' {
+            in_single_quote = !in_single_quote;
+            current.push(ch);
+        } else if ch == ';' && !in_single_quote {
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                stmts.push(trimmed.to_string());
+            }
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+        prev_char = ch;
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        stmts.push(trimmed.to_string());
+    }
+    stmts
+}
+
+fn format_csv_field(val: &Value, delimiter: char) -> String {
+    let s = match val {
+        Value::Null => "".to_string(),
+        Value::String(str_val) => str_val.clone(),
+        _ => val.to_string(),
+    };
+    if s.contains(delimiter) || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s
+    }
+}
+
+fn parse_csv_line(line: &str, delimiter: char) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    current.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                current.push(ch);
+            }
+        } else {
+            if ch == '"' {
+                in_quotes = true;
+            } else if ch == delimiter {
+                fields.push(current.clone());
+                current.clear();
+            } else {
+                current.push(ch);
+            }
+        }
+    }
+    fields.push(current);
+    fields
 }
 
 

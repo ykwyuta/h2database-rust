@@ -30,6 +30,110 @@ pub enum Value {
     Uuid(Uuid),
     Json(serde_json::Value),
     Array(Vec<Value>),
+    Interval(IntervalValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+pub struct IntervalValue {
+    pub months: i32,
+    pub days: i32,
+    pub microseconds: i64,
+}
+
+impl IntervalValue {
+    pub fn new(months: i32, days: i32, microseconds: i64) -> Self {
+        Self { months, days, microseconds }
+    }
+
+    pub fn from_days(days: i32) -> Self {
+        Self { months: 0, days, microseconds: 0 }
+    }
+
+    pub fn from_hours(hours: i64) -> Self {
+        Self { months: 0, days: 0, microseconds: hours * 3_600_000_000 }
+    }
+
+    pub fn from_minutes(mins: i64) -> Self {
+        Self { months: 0, days: 0, microseconds: mins * 60_000_000 }
+    }
+
+    pub fn from_seconds(secs: i64) -> Self {
+        Self { months: 0, days: 0, microseconds: secs * 1_000_000 }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        let mut months = 0i32;
+        let mut days = 0i32;
+        let mut microseconds = 0i64;
+
+        let parts: Vec<&str> = s.split_whitespace().collect();
+        let mut i = 0;
+        while i < parts.len() {
+            let part = parts[i];
+            if part.contains(':') {
+                let time_parts: Vec<&str> = part.split(':').collect();
+                if time_parts.len() >= 2 {
+                    let h: i64 = time_parts[0].parse().ok()?;
+                    let m: i64 = time_parts[1].parse().ok()?;
+                    let s_f: f64 = if time_parts.len() >= 3 { time_parts[2].parse().ok()? } else { 0.0 };
+                    microseconds += h * 3_600_000_000 + m * 60_000_000 + (s_f * 1_000_000.0) as i64;
+                    i += 1;
+                    continue;
+                }
+            }
+
+            if let Ok(num) = part.parse::<f64>() {
+                if i + 1 < parts.len() {
+                    let unit = parts[i + 1].to_lowercase();
+                    let unit = unit.trim_end_matches('s');
+                    match unit {
+                        "year" => months += (num * 12.0) as i32,
+                        "month" => months += num as i32,
+                        "week" => days += (num * 7.0) as i32,
+                        "day" => days += num as i32,
+                        "hour" => microseconds += (num * 3_600_000_000.0) as i64,
+                        "minute" => microseconds += (num * 60_000_000.0) as i64,
+                        "second" => microseconds += (num * 1_000_000.0) as i64,
+                        "millisecond" | "msec" => microseconds += (num * 1_000.0) as i64,
+                        "microsecond" | "usec" => microseconds += num as i64,
+                        _ => return None,
+                    }
+                    i += 2;
+                    continue;
+                }
+            }
+            return None;
+        }
+
+        Some(Self { months, days, microseconds })
+    }
+}
+
+impl std::fmt::Display for IntervalValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut parts = Vec::new();
+        let years = self.months / 12;
+        let months = self.months % 12;
+        if years != 0 {
+            parts.push(format!("{} year{}", years, if years.abs() > 1 { "s" } else { "" }));
+        }
+        if months != 0 {
+            parts.push(format!("{} mon{}", months, if months.abs() > 1 { "s" } else { "" }));
+        }
+        if self.days != 0 {
+            parts.push(format!("{} day{}", self.days, if self.days.abs() > 1 { "s" } else { "" }));
+        }
+        if self.microseconds != 0 || parts.is_empty() {
+            let total_secs = self.microseconds as f64 / 1_000_000.0;
+            let secs = (total_secs.abs() % 60.0) as u64;
+            let mins = ((total_secs.abs() / 60.0) as u64) % 60;
+            let hours = (total_secs.abs() / 3600.0) as u64;
+            let sign = if self.microseconds < 0 { "-" } else { "" };
+            parts.push(format!("{}{:02}:{:02}:{:02}", sign, hours, mins, secs));
+        }
+        write!(f, "{}", parts.join(" "))
+    }
 }
 
 impl Value {
@@ -55,6 +159,7 @@ impl Value {
                 let inner = items.first().and_then(|v| v.data_type()).unwrap_or(DataType::Integer);
                 Some(DataType::Array(Box::new(inner)))
             }
+            Value::Interval(_) => Some(DataType::Interval),
         }
     }
 
@@ -98,6 +203,7 @@ impl Value {
             Value::SmallInt(n) => Some(*n as f64),
             Value::Integer(n) => Some(*n as f64),
             Value::BigInt(n) => Some(*n as f64),
+            Value::String(s) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -111,7 +217,31 @@ impl Value {
             Value::Decimal(d) => d.to_i64(),
             Value::Float(f) => Some(*f as i64),
             Value::Double(d) => Some(*d as i64),
+            Value::String(s) => s.trim().parse::<i64>().ok(),
             _ => None,
+        }
+    }
+
+    pub fn to_sql_literal(&self) -> String {
+        match self {
+            Value::Null => "NULL".to_string(),
+            Value::Boolean(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+            Value::TinyInt(n) => n.to_string(),
+            Value::SmallInt(n) => n.to_string(),
+            Value::Integer(n) => n.to_string(),
+            Value::BigInt(n) => n.to_string(),
+            Value::Float(f) => f.to_string(),
+            Value::Double(d) => d.to_string(),
+            Value::Decimal(d) => d.to_string(),
+            Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+            Value::Bytes(b) => format!("'{}'", String::from_utf8_lossy(b).replace('\'', "''")),
+            Value::Date(d) => format!("DATE '{}'", d.format("%Y-%m-%d")),
+            Value::Time(t) => format!("TIME '{}'", t.format("%H:%M:%S")),
+            Value::Timestamp(ts) => format!("TIMESTAMP '{}'", ts.format("%Y-%m-%d %H:%M:%S")),
+            Value::Uuid(u) => format!("'{}'", u),
+            Value::Json(j) => format!("'{}'", j.to_string().replace('\'', "''")),
+            Value::Interval(inv) => format!("INTERVAL '{}'", inv),
+            Value::Array(arr) => format!("ARRAY[{}]", arr.iter().map(|v| v.to_sql_literal()).collect::<Vec<_>>().join(", ")),
         }
     }
 
@@ -179,6 +309,11 @@ impl Value {
             DataType::Boolean => {
                 match self {
                     Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    Value::String(s) => match s.trim().to_uppercase().as_str() {
+                        "TRUE" | "1" | "T" | "YES" => Ok(Value::Boolean(true)),
+                        "FALSE" | "0" | "F" | "NO" => Ok(Value::Boolean(false)),
+                        _ => Err(H2Error::TypeError(format!("Cannot cast '{}' to BOOLEAN", s))),
+                    },
                     _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to BOOLEAN", self))),
                 }
             }
@@ -242,6 +377,17 @@ impl Value {
                     }
                 }
                 _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to UUID", self))),
+            },
+            DataType::Interval => match self {
+                Value::Interval(iv) => Ok(Value::Interval(*iv)),
+                Value::String(s) => {
+                    if let Some(iv) = IntervalValue::parse(s) {
+                        Ok(Value::Interval(iv))
+                    } else {
+                        Err(H2Error::TypeError(format!("Cannot parse '{}' as INTERVAL", s)))
+                    }
+                }
+                _ => Err(H2Error::TypeError(format!("Cannot cast {:?} to INTERVAL", self))),
             },
             _ => Ok(self.clone()),
         }
@@ -352,6 +498,7 @@ impl PartialOrd for Value {
             (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.partial_cmp(b),
             (Value::Array(a), Value::Array(b)) => a.partial_cmp(b),
+            (Value::Interval(a), Value::Interval(b)) => a.partial_cmp(b),
             // Timestamp と String のクロス比較
             (Value::Timestamp(a), Value::String(s)) => {
                 let b = parse_timestamp(s)?;
@@ -435,7 +582,14 @@ impl std::fmt::Display for Value {
                 }
                 write!(f, "]")
             }
+            Value::Interval(iv) => write!(f, "{}", iv),
         }
+    }
+}
+
+impl From<IntervalValue> for Value {
+    fn from(iv: IntervalValue) -> Self {
+        Value::Interval(iv)
     }
 }
 
@@ -676,6 +830,18 @@ impl FromSql for serde_json::Value {
 impl FromSql for Value {
     fn from_sql(val: &Value) -> H2Result<Self> {
         Ok(val.clone())
+    }
+}
+
+impl FromSql for IntervalValue {
+    fn from_sql(val: &Value) -> H2Result<Self> {
+        match val {
+            Value::Interval(iv) => Ok(*iv),
+            Value::String(s) => IntervalValue::parse(s).ok_or_else(|| {
+                H2Error::TypeError(format!("Invalid interval string '{}'", s))
+            }),
+            _ => Err(H2Error::TypeError(format!("Expected Interval, found {:?}", val))),
+        }
     }
 }
 

@@ -1,9 +1,12 @@
 use rust_decimal::Decimal;
-use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, FunctionArg, FunctionArgExpr, Value as SqlValue};
+use rust_decimal::prelude::ToPrimitive;
+use sqlparser::ast::{BinaryOperator, Expr as SqlExpr, FunctionArg, FunctionArgExpr, Value as SqlValue, TrimWhereField};
 use std::str::FromStr;
+use std::sync::Arc;
+use chrono::Datelike;
 
-use h2_types::{H2Error, H2Result, Value};
-use crate::catalog::TableDef;
+use h2_types::{H2Error, H2Result, Value, IntervalValue};
+use crate::catalog::{Catalog, TableDef};
 use crate::fts::tokenizer::{get_tokenizer, TokenizerKind};
 use crate::row::Row;
 
@@ -18,11 +21,16 @@ pub struct ColumnBinding {
 #[derive(Debug, Clone, Default)]
 pub struct RowContext {
     pub columns: Vec<ColumnBinding>,
+    pub catalog: Option<Arc<Catalog>>,
 }
 
 impl RowContext {
     pub fn new() -> Self {
-        Self { columns: Vec::new() }
+        Self { columns: Vec::new(), catalog: None }
+    }
+
+    pub fn with_catalog(catalog: Arc<Catalog>) -> Self {
+        Self { columns: Vec::new(), catalog: Some(catalog) }
     }
 
     pub fn from_table_def(table: &TableDef, alias: Option<&str>) -> Self {
@@ -32,7 +40,7 @@ impl RowContext {
             column_name: col.name.clone(),
             index: i,
         }).collect();
-        Self { columns }
+        Self { columns, catalog: None }
     }
 
     pub fn append_table(&mut self, table: &TableDef, alias: Option<&str>, base_idx: usize) {
@@ -112,6 +120,17 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
             if idents.len() == 2 {
                 let tbl = &idents[0].value;
                 let col = &idents[1].value;
+                if col.eq_ignore_ascii_case("NEXTVAL") {
+                    if let Some(catalog) = &ctx.catalog {
+                        let next_v = catalog.nextval(tbl)?;
+                        return Ok(Value::BigInt(next_v));
+                    }
+                } else if col.eq_ignore_ascii_case("CURRVAL") {
+                    if let Some(catalog) = &ctx.catalog {
+                        let curr_v = catalog.currval(tbl)?;
+                        return Ok(Value::BigInt(curr_v));
+                    }
+                }
                 let col_idx = ctx.resolve_column(Some(tbl), col).ok_or_else(|| {
                     H2Error::Execution(format!("Column '{}.{}' not found", tbl, col))
                 })?;
@@ -201,6 +220,111 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
             }
             Ok(Value::Array(vals))
         }
+        SqlExpr::Substring { expr, substring_from, substring_for, .. } => {
+            let s_val = evaluate_expr_context(expr, ctx, row)?;
+            let s = match s_val {
+                Value::String(s) => s,
+                Value::Null => return Ok(Value::Null),
+                _ => s_val.to_string(),
+            };
+            let from_val = if let Some(f) = substring_from {
+                evaluate_expr_context(f, ctx, row)?
+            } else {
+                Value::Integer(1)
+            };
+            let for_val = if let Some(l) = substring_for {
+                Some(evaluate_expr_context(l, ctx, row)?)
+            } else {
+                None
+            };
+            substring_impl(&s, &from_val, for_val.as_ref())
+        }
+        SqlExpr::Trim { expr, trim_where, trim_what, .. } => {
+            let s_val = evaluate_expr_context(expr, ctx, row)?;
+            let s = match s_val {
+                Value::String(s) => s,
+                Value::Null => return Ok(Value::Null),
+                _ => s_val.to_string(),
+            };
+            let chars = if let Some(w) = trim_what {
+                let what_val = evaluate_expr_context(w, ctx, row)?;
+                match what_val {
+                    Value::String(cs) => cs,
+                    _ => " ".to_string(),
+                }
+            } else {
+                " ".to_string()
+            };
+            let trimmed = match trim_where {
+                Some(TrimWhereField::Leading) => s.trim_start_matches(|c| chars.contains(c)).to_string(),
+                Some(TrimWhereField::Trailing) => s.trim_end_matches(|c| chars.contains(c)).to_string(),
+                _ => s.trim_matches(|c| chars.contains(c)).to_string(),
+            };
+            Ok(Value::String(trimmed))
+        }
+        SqlExpr::Extract { field, expr, .. } => {
+            let val = evaluate_expr_context(expr, ctx, row)?;
+            extract_field(&val, &field.to_string())
+        }
+        SqlExpr::Interval(interval) => {
+            let base_val = evaluate_expr_context(&interval.value, ctx, row)?;
+            let s = match &base_val {
+                Value::String(s) => s.clone(),
+                Value::Integer(i) => {
+                    if let Some(ref field) = interval.leading_field {
+                        format!("{} {:?}", i, field)
+                    } else {
+                        format!("{} second", i)
+                    }
+                }
+                _ => base_val.to_string(),
+            };
+            let interval_str = if let Some(ref field) = interval.leading_field {
+                if s.split_whitespace().count() == 1 {
+                    format!("{} {:?}", s, field)
+                } else {
+                    s
+                }
+            } else {
+                s
+            };
+            if let Some(iv) = IntervalValue::parse(&interval_str) {
+                Ok(Value::Interval(iv))
+            } else {
+                Err(H2Error::Execution(format!("Invalid INTERVAL literal: '{}'", interval_str)))
+            }
+        }
+        SqlExpr::Cast { expr, data_type, .. } => {
+            let val = evaluate_expr_context(expr, ctx, row)?;
+            let target_type = crate::parser::convert_data_type(data_type)?;
+            val.cast_to(&target_type)
+        }
+        SqlExpr::TypedString { data_type, value } => {
+            let target_type = crate::parser::convert_data_type(data_type)?;
+            Value::String(value.clone()).cast_to(&target_type)
+        }
+        SqlExpr::Ceil { expr, .. } => {
+            let v = evaluate_expr_context(expr, ctx, row)?;
+            match v {
+                Value::Integer(i) => Ok(Value::Integer(i)),
+                Value::BigInt(i) => Ok(Value::BigInt(i)),
+                Value::Float(f) => Ok(Value::Float(f.ceil())),
+                Value::Double(d) => Ok(Value::Double(d.ceil())),
+                Value::Decimal(d) => Ok(Value::Decimal(d.ceil())),
+                _ => Err(H2Error::TypeError("CEIL requires numeric argument".to_string())),
+            }
+        }
+        SqlExpr::Floor { expr, .. } => {
+            let v = evaluate_expr_context(expr, ctx, row)?;
+            match v {
+                Value::Integer(i) => Ok(Value::Integer(i)),
+                Value::BigInt(i) => Ok(Value::BigInt(i)),
+                Value::Float(f) => Ok(Value::Float(f.floor())),
+                Value::Double(d) => Ok(Value::Double(d.floor())),
+                Value::Decimal(d) => Ok(Value::Decimal(d.floor())),
+                _ => Err(H2Error::TypeError("FLOOR requires numeric argument".to_string())),
+            }
+        }
         // スカラ関数
         SqlExpr::Function(func) => {
             let func_name = func.name.to_string().to_uppercase();
@@ -230,7 +354,6 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                         let query_tokens = tokenizer.tokenize(query);
                         let doc_tokens = tokenizer.tokenize(text);
 
-                        // クエリの全トークンがドキュメントに含まれているか (AND判定)
                         let matched = !query_tokens.is_empty()
                             && query_tokens.iter().all(|q_tok| doc_tokens.contains(q_tok));
                         Ok(Value::Boolean(matched))
@@ -323,6 +446,524 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
             } else if func_name == "NOW" || func_name == "CURRENT_TIMESTAMP" {
                 let now = chrono::Utc::now().to_rfc3339();
                 Ok(Value::String(now))
+            } else if func_name == "CURRENT_DATE" {
+                Ok(Value::Date(chrono::Utc::now().date_naive()))
+            } else if func_name == "CURRENT_TIME" {
+                Ok(Value::Time(chrono::Utc::now().time()))
+            // ================= 高度な数学関数 =================
+            } else if func_name == "SIN" || func_name == "COS" || func_name == "TAN"
+                || func_name == "ASIN" || func_name == "ACOS" || func_name == "ATAN" {
+                if args.is_empty() { return Err(H2Error::Execution(format!("{} requires 1 argument", func_name))); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                if v.is_null() { return Ok(Value::Null); }
+                let f = v.to_f64().ok_or_else(|| H2Error::TypeError(format!("{} requires numeric argument", func_name)))?;
+                let res = match func_name.as_str() {
+                    "SIN" => f.sin(),
+                    "COS" => f.cos(),
+                    "TAN" => f.tan(),
+                    "ASIN" => f.asin(),
+                    "ACOS" => f.acos(),
+                    "ATAN" => f.atan(),
+                    _ => unreachable!(),
+                };
+                Ok(Value::Double(res))
+            } else if func_name == "ATAN2" {
+                if args.len() < 2 { return Err(H2Error::Execution("ATAN2 requires 2 arguments".to_string())); }
+                let y = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("ATAN2 requires numeric argument".to_string()))?;
+                let x = evaluate_func_arg_context(&args[1], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("ATAN2 requires numeric argument".to_string()))?;
+                Ok(Value::Double(y.atan2(x)))
+            } else if func_name == "DEGREES" {
+                if args.is_empty() { return Err(H2Error::Execution("DEGREES requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("DEGREES requires numeric argument".to_string()))?;
+                Ok(Value::Double(f.to_degrees()))
+            } else if func_name == "RADIANS" {
+                if args.is_empty() { return Err(H2Error::Execution("RADIANS requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("RADIANS requires numeric argument".to_string()))?;
+                Ok(Value::Double(f.to_radians()))
+            } else if func_name == "PI" {
+                Ok(Value::Double(std::f64::consts::PI))
+            } else if func_name == "EXP" {
+                if args.is_empty() { return Err(H2Error::Execution("EXP requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("EXP requires numeric argument".to_string()))?;
+                Ok(Value::Double(f.exp()))
+            } else if func_name == "LN" {
+                if args.is_empty() { return Err(H2Error::Execution("LN requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("LN requires numeric argument".to_string()))?;
+                if f <= 0.0 { return Err(H2Error::Execution("LN argument must be positive".to_string())); }
+                Ok(Value::Double(f.ln()))
+            } else if func_name == "LOG" || func_name == "LOG10" {
+                if args.is_empty() { return Err(H2Error::Execution(format!("{} requires at least 1 argument", func_name))); }
+                if func_name == "LOG10" || args.len() == 1 {
+                    let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("LOG requires numeric argument".to_string()))?;
+                    if f <= 0.0 { return Err(H2Error::Execution("LOG argument must be positive".to_string())); }
+                    if func_name == "LOG10" {
+                        Ok(Value::Double(f.log10()))
+                    } else {
+                        Ok(Value::Double(f.ln()))
+                    }
+                } else {
+                    let b = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("LOG requires numeric argument".to_string()))?;
+                    let x = evaluate_func_arg_context(&args[1], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("LOG requires numeric argument".to_string()))?;
+                    if b <= 0.0 || b == 1.0 || x <= 0.0 { return Err(H2Error::Execution("Invalid base or argument for LOG".to_string())); }
+                    Ok(Value::Double(x.log(b)))
+                }
+            } else if func_name == "SQRT" {
+                if args.is_empty() { return Err(H2Error::Execution("SQRT requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("SQRT requires numeric argument".to_string()))?;
+                if f < 0.0 { return Err(H2Error::Execution("Cannot take SQRT of negative number".to_string())); }
+                Ok(Value::Double(f.sqrt()))
+            } else if func_name == "POWER" || func_name == "POW" {
+                if args.len() < 2 { return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name))); }
+                let x = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("POWER requires numeric argument".to_string()))?;
+                let y = evaluate_func_arg_context(&args[1], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("POWER requires numeric argument".to_string()))?;
+                Ok(Value::Double(x.powf(y)))
+            } else if func_name == "CEIL" || func_name == "CEILING" {
+                if args.is_empty() { return Err(H2Error::Execution("CEIL requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::Integer(i) => Ok(Value::Integer(i)),
+                    Value::BigInt(i) => Ok(Value::BigInt(i)),
+                    Value::Float(f) => Ok(Value::Float(f.ceil())),
+                    Value::Double(d) => Ok(Value::Double(d.ceil())),
+                    Value::Decimal(d) => Ok(Value::Decimal(d.ceil())),
+                    _ => Err(H2Error::TypeError("CEIL requires numeric argument".to_string())),
+                }
+            } else if func_name == "FLOOR" {
+                if args.is_empty() { return Err(H2Error::Execution("FLOOR requires 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match v {
+                    Value::Integer(i) => Ok(Value::Integer(i)),
+                    Value::BigInt(i) => Ok(Value::BigInt(i)),
+                    Value::Float(f) => Ok(Value::Float(f.floor())),
+                    Value::Double(d) => Ok(Value::Double(d.floor())),
+                    Value::Decimal(d) => Ok(Value::Decimal(d.floor())),
+                    _ => Err(H2Error::TypeError("FLOOR requires numeric argument".to_string())),
+                }
+            } else if func_name == "ROUND" {
+                if args.is_empty() { return Err(H2Error::Execution("ROUND requires at least 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let digits = if args.len() >= 2 {
+                    evaluate_func_arg_context(&args[1], ctx, row)?.to_i64().unwrap_or(0) as u32
+                } else {
+                    0
+                };
+                if v.is_null() { return Ok(Value::Null); }
+                if let Some(mut d) = v.to_decimal() {
+                    d = d.round_dp(digits);
+                    if digits == 0 {
+                        if let Some(i) = d.to_i64() {
+                            if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                                return Ok(Value::Integer(i as i32));
+                            }
+                            return Ok(Value::BigInt(i));
+                        }
+                    }
+                    Ok(Value::Decimal(d))
+                } else if let Some(f) = v.to_f64() {
+                    let factor = 10f64.powi(digits as i32);
+                    Ok(Value::Double((f * factor).round() / factor))
+                } else {
+                    Err(H2Error::TypeError("ROUND requires numeric argument".to_string()))
+                }
+            } else if func_name == "TRUNC" || func_name == "TRUNCATE" {
+                if args.is_empty() { return Err(H2Error::Execution("TRUNC requires at least 1 argument".to_string())); }
+                let v = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let digits = if args.len() >= 2 {
+                    evaluate_func_arg_context(&args[1], ctx, row)?.to_i64().unwrap_or(0) as u32
+                } else {
+                    0
+                };
+                if v.is_null() { return Ok(Value::Null); }
+                if let Some(mut d) = v.to_decimal() {
+                    d = d.trunc_with_scale(digits);
+                    if digits == 0 {
+                        if let Some(i) = d.to_i64() {
+                            if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                                return Ok(Value::Integer(i as i32));
+                            }
+                            return Ok(Value::BigInt(i));
+                        }
+                    }
+                    Ok(Value::Decimal(d))
+                } else if let Some(f) = v.to_f64() {
+                    let factor = 10f64.powi(digits as i32);
+                    Ok(Value::Double((f * factor).trunc() / factor))
+                } else {
+                    Err(H2Error::TypeError("TRUNC requires numeric argument".to_string()))
+                }
+            } else if func_name == "SIGN" {
+                if args.is_empty() { return Err(H2Error::Execution("SIGN requires 1 argument".to_string())); }
+                let f = evaluate_func_arg_context(&args[0], ctx, row)?.to_f64().ok_or_else(|| H2Error::TypeError("SIGN requires numeric argument".to_string()))?;
+                let s = if f > 0.0 { 1 } else if f < 0.0 { -1 } else { 0 };
+                Ok(Value::Integer(s))
+            } else if func_name == "MOD" {
+                if args.len() < 2 { return Err(H2Error::Execution("MOD requires 2 arguments".to_string())); }
+                let a = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let b = evaluate_func_arg_context(&args[1], ctx, row)?;
+                evaluate_arithmetic_op(&a, &BinaryOperator::Modulo, &b)
+            // ================= 高度な文字列関数 =================
+            } else if func_name == "SUBSTR" || func_name == "SUBSTRING" {
+                if args.len() < 2 { return Err(H2Error::Execution("SUBSTRING requires at least 2 arguments".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let from = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let len = if args.len() >= 3 { Some(evaluate_func_arg_context(&args[2], ctx, row)?) } else { None };
+                match s {
+                    Value::String(str_val) => substring_impl(&str_val, &from, len.as_ref()),
+                    Value::Null => Ok(Value::Null),
+                    _ => substring_impl(&s.to_string(), &from, len.as_ref()),
+                }
+            } else if func_name == "TRIM" || func_name == "LTRIM" || func_name == "RTRIM" || func_name == "BTRIM" {
+                if args.is_empty() { return Err(H2Error::Execution(format!("{} requires at least 1 argument", func_name))); }
+                let s_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let s = match s_val {
+                    Value::String(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    _ => s_val.to_string(),
+                };
+                let chars = if args.len() >= 2 {
+                    match evaluate_func_arg_context(&args[1], ctx, row)? {
+                        Value::String(c) => c,
+                        _ => " ".to_string(),
+                    }
+                } else {
+                    " ".to_string()
+                };
+                let trimmed = match func_name.as_str() {
+                    "LTRIM" => s.trim_start_matches(|c| chars.contains(c)).to_string(),
+                    "RTRIM" => s.trim_end_matches(|c| chars.contains(c)).to_string(),
+                    _ => s.trim_matches(|c| chars.contains(c)).to_string(),
+                };
+                Ok(Value::String(trimmed))
+            } else if func_name == "REPLACE" {
+                if args.len() < 3 { return Err(H2Error::Execution("REPLACE requires 3 arguments".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let from = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let to = evaluate_func_arg_context(&args[2], ctx, row)?;
+                match (s, from, to) {
+                    (Value::String(s), Value::String(f), Value::String(t)) => Ok(Value::String(s.replace(&f, &t))),
+                    _ => Ok(Value::Null),
+                }
+            } else if func_name == "LPAD" || func_name == "RPAD" {
+                if args.len() < 2 { return Err(H2Error::Execution(format!("{} requires at least 2 arguments", func_name))); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let len = evaluate_func_arg_context(&args[1], ctx, row)?.to_i64().unwrap_or(0) as usize;
+                let pad = if args.len() >= 3 {
+                    match evaluate_func_arg_context(&args[2], ctx, row)? {
+                        Value::String(p) => p,
+                        _ => " ".to_string(),
+                    }
+                } else {
+                    " ".to_string()
+                };
+                let s_str = match s { Value::String(s) => s, Value::Null => return Ok(Value::Null), v => v.to_string() };
+                let char_count = s_str.chars().count();
+                if char_count >= len {
+                    let truncated: String = s_str.chars().take(len).collect();
+                    Ok(Value::String(truncated))
+                } else {
+                    let diff = len - char_count;
+                    let pad_repeated: String = pad.chars().cycle().take(diff).collect();
+                    if func_name == "LPAD" {
+                        Ok(Value::String(format!("{}{}", pad_repeated, s_str)))
+                    } else {
+                        Ok(Value::String(format!("{}{}", s_str, pad_repeated)))
+                    }
+                }
+            } else if func_name == "INITCAP" {
+                if args.is_empty() { return Err(H2Error::Execution("INITCAP requires 1 argument".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match s {
+                    Value::String(s) => Ok(Value::String(initcap(&s))),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::String(initcap(&s.to_string()))),
+                }
+            } else if func_name == "REVERSE" {
+                if args.is_empty() { return Err(H2Error::Execution("REVERSE requires 1 argument".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match s {
+                    Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::String(s.to_string().chars().rev().collect())),
+                }
+            } else if func_name == "REPEAT" {
+                if args.len() < 2 { return Err(H2Error::Execution("REPEAT requires 2 arguments".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let n = evaluate_func_arg_context(&args[1], ctx, row)?.to_i64().unwrap_or(0);
+                if n <= 0 { return Ok(Value::String(String::new())); }
+                match s {
+                    Value::String(s) => Ok(Value::String(s.repeat(n as usize))),
+                    Value::Null => Ok(Value::Null),
+                    _ => Ok(Value::String(s.to_string().repeat(n as usize))),
+                }
+            } else if func_name == "TRANSLATE" {
+                if args.len() < 3 { return Err(H2Error::Execution("TRANSLATE requires 3 arguments".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let from = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let to = evaluate_func_arg_context(&args[2], ctx, row)?;
+                match (s, from, to) {
+                    (Value::String(s), Value::String(f), Value::String(t)) => Ok(Value::String(translate(&s, &f, &t))),
+                    _ => Ok(Value::Null),
+                }
+            } else if func_name == "SPLIT_PART" {
+                if args.len() < 3 { return Err(H2Error::Execution("SPLIT_PART requires 3 arguments".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let delim = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let part = evaluate_func_arg_context(&args[2], ctx, row)?.to_i64().unwrap_or(1);
+                match (s, delim) {
+                    (Value::String(s), Value::String(d)) => {
+                        if part <= 0 { return Ok(Value::String(String::new())); }
+                        let idx = (part - 1) as usize;
+                        let parts: Vec<&str> = s.split(&d).collect();
+                        if idx < parts.len() {
+                            Ok(Value::String(parts[idx].to_string()))
+                        } else {
+                            Ok(Value::String(String::new()))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            } else if func_name == "LEFT" || func_name == "RIGHT" {
+                if args.len() < 2 { return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name))); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let n = evaluate_func_arg_context(&args[1], ctx, row)?.to_i64().unwrap_or(0);
+                let s_str = match s { Value::String(s) => s, Value::Null => return Ok(Value::Null), v => v.to_string() };
+                let chars: Vec<char> = s_str.chars().collect();
+                if n <= 0 { return Ok(Value::String(String::new())); }
+                let n_usize = n as usize;
+                if func_name == "LEFT" {
+                    let res: String = chars.into_iter().take(n_usize).collect();
+                    Ok(Value::String(res))
+                } else {
+                    let skip = if chars.len() > n_usize { chars.len() - n_usize } else { 0 };
+                    let res: String = chars.into_iter().skip(skip).collect();
+                    Ok(Value::String(res))
+                }
+            } else if func_name == "CHR" {
+                if args.is_empty() { return Err(H2Error::Execution("CHR requires 1 argument".to_string())); }
+                let code = evaluate_func_arg_context(&args[0], ctx, row)?.to_i64().unwrap_or(0) as u32;
+                let c = char::from_u32(code).unwrap_or('\0');
+                Ok(Value::String(c.to_string()))
+            } else if func_name == "ASCII" {
+                if args.is_empty() { return Err(H2Error::Execution("ASCII requires 1 argument".to_string())); }
+                let s = evaluate_func_arg_context(&args[0], ctx, row)?;
+                match s {
+                    Value::String(s) => {
+                        if let Some(c) = s.chars().next() {
+                            Ok(Value::Integer(c as i32))
+                        } else {
+                            Ok(Value::Integer(0))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            // ================= 正規表現関数 =================
+            } else if func_name == "REGEXP_LIKE" {
+                if args.len() < 2 { return Err(H2Error::Execution("REGEXP_LIKE requires at least 2 arguments".to_string())); }
+                let text = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let pat = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let case_insensitive = if args.len() >= 3 {
+                    match evaluate_func_arg_context(&args[2], ctx, row)? {
+                        Value::String(flags) => flags.contains('i'),
+                        _ => false,
+                    }
+                } else {
+                    false
+                };
+                match (text, pat) {
+                    (Value::String(t), Value::String(p)) => regex_match(&p, &t, case_insensitive).map(Value::Boolean),
+                    _ => Ok(Value::Null),
+                }
+            } else if func_name == "REGEXP_REPLACE" {
+                if args.len() < 3 { return Err(H2Error::Execution("REGEXP_REPLACE requires at least 3 arguments".to_string())); }
+                let text = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let pat = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let rep = evaluate_func_arg_context(&args[2], ctx, row)?;
+                let flags = if args.len() >= 4 {
+                    match evaluate_func_arg_context(&args[3], ctx, row)? {
+                        Value::String(f) => f,
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                match (text, pat, rep) {
+                    (Value::String(t), Value::String(p), Value::String(r)) => {
+                        let mut builder = regex::RegexBuilder::new(&p);
+                        builder.case_insensitive(flags.contains('i'));
+                        let re = builder.build().map_err(|e| H2Error::Execution(format!("Invalid regex '{}': {}", p, e)))?;
+                        if flags.contains('g') {
+                            Ok(Value::String(re.replace_all(&t, r.as_str()).to_string()))
+                        } else {
+                            Ok(Value::String(re.replace(&t, r.as_str()).to_string()))
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            } else if func_name == "REGEXP_SUBSTR" {
+                if args.len() < 2 { return Err(H2Error::Execution("REGEXP_SUBSTR requires 2 arguments".to_string())); }
+                let text = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let pat = evaluate_func_arg_context(&args[1], ctx, row)?;
+                match (text, pat) {
+                    (Value::String(t), Value::String(p)) => {
+                        let re = regex::Regex::new(&p).map_err(|e| H2Error::Execution(format!("Invalid regex '{}': {}", p, e)))?;
+                        if let Some(m) = re.find(&t) {
+                            Ok(Value::String(m.as_str().to_string()))
+                        } else {
+                            Ok(Value::Null)
+                        }
+                    }
+                    _ => Ok(Value::Null),
+                }
+            // ================= 日付計算関数 =================
+            } else if func_name == "DATE_ADD" || func_name == "DATE_SUB" {
+                if args.len() < 2 { return Err(H2Error::Execution(format!("{} requires 2 arguments", func_name))); }
+                let d = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let iv_val = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let iv = match iv_val {
+                    Value::Interval(iv) => iv,
+                    Value::String(s) => IntervalValue::parse(&s).ok_or_else(|| H2Error::TypeError(format!("Invalid INTERVAL string '{}'", s)))?,
+                    _ => return Err(H2Error::TypeError("Second argument must be INTERVAL".to_string())),
+                };
+                let op = if func_name == "DATE_ADD" { BinaryOperator::Plus } else { BinaryOperator::Minus };
+                evaluate_arithmetic_op(&d, &op, &Value::Interval(iv))
+            } else if func_name == "DATEDIFF" {
+                if args.len() < 2 { return Err(H2Error::Execution("DATEDIFF requires at least 2 arguments".to_string())); }
+                let (unit, d1_arg, d2_arg) = if args.len() >= 3 {
+                    let u = match evaluate_func_arg_context(&args[0], ctx, row)? {
+                        Value::String(s) => s.to_uppercase(),
+                        _ => "DAY".to_string(),
+                    };
+                    (u, &args[1], &args[2])
+                } else {
+                    ("DAY".to_string(), &args[0], &args[1])
+                };
+                let d1 = evaluate_func_arg_context(d1_arg, ctx, row)?;
+                let d2 = evaluate_func_arg_context(d2_arg, ctx, row)?;
+                let diff = evaluate_arithmetic_op(&d1, &BinaryOperator::Minus, &d2)?;
+                match diff {
+                    Value::Interval(iv) => match unit.as_str() {
+                        "YEAR" | "YEARS" => Ok(Value::Integer(iv.months / 12)),
+                        "MONTH" | "MONTHS" => Ok(Value::Integer(iv.months)),
+                        "DAY" | "DAYS" => Ok(Value::Integer(iv.days)),
+                        "HOUR" | "HOURS" => Ok(Value::Integer((iv.microseconds / 3_600_000_000) as i32)),
+                        "MINUTE" | "MINUTES" => Ok(Value::Integer((iv.microseconds / 60_000_000) as i32)),
+                        "SECOND" | "SECONDS" => Ok(Value::Integer((iv.microseconds / 1_000_000) as i32)),
+                        _ => Ok(Value::Integer(iv.days)),
+                    },
+                    _ => Err(H2Error::Execution("Cannot compute DATEDIFF".to_string())),
+                }
+            } else if func_name == "DATE_PART" {
+                if args.len() < 2 { return Err(H2Error::Execution("DATE_PART requires 2 arguments".to_string())); }
+                let unit = match evaluate_func_arg_context(&args[0], ctx, row)? {
+                    Value::String(s) => s,
+                    _ => return Err(H2Error::TypeError("First argument to DATE_PART must be string".to_string())),
+                };
+                let target = evaluate_func_arg_context(&args[1], ctx, row)?;
+                extract_field(&target, &unit)
+            } else if func_name == "DATE_TRUNC" {
+                if args.len() < 2 { return Err(H2Error::Execution("DATE_TRUNC requires 2 arguments".to_string())); }
+                let unit = match evaluate_func_arg_context(&args[0], ctx, row)? {
+                    Value::String(s) => s.to_uppercase(),
+                    _ => return Err(H2Error::TypeError("First argument to DATE_TRUNC must be string".to_string())),
+                };
+                let target = evaluate_func_arg_context(&args[1], ctx, row)?;
+                match target {
+                    Value::Date(d) => match unit.as_str() {
+                        "YEAR" => Ok(Value::Date(chrono::NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap())),
+                        "MONTH" => Ok(Value::Date(chrono::NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap())),
+                        "DAY" => Ok(Value::Date(d)),
+                        _ => Ok(Value::Date(d)),
+                    },
+                    Value::Timestamp(ts) => {
+                        use chrono::Timelike;
+                        let d = ts.date_naive();
+                        match unit.as_str() {
+                            "YEAR" => {
+                                let nd = chrono::NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap();
+                                let nt = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+                                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(chrono::NaiveDateTime::new(nd, nt), chrono::Utc)))
+                            }
+                            "MONTH" => {
+                                let nd = chrono::NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap();
+                                let nt = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+                                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(chrono::NaiveDateTime::new(nd, nt), chrono::Utc)))
+                            }
+                            "DAY" => {
+                                let nt = chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+                                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(chrono::NaiveDateTime::new(d, nt), chrono::Utc)))
+                            }
+                            "HOUR" => {
+                                let nt = chrono::NaiveTime::from_hms_opt(ts.hour(), 0, 0).unwrap();
+                                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(chrono::NaiveDateTime::new(d, nt), chrono::Utc)))
+                            }
+                            "MINUTE" => {
+                                let nt = chrono::NaiveTime::from_hms_opt(ts.hour(), ts.minute(), 0).unwrap();
+                                Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(chrono::NaiveDateTime::new(d, nt), chrono::Utc)))
+                            }
+                            _ => Ok(Value::Timestamp(ts)),
+                        }
+                    }
+                    _ => Ok(target),
+                }
+            } else if func_name == "AGE" {
+                if args.is_empty() { return Err(H2Error::Execution("AGE requires at least 1 argument".to_string())); }
+                let t1 = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let t2 = if args.len() >= 2 {
+                    evaluate_func_arg_context(&args[1], ctx, row)?
+                } else {
+                    Value::Timestamp(chrono::Utc::now())
+                };
+                evaluate_arithmetic_op(&t1, &BinaryOperator::Minus, &t2)
+            } else if func_name == "NEXTVAL" {
+                if args.is_empty() { return Err(H2Error::Execution("NEXTVAL requires 1 argument (sequence name)".to_string())); }
+                let seq_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let seq_name = match &seq_val {
+                    Value::String(s) => s.as_str(),
+                    _ => return Err(H2Error::Execution("NEXTVAL argument must be a string".to_string())),
+                };
+                let catalog = ctx.catalog.as_ref().ok_or_else(|| {
+                    H2Error::Execution("Catalog context unavailable for NEXTVAL".to_string())
+                })?;
+                let v = catalog.nextval(seq_name)?;
+                Ok(Value::BigInt(v))
+            } else if func_name == "CURRVAL" {
+                if args.is_empty() { return Err(H2Error::Execution("CURRVAL requires 1 argument (sequence name)".to_string())); }
+                let seq_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let seq_name = match &seq_val {
+                    Value::String(s) => s.as_str(),
+                    _ => return Err(H2Error::Execution("CURRVAL argument must be a string".to_string())),
+                };
+                let catalog = ctx.catalog.as_ref().ok_or_else(|| {
+                    H2Error::Execution("Catalog context unavailable for CURRVAL".to_string())
+                })?;
+                let v = catalog.currval(seq_name)?;
+                Ok(Value::BigInt(v))
+            } else if func_name == "SETVAL" {
+                if args.len() < 2 { return Err(H2Error::Execution("SETVAL requires 2 arguments (sequence name, value)".to_string())); }
+                let seq_val = evaluate_func_arg_context(&args[0], ctx, row)?;
+                let seq_name = match &seq_val {
+                    Value::String(s) => s.as_str(),
+                    _ => return Err(H2Error::Execution("SETVAL argument 1 must be a string".to_string())),
+                };
+                let target_v = evaluate_func_arg_context(&args[1], ctx, row)?;
+                let val_num = match target_v {
+                    Value::Integer(i) => i as i64,
+                    Value::BigInt(i) => i,
+                    _ => return Err(H2Error::Execution("SETVAL argument 2 must be an integer".to_string())),
+                };
+                let is_called = if args.len() >= 3 {
+                    match evaluate_func_arg_context(&args[2], ctx, row)? {
+                        Value::Boolean(b) => b,
+                        _ => true,
+                    }
+                } else {
+                    true
+                };
+                let catalog = ctx.catalog.as_ref().ok_or_else(|| {
+                    H2Error::Execution("Catalog context unavailable for SETVAL".to_string())
+                })?;
+                let v = catalog.setval(seq_name, val_num, is_called)?;
+                Ok(Value::BigInt(v))
             } else {
                 Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
             }
@@ -396,6 +1037,38 @@ pub fn evaluate_literal_or_unary(expr: &SqlExpr) -> H2Result<Value> {
             }
             Ok(Value::Array(vals))
         }
+        SqlExpr::Interval(interval) => {
+            let base_val = evaluate_literal_or_unary(&interval.value)?;
+            let s = match &base_val {
+                Value::String(s) => s.clone(),
+                Value::Integer(i) => {
+                    if let Some(ref field) = interval.leading_field {
+                        format!("{} {:?}", i, field)
+                    } else {
+                        format!("{} second", i)
+                    }
+                }
+                _ => base_val.to_string(),
+            };
+            let interval_str = if let Some(ref field) = interval.leading_field {
+                if s.split_whitespace().count() == 1 {
+                    format!("{} {:?}", s, field)
+                } else {
+                    s
+                }
+            } else {
+                s
+            };
+            if let Some(iv) = IntervalValue::parse(&interval_str) {
+                Ok(Value::Interval(iv))
+            } else {
+                Err(H2Error::Execution(format!("Invalid INTERVAL literal: '{}'", interval_str)))
+            }
+        }
+        SqlExpr::TypedString { data_type, value } => {
+            let target_type = crate::parser::convert_data_type(data_type)?;
+            Value::String(value.clone()).cast_to(&target_type)
+        }
         _ => Err(H2Error::Execution(format!("Unsupported literal or unary expression: {:?}", expr))),
     }
 }
@@ -444,8 +1117,41 @@ pub fn evaluate_binary_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
             };
             Ok(Value::Boolean(l_bool || r_bool))
         }
-        BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide => {
+        BinaryOperator::Plus | BinaryOperator::Minus | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => {
             evaluate_arithmetic_op(left, op, right)
+        }
+        BinaryOperator::StringConcat => {
+            let l_str = match left { Value::String(s) => s.clone(), Value::Null => return Ok(Value::Null), v => v.to_string() };
+            let r_str = match right { Value::String(s) => s.clone(), Value::Null => return Ok(Value::Null), v => v.to_string() };
+            Ok(Value::String(format!("{}{}", l_str, r_str)))
+        }
+        BinaryOperator::PGRegexMatch => {
+            let (l, r) = match (left, right) {
+                (Value::String(l), Value::String(r)) => (l.as_str(), r.as_str()),
+                _ => return Ok(Value::Null),
+            };
+            regex_match(r, l, false).map(Value::Boolean)
+        }
+        BinaryOperator::PGRegexIMatch => {
+            let (l, r) = match (left, right) {
+                (Value::String(l), Value::String(r)) => (l.as_str(), r.as_str()),
+                _ => return Ok(Value::Null),
+            };
+            regex_match(r, l, true).map(Value::Boolean)
+        }
+        BinaryOperator::PGRegexNotMatch => {
+            let (l, r) = match (left, right) {
+                (Value::String(l), Value::String(r)) => (l.as_str(), r.as_str()),
+                _ => return Ok(Value::Null),
+            };
+            regex_match(r, l, false).map(|b| Value::Boolean(!b))
+        }
+        BinaryOperator::PGRegexNotIMatch => {
+            let (l, r) = match (left, right) {
+                (Value::String(l), Value::String(r)) => (l.as_str(), r.as_str()),
+                _ => return Ok(Value::Null),
+            };
+            regex_match(r, l, true).map(|b| Value::Boolean(!b))
         }
         BinaryOperator::Arrow | BinaryOperator::LongArrow => {
             let serde_val = match left {
@@ -498,6 +1204,41 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
         return Ok(Value::Null);
     }
     match (left, right) {
+        // Date / Timestamp + Interval
+        (Value::Date(d), Value::Interval(iv)) if matches!(op, BinaryOperator::Plus) => {
+            Ok(Value::Date(add_interval_to_date(*d, iv)))
+        }
+        (Value::Interval(iv), Value::Date(d)) if matches!(op, BinaryOperator::Plus) => {
+            Ok(Value::Date(add_interval_to_date(*d, iv)))
+        }
+        (Value::Date(d), Value::Interval(iv)) if matches!(op, BinaryOperator::Minus) => {
+            let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
+            Ok(Value::Date(add_interval_to_date(*d, &neg_iv)))
+        }
+        (Value::Timestamp(ts), Value::Interval(iv)) if matches!(op, BinaryOperator::Plus) => {
+            Ok(Value::Timestamp(add_interval_to_datetime(*ts, iv)))
+        }
+        (Value::Interval(iv), Value::Timestamp(ts)) if matches!(op, BinaryOperator::Plus) => {
+            Ok(Value::Timestamp(add_interval_to_datetime(*ts, iv)))
+        }
+        (Value::Timestamp(ts), Value::Interval(iv)) if matches!(op, BinaryOperator::Minus) => {
+            let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
+            Ok(Value::Timestamp(add_interval_to_datetime(*ts, &neg_iv)))
+        }
+        (Value::Interval(a), Value::Interval(b)) => match op {
+            BinaryOperator::Plus => Ok(Value::Interval(IntervalValue::new(a.months + b.months, a.days + b.days, a.microseconds + b.microseconds))),
+            BinaryOperator::Minus => Ok(Value::Interval(IntervalValue::new(a.months - b.months, a.days - b.days, a.microseconds - b.microseconds))),
+            _ => Err(H2Error::TypeError(format!("Cannot apply operator {:?} to INTERVAL", op))),
+        },
+        (Value::Date(d1), Value::Date(d2)) if matches!(op, BinaryOperator::Minus) => {
+            let days = (*d1 - *d2).num_days() as i32;
+            Ok(Value::Interval(IntervalValue::from_days(days)))
+        }
+        (Value::Timestamp(t1), Value::Timestamp(t2)) if matches!(op, BinaryOperator::Minus) => {
+            let micro = (*t1 - *t2).num_microseconds().unwrap_or(0);
+            Ok(Value::Interval(IntervalValue::new(0, 0, micro)))
+        }
+        // 数値演算
         (Value::Integer(l), Value::Integer(r)) => match op {
             BinaryOperator::Plus => Ok(Value::Integer(l.wrapping_add(*r))),
             BinaryOperator::Minus => Ok(Value::Integer(l.wrapping_sub(*r))),
@@ -507,6 +1248,13 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
                     Err(H2Error::Execution("Division by zero".to_string()))
                 } else {
                     Ok(Value::Integer(l / r))
+                }
+            }
+            BinaryOperator::Modulo => {
+                if *r == 0 {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::Integer(l % r))
                 }
             }
             _ => unreachable!(),
@@ -522,6 +1270,13 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
                     Ok(Value::BigInt(l / r))
                 }
             }
+            BinaryOperator::Modulo => {
+                if *r == 0 {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::BigInt(l % r))
+                }
+            }
             _ => unreachable!(),
         },
         (Value::Double(l), Value::Double(r)) => match op {
@@ -529,6 +1284,7 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
             BinaryOperator::Minus => Ok(Value::Double(l - r)),
             BinaryOperator::Multiply => Ok(Value::Double(l * r)),
             BinaryOperator::Divide => Ok(Value::Double(l / r)),
+            BinaryOperator::Modulo => Ok(Value::Double(l % r)),
             _ => unreachable!(),
         },
         (Value::Decimal(l), Value::Decimal(r)) => match op {
@@ -542,16 +1298,32 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
                     Ok(Value::Decimal(*l / *r))
                 }
             }
+            BinaryOperator::Modulo => {
+                if r.is_zero() {
+                    Err(H2Error::Execution("Division by zero".to_string()))
+                } else {
+                    Ok(Value::Decimal(*l % *r))
+                }
+            }
             _ => unreachable!(),
         },
         // 数値の型が混在している場合は i64 / f64 に格上げ
         (l, r) => {
+            if matches!(op, BinaryOperator::Modulo) {
+                if let (Some(li), Some(ri)) = (l.to_i64(), r.to_i64()) {
+                    if ri == 0 {
+                        return Err(H2Error::Execution("Division by zero".to_string()));
+                    }
+                    return Ok(Value::BigInt(li % ri));
+                }
+            }
             if let (Some(lf), Some(rf)) = (l.to_f64(), r.to_f64()) {
                 match op {
                     BinaryOperator::Plus => Ok(Value::Double(lf + rf)),
                     BinaryOperator::Minus => Ok(Value::Double(lf - rf)),
                     BinaryOperator::Multiply => Ok(Value::Double(lf * rf)),
                     BinaryOperator::Divide => Ok(Value::Double(lf / rf)),
+                    BinaryOperator::Modulo => Ok(Value::Double(lf % rf)),
                     _ => unreachable!(),
                 }
             } else {
@@ -605,6 +1377,189 @@ fn json_to_value(j: &serde_json::Value) -> Value {
         serde_json::Value::String(s) => Value::String(s.clone()),
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(j.clone()),
     }
+}
+
+pub fn substring_impl(s: &str, from_val: &Value, for_val: Option<&Value>) -> H2Result<Value> {
+    let from = from_val.to_i64().unwrap_or(1);
+    let chars: Vec<char> = s.chars().collect();
+    let start_idx = if from <= 0 { 0 } else { (from - 1) as usize };
+    if start_idx >= chars.len() {
+        return Ok(Value::String(String::new()));
+    }
+    let sub = if let Some(for_v) = for_val {
+        let len = for_v.to_i64().unwrap_or(0);
+        if len <= 0 {
+            String::new()
+        } else {
+            let end_idx = (start_idx + len as usize).min(chars.len());
+            chars[start_idx..end_idx].iter().collect()
+        }
+    } else {
+        chars[start_idx..].iter().collect()
+    };
+    Ok(Value::String(sub))
+}
+
+pub fn initcap(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut capitalize_next = true;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            if capitalize_next {
+                result.extend(c.to_uppercase());
+                capitalize_next = false;
+            } else {
+                result.extend(c.to_lowercase());
+            }
+        } else {
+            result.push(c);
+            capitalize_next = true;
+        }
+    }
+    result
+}
+
+pub fn translate(s: &str, from: &str, to: &str) -> String {
+    let from_chars: Vec<char> = from.chars().collect();
+    let to_chars: Vec<char> = to.chars().collect();
+    let mut map = std::collections::HashMap::new();
+    let mut delete_set = std::collections::HashSet::new();
+
+    for (i, &fc) in from_chars.iter().enumerate() {
+        if !map.contains_key(&fc) && !delete_set.contains(&fc) {
+            if i < to_chars.len() {
+                map.insert(fc, to_chars[i]);
+            } else {
+                delete_set.insert(fc);
+            }
+        }
+    }
+
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if delete_set.contains(&c) {
+            continue;
+        }
+        if let Some(&rep) = map.get(&c) {
+            out.push(rep);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+pub fn regex_match(pattern: &str, text: &str, case_insensitive: bool) -> H2Result<bool> {
+    let mut builder = regex::RegexBuilder::new(pattern);
+    builder.case_insensitive(case_insensitive);
+    match builder.build() {
+        Ok(re) => Ok(re.is_match(text)),
+        Err(e) => Err(H2Error::Execution(format!("Invalid regex pattern '{}': {}", pattern, e))),
+    }
+}
+
+pub fn extract_field(val: &Value, field: &str) -> H2Result<Value> {
+    use chrono::Timelike;
+    let field = field.to_uppercase();
+    match val {
+        Value::Date(d) => match field.as_str() {
+            "YEAR" => Ok(Value::Integer(d.year())),
+            "MONTH" => Ok(Value::Integer(d.month() as i32)),
+            "DAY" => Ok(Value::Integer(d.day() as i32)),
+            "DOW" => Ok(Value::Integer(d.weekday().num_days_from_sunday() as i32)),
+            "DOY" => Ok(Value::Integer(d.ordinal() as i32)),
+            "EPOCH" => Ok(Value::BigInt(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp())),
+            _ => Err(H2Error::Execution(format!("Cannot extract {} from DATE", field))),
+        },
+        Value::Time(t) => match field.as_str() {
+            "HOUR" => Ok(Value::Integer(t.hour() as i32)),
+            "MINUTE" => Ok(Value::Integer(t.minute() as i32)),
+            "SECOND" => Ok(Value::Integer(t.second() as i32)),
+            _ => Err(H2Error::Execution(format!("Cannot extract {} from TIME", field))),
+        },
+        Value::Timestamp(ts) => match field.as_str() {
+            "YEAR" => Ok(Value::Integer(ts.year())),
+            "MONTH" => Ok(Value::Integer(ts.month() as i32)),
+            "DAY" => Ok(Value::Integer(ts.day() as i32)),
+            "HOUR" => Ok(Value::Integer(ts.hour() as i32)),
+            "MINUTE" => Ok(Value::Integer(ts.minute() as i32)),
+            "SECOND" => Ok(Value::Integer(ts.second() as i32)),
+            "DOW" => Ok(Value::Integer(ts.weekday().num_days_from_sunday() as i32)),
+            "DOY" => Ok(Value::Integer(ts.ordinal() as i32)),
+            "EPOCH" => Ok(Value::BigInt(ts.timestamp())),
+            _ => Err(H2Error::Execution(format!("Cannot extract {} from TIMESTAMP", field))),
+        },
+        Value::String(s) => {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(s) {
+                extract_field(&Value::Timestamp(ts.with_timezone(&chrono::Utc)), &field)
+            } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                extract_field(&Value::Date(d), &field)
+            } else {
+                Err(H2Error::Execution(format!("Cannot extract field from string '{}'", s)))
+            }
+        }
+        Value::Interval(iv) => match field.as_str() {
+            "YEAR" => Ok(Value::Integer(iv.months / 12)),
+            "MONTH" => Ok(Value::Integer(iv.months % 12)),
+            "DAY" => Ok(Value::Integer(iv.days)),
+            "HOUR" => Ok(Value::Integer((iv.microseconds / 3_600_000_000) as i32)),
+            "MINUTE" => Ok(Value::Integer(((iv.microseconds / 60_000_000) % 60) as i32)),
+            "SECOND" => Ok(Value::Integer(((iv.microseconds / 1_000_000) % 60) as i32)),
+            _ => Err(H2Error::Execution(format!("Cannot extract {} from INTERVAL", field))),
+        },
+        Value::Null => Ok(Value::Null),
+        _ => Err(H2Error::Execution(format!("Cannot extract {} from {:?}", field, val))),
+    }
+}
+
+pub fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
+
+pub fn add_interval_to_datetime(dt: chrono::DateTime<chrono::Utc>, iv: &IntervalValue) -> chrono::DateTime<chrono::Utc> {
+    let mut year = dt.year();
+    let mut month = dt.month() as i32 + iv.months;
+    while month > 12 {
+        year += 1;
+        month -= 12;
+    }
+    while month < 1 {
+        year -= 1;
+        month += 12;
+    }
+    let day = dt.day().min(days_in_month(year, month as u32));
+    let naive_date = chrono::NaiveDate::from_ymd_opt(year, month as u32, day).unwrap_or(dt.date_naive());
+    let naive_time = dt.time();
+    let naive_dt = chrono::NaiveDateTime::new(naive_date, naive_time);
+    let dt_utc = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive_dt, chrono::Utc);
+    dt_utc + chrono::Duration::days(iv.days as i64) + chrono::Duration::microseconds(iv.microseconds)
+}
+
+pub fn add_interval_to_date(d: chrono::NaiveDate, iv: &IntervalValue) -> chrono::NaiveDate {
+    let mut year = d.year();
+    let mut month = d.month() as i32 + iv.months;
+    while month > 12 {
+        year += 1;
+        month -= 12;
+    }
+    while month < 1 {
+        year -= 1;
+        month += 12;
+    }
+    let day = d.day().min(days_in_month(year, month as u32));
+    let base = chrono::NaiveDate::from_ymd_opt(year, month as u32, day).unwrap_or(d);
+    base + chrono::Duration::days(iv.days as i64)
 }
 
 

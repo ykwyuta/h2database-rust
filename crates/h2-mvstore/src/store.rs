@@ -185,4 +185,41 @@ impl MVStore {
 
         Ok(())
     }
+
+    pub fn get_map_names(&self) -> Vec<String> {
+        self.maps.read().keys().cloned().collect()
+    }
+
+    /// 全マップのデータをファイルへバックアップ
+    pub fn dump_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<()> {
+        let maps = self.maps.read();
+        let mut backup_data: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
+        for (name, map) in maps.iter() {
+            let entries = map.scan_all().into_iter().map(|e| (e.key, e.value)).collect();
+            backup_data.insert(name.clone(), entries);
+        }
+        let serialized = serde_json::to_vec_pretty(&backup_data)
+            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+        std::fs::write(path, serialized)
+            .map_err(|e| h2_types::H2Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// バックアップファイルから全マップを復元
+    pub fn restore_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<()> {
+        let data = std::fs::read(path)
+            .map_err(|e| h2_types::H2Error::Storage(e.to_string()))?;
+        let backup_data: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> = serde_json::from_slice(&data)
+            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+
+        for (name, entries) in backup_data {
+            let map = self.open_map(&name);
+            map.clear();
+            for (k, v) in entries {
+                map.put(k, v);
+            }
+        }
+        self.commit()?;
+        Ok(())
+    }
 }
