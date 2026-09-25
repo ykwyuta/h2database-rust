@@ -34,6 +34,12 @@ pub enum H2Error {
 
     #[error("Corrupted database file: {0}")]
     Corrupted(String),
+
+    #[error("Read-only transaction: {0}")]
+    ReadOnly(String),
+
+    #[error("Replication error: {0}")]
+    Replication(String),
 }
 
 pub type H2Result<T> = Result<T, H2Error>;

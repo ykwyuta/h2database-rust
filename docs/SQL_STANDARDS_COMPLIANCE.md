@@ -17,6 +17,7 @@
 | **TCL (トランザクション)** | SQL-92 | `BEGIN`, `COMMIT`, `ROLLBACK`, MVCC スナップショット分離, 自動 Undo Log 復元, **デッドロック検出・自動キャンセル (Victim Rollback)**, **クエリ単位実行タイムアウト (`SET statement_timeout`)** | **`SAVEPOINT` (設計方針として実装対象外)**, 動的分離レベル変更 (`SET TRANSACTION ISOLATION LEVEL`) |
 | **関数・演算子** | SQL-92 / 拡張 | **高度な数学関数 (SIN, COS, TAN, LN, LOG, EXP, SQRT, POWER, ROUND, CEIL, FLOOR, TRUNC, MOD, PI等)**, **高度な文字列関数 (SUBSTR, TRIM, REPLACE, LPAD, RPAD, INITCAP, REVERSE, TRANSLATE, SPLIT_PART, `||`等)**, **正規表現演算 (`~`, `~*`, `!~`, `!~*`, `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`)**, **日付計算関数 (`DATE_ADD`, `DATE_SUB`, `DATEDIFF`, `DATE_PART`, `DATE_TRUNC`, `AGE`, `EXTRACT`)**, **シーケンス関数 (`NEXTVAL`, `CURRVAL`, `SETVAL`, Oracle記法)**, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COALESCE`, JSON 演算子 (`->`, `->>`), 日本語全文検索 (`FT_SEARCH`) | ユーザー定義関数(UDF) |
 | **データ管理・保守・カーソル** | SQL-92 / SQL:2003 / 拡張 | **バックアップ・リストア (`BACKUP TO`, `RESTORE FROM`, `SCRIPT TO`, `RUNSCRIPT FROM`)**, **COPY文 (`COPY tbl TO/FROM 'path' [WITH (FORMAT CSV, HEADER, DELIMITER)]`)**, **カーソル (`DECLARE cur CURSOR FOR query`, `FETCH ... FROM cur`, `CLOSE cur`)** | バックグラウンド非同期自動バックアップ |
+| **レプリケーション・高可用性** | PG互換 / 分散同期 | **2インスタンス同期構成 (Primary: Read-Write, Standby: Read-Only)**, **`synchronous_commit = remote_apply` 相当 (スタンバイ適用完了同期待機・ラグゼロ保証)**, **スタンバイ書き込み拒絶 (Read-Only 透過制御)**, **初期スナップショット自動同期** | 非同期レプリケーション、マルチスタンバイ・クォーラム同期 |
 | **メタデータ・診断** | SQL-92 / SQL:2008 / MySQL互換 | `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `SHOW TABLES`, `SHOW COLUMNS`, `EXPLAIN` | `INFORMATION_SCHEMA.VIEWS / CONSTRAINTS`, `EXPLAIN ANALYZE` (実測プロファイリング) |
 
 ---
@@ -358,9 +359,69 @@
 
 ---
 
-## 🚀 9. ロードマップと開発実績
+---
 
-SQL 標準規格、PostgreSQL 互換構文、および Java版 H2 Database の主要機能は**すべて実装・統合テスト完了**しました。
+## 🌐 9. 高可用性・同期レプリケーション (Replication & High Availability: PostgreSQL remote_apply 相当)
+
+本データベースは、**2 つの独立したインスタンスを起動し、1 インスタンスを Read-Write（Primary）、もう 1 インスタンスを Read-Only（Standby）として同期稼働させるレプリケーション構成**をサポートしています。
+
+初期バージョンとして、**PostgreSQL の `synchronous_commit = remote_apply` 相当の同期保証**を完全実装しています。
+
+### アーキテクチャと動作特性
+- **Primary インスタンス (Read-Write)**:
+  - 読み書き（SELECT, INSERT, UPDATE, DELETE, DDL, SEQUENCE, VACUUM 等）をすべて通常通り実行可能。
+  - レプリケーションサーバー（TCP リスナー）を自動起動し、接続してきた Standby と通信。
+  - 各トランザクションのコミット時、変更された全マップ・全キー・値のコミットレコード（`ReplicationCommitRecord`）を Standby へ送信。
+  - **`remote_apply` 同期保証**: Standby が変更を受信し、ローカルストレージ（MVStore）への書き込み・コミット・カタログリロードを完了した通知（`Applied` ACK）を返信するまで、Primary 側のコミット呼び出し元スレッドをブロック待機。
+  - **効果**: クライアントが Primary で `COMMIT` または DML 成功の応答を受け取った瞬間、Standby 側にはすでに 100% 変更が反映・確定しており、**レプリケーションラグ 0・強い一貫性（Read-your-writes 整合性）** を提供。
+- **Standby インスタンス (Read-Only)**:
+  - 読み取り専用インスタンスとして稼働。
+  - `SELECT`, `EXPLAIN`, `SHOW TABLES`, `SHOW COLUMNS` などの読み取り系クエリは高速に実行可能。
+  - 書き込み操作（`INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `ALTER`, `TRUNCATE`, `VACUUM`, `RESTORE`, `RUNSCRIPT` 等）を実行しようとすると、即座に **`H2Error::ReadOnly`** で安全に拒否。
+  - バックグラウンドで Primary に接続し、コミットストリームを受信・適用。
+  - `_catalog` マップに変更が含まれる場合は、インメモリキャッシュ（`Catalog`）を自動的にホットリロードし、スキーマ変更も透過反映。
+- **初期スナップショット自動同期 (Snapshot Sync)**:
+  - Primary にすでにテーブルやデータが存在する状態で Standby が後から起動・接続した場合でも、Primary の全マップの全コミット済みデータを自動ダンプ＆転送し、Standby 側で完全復元・バージョン同期。その後リアルタイム同期へシームレスに移行。
+
+### 使用コード例
+```rust
+use h2::replication::{Instance, InstanceConfig, InstanceRole, SyncReplicationMode};
+
+// 1. Primary (Read-Write) インスタンスを起動
+let primary_config = InstanceConfig {
+    role: InstanceRole::Primary {
+        listen_addr: "127.0.0.1:8765".parse().unwrap(),
+        sync_mode: SyncReplicationMode::RemoteApply,
+        apply_timeout: std::time::Duration::from_secs(10),
+    },
+};
+let primary = Instance::open("path/to/primary.db", primary_config)?;
+let p_conn = primary.connect()?;
+
+// 2. Standby (Read-Only) インスタンスを起動 (Primary へ接続)
+let standby_config = InstanceConfig::standby("127.0.0.1:8765".parse().unwrap());
+let standby = Instance::open("path/to/standby.db", standby_config)?;
+let s_conn = standby.connect()?;
+
+// 3. Primary で書き込み
+p_conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);")?;
+p_conn.execute("INSERT INTO users VALUES (1, 'Alice');")?;
+// ↑ remote_apply のため、INSERT の完了時点で Standby への適用完了が保証される！
+
+// 4. Standby で即座に読み取り可能（ラグゼロ）
+let rows = s_conn.query("SELECT * FROM users;")?;
+assert_eq!(rows.len(), 1);
+
+// 5. Standby で書き込みを試みると拒否される
+let err = s_conn.execute("INSERT INTO users VALUES (2, 'Bob');");
+assert!(matches!(err, Err(h2::H2Error::ReadOnly(_))));
+```
+
+---
+
+## 🚀 10. ロードマップと開発実績
+
+SQL 標準規格、PostgreSQL 互換構文、Java版 H2 Database の主要機能、および **2 インスタンス同期レプリケーション (`remote_apply`)** は**すべて実装・統合テスト完了**しました。
 
 | 状態 | 対象機能 | 分野 | 主な利用用途・効果 |
 | :---: | :--- | :---: | :--- |
@@ -380,4 +441,5 @@ SQL 標準規格、PostgreSQL 互換構文、および Java版 H2 Database の�
 | ✅ **完了** | 時間間隔型 (`INTERVAL`) | 型 | 期間リテラル、日付と期間の柔軟な算術 |
 | ✅ **完了** | シーケンス管理 (`SEQUENCE`, `SERIAL`, `IDENTITY`) | DDL/関数 | 自動採番、連番生成、Oracle/PG構文両対応 |
 | ✅ **完了** | バックアップ・リストア、COPY文 (CSV)、カーソル (`CURSOR`) | 保守/DQL | 物理/論理バックアップ、CSV高速入出力、スクロール行フェッチ |
+| ✅ **完了** | **2インスタンス同期構成 (Read-Write / Read-Only, remote_apply)** | HA/レプリケーション | 高可用性・参照負荷分散・ゼロラグ強整合同期 |
 | ⛔ **対象外** | `SAVEPOINT` (セーブポイント) | TCL | ※高速MVCCとUndo Log簡潔性維持のため設計上対象外 |

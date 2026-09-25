@@ -1,4 +1,4 @@
-use h2::{Connection, Value};
+use h2::Connection;
 
 #[test]
 fn test_advanced_math_functions() {

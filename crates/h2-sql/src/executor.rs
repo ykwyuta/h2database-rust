@@ -137,6 +137,7 @@ pub struct SQLEngine {
     tx_store: Arc<TransactionStore>,
     catalog: Arc<Catalog>,
     cursors: Arc<parking_lot::RwLock<HashMap<String, CursorState>>>,
+    read_only: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl SQLEngine {
@@ -144,12 +145,22 @@ impl SQLEngine {
         let tx_store = TransactionStore::new(Arc::clone(&store));
         let catalog = Arc::new(Catalog::new(Arc::clone(&store))?);
         let cursors = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let read_only = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Ok(Self {
             store,
             tx_store,
             catalog,
             cursors,
+            read_only,
         })
+    }
+
+    pub fn set_read_only(&self, ro: bool) {
+        self.read_only.store(ro, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn store(&self) -> &Arc<MVStore> {
@@ -181,12 +192,25 @@ impl SQLEngine {
     /// 明示的トランザクションコンテキストでSQLを実行
     pub fn execute_with_tx(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
+        let trimmed_upper = trimmed.to_uppercase();
+
+        if self.is_read_only() {
+            if trimmed.eq_ignore_ascii_case("VACUUM")
+                || trimmed_upper.starts_with("RESTORE FROM ")
+                || trimmed_upper.starts_with("RUNSCRIPT FROM ")
+                || trimmed_upper.starts_with("ALTER SEQUENCE")
+            {
+                return Err(H2Error::ReadOnly(
+                    "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
+                ));
+            }
+        }
+
         if trimmed.eq_ignore_ascii_case("VACUUM") {
             self.store.compact()?;
             return Ok(ExecutionResult::Ddl);
         }
 
-        let trimmed_upper = trimmed.to_uppercase();
         if trimmed_upper.starts_with("BACKUP TO ") {
             let path = extract_file_path(&trimmed[10..]);
             self.backup_to(&path)?;
@@ -221,10 +245,31 @@ impl SQLEngine {
         let mut last_result = ExecutionResult::Ddl;
 
         for stmt in statements {
+            if self.is_read_only() && Self::is_write_statement(&stmt) {
+                return Err(H2Error::ReadOnly(
+                    "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
+                ));
+            }
             last_result = self.execute_statement(tx, stmt)?;
         }
 
         Ok(last_result)
+    }
+
+    fn is_write_statement(stmt: &Statement) -> bool {
+        match stmt {
+            Statement::Query(_)
+            | Statement::Explain { .. }
+            | Statement::ShowTables { .. }
+            | Statement::ShowColumns { .. }
+            | Statement::ShowVariable { .. }
+            | Statement::ShowVariables { .. }
+            | Statement::Declare { .. }
+            | Statement::Fetch { .. }
+            | Statement::Close { .. } => false,
+            Statement::Copy { to, .. } => !*to, // COPY ... FROM は書き込み
+            _ => true,
+        }
     }
 
     pub fn backup_to(&self, path: &str) -> H2Result<()> {

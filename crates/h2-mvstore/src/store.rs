@@ -8,6 +8,7 @@ use crate::chunk::ChunkPayload;
 use crate::file_store::FileStore;
 use crate::map::MVMap;
 use crate::page::Page;
+use crate::replication::{MapChangeSink, ReplicationListener};
 use crate::tree::MVTree;
 
 /// MVStore 本体
@@ -16,6 +17,8 @@ pub struct MVStore {
     maps: Arc<RwLock<HashMap<String, MVMap>>>,
     version: Arc<RwLock<u64>>,
     chunk_id_counter: Arc<RwLock<u32>>,
+    change_sink: Arc<RwLock<Option<Arc<dyn MapChangeSink>>>>,
+    replication_listener: Arc<RwLock<Option<Arc<dyn ReplicationListener>>>>,
 }
 
 impl MVStore {
@@ -52,6 +55,8 @@ impl MVStore {
             maps: Arc::new(RwLock::new(maps)),
             version: Arc::new(RwLock::new(last_version)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
+            change_sink: Arc::new(RwLock::new(None)),
+            replication_listener: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -61,7 +66,23 @@ impl MVStore {
             maps: Arc::new(RwLock::new(HashMap::new())),
             version: Arc::new(RwLock::new(0)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
+            change_sink: Arc::new(RwLock::new(None)),
+            replication_listener: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// マップ変更シンクを設定
+    pub fn set_change_sink(&self, sink: Option<Arc<dyn MapChangeSink>>) {
+        let maps = self.maps.read();
+        for map in maps.values() {
+            map.set_sink(sink.as_ref().map(Arc::clone));
+        }
+        *self.change_sink.write() = sink;
+    }
+
+    /// レプリケーションリスナーを設定
+    pub fn set_replication_listener(&self, listener: Option<Arc<dyn ReplicationListener>>) {
+        *self.replication_listener.write() = listener;
     }
 
     /// 名前付きマップを取得または新規作成
@@ -71,6 +92,9 @@ impl MVStore {
             map.clone()
         } else {
             let new_map = MVMap::new(name, MVTree::default());
+            if let Some(ref sink) = *self.change_sink.read() {
+                new_map.set_sink(Some(Arc::clone(sink)));
+            }
             maps.insert(name.to_string(), new_map.clone());
             new_map
         }
@@ -123,10 +147,52 @@ impl MVStore {
 
         let payload = ChunkPayload::new(chunk_id, new_version, (*metadata_tree.root).clone());
 
+        // 未コミット変更の取り出し
+        let changes = if let Some(ref sink) = *self.change_sink.read() {
+            sink.drain_changes()
+        } else {
+            Vec::new()
+        };
+
         let mut fs = self.file_store.write();
         fs.append_and_commit(&payload)?;
 
+        // レプリケーションリスナーが存在する場合、通知＆同期待機 (remote_apply)
+        if let Some(ref listener) = *self.replication_listener.read() {
+            listener.on_commit(new_version, changes)?;
+        }
+
         Ok(new_version)
+    }
+
+    /// 全マップの全エントリをスキャンして取得（初期スナップショット送信用）
+    pub fn scan_all_maps(&self) -> HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> {
+        let maps = self.maps.read();
+        let mut result = HashMap::new();
+        for (name, map) in maps.iter() {
+            let entries = map.scan_all().into_iter().map(|e| (e.key, e.value)).collect();
+            result.insert(name.clone(), entries);
+        }
+        result
+    }
+
+    /// スナップショットを全マップに適用（初期スナップショット受信用）
+    pub fn apply_snapshot(&self, target_version: u64, snapshot: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>>) -> H2Result<()> {
+        for (name, entries) in snapshot {
+            let map = self.open_map(&name);
+            map.clear();
+            for (k, v) in entries {
+                map.put(k, v);
+            }
+        }
+        *self.version.write() = target_version.saturating_sub(1);
+        self.commit()?;
+        *self.version.write() = target_version;
+        Ok(())
+    }
+
+    pub fn set_version(&self, ver: u64) {
+        *self.version.write() = ver;
     }
 
     pub fn current_version(&self) -> u64 {

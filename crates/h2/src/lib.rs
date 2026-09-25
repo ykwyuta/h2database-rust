@@ -6,6 +6,9 @@ pub use h2_mvstore::{MVStore, TransactionStatus};
 pub use h2_sql::{ExecutionResult, Row, SQLEngine};
 pub use h2_types::{DataType, FromSql, H2Error, H2Result, Value};
 
+pub mod replication;
+pub use replication::{Instance, InstanceConfig, InstanceRole, SyncReplicationMode};
+
 #[cfg(feature = "async")]
 pub mod async_conn;
 #[cfg(feature = "async")]
@@ -217,6 +220,21 @@ impl Connection {
         })
     }
 
+    /// SQLEngine と MVStore から直接 Connection を生成
+    pub fn from_engine(engine: Arc<SQLEngine>, store: Arc<MVStore>) -> Self {
+        Self {
+            store,
+            engine,
+            current_tx: Arc::new(parking_lot::Mutex::new(None)),
+            default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
+        }
+    }
+
+    /// インスタンスが Read-Only かどうかを確認
+    pub fn is_read_only(&self) -> bool {
+        self.engine.is_read_only()
+    }
+
     /// 同一のデータベースを共有し、独立したトランザクション状態を持つ新しいセッション（接続）を作成
     pub fn new_session(&self) -> Self {
         Self {
@@ -292,6 +310,9 @@ impl Connection {
                 Ok(0)
             }
             TxCommand::Vacuum => {
+                if self.engine.is_read_only() {
+                    return Err(H2Error::ReadOnly("Cannot execute VACUUM on a read-only instance".to_string()));
+                }
                 self.vacuum()?;
                 Ok(0)
             }

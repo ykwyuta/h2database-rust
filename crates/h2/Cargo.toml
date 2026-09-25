@@ -10,13 +10,16 @@ h2-types = { path = "../h2-types" }
 h2-mvstore = { path = "../h2-mvstore" }
 h2-sql = { path = "../h2-sql" }
 h2-server = { path = "../h2-server", optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 parking_lot = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [features]
 default = ["server", "async"]
-server = ["dep:h2-server", "dep:tokio"]
-async = ["dep:tokio"]
+server = ["dep:h2-server"]
+async = []
 
 [dev-dependencies]
 tempfile = "3.14"
