@@ -7,6 +7,7 @@ pub mod memory;
 pub mod parser;
 pub mod row;
 pub mod stats;
+pub mod vectorized;
 
 pub use auth::{AuthManager, Privilege, UserInfo};
 pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats};
@@ -15,6 +16,11 @@ pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind
 pub use memory::{ExternalSorter, MemoryConfig, MemoryGrant, MemoryGrantCoordinator, MemoryTracker};
 pub use row::Row;
 pub use stats::{analyze_table, estimate_scan_cost, estimate_selectivity};
+pub use vectorized::{
+    create_arrow_schema, scan_slotted_page_to_batch, ExecutionMode, MemoryBatchOperator,
+    MemoryRowOperator, PhysicalOperator, RowToVectorAdapter, VectorAggregateOp, VectorChunk,
+    VectorToRowAdapter, VectorizedAggregate, VectorizedFilter,
+};
 
 #[cfg(test)]
 mod tests {

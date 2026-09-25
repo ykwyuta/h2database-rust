@@ -142,6 +142,7 @@ pub struct SQLEngine {
     auth: Arc<crate::auth::AuthManager>,
     memory_config: crate::memory::MemoryConfig,
     admission: Arc<crate::memory::MemoryGrantCoordinator>,
+    execution_mode: Arc<parking_lot::RwLock<String>>,
 }
 
 impl SQLEngine {
@@ -153,6 +154,7 @@ impl SQLEngine {
         let auth = Arc::new(crate::auth::AuthManager::new());
         let memory_config = crate::memory::MemoryConfig::new();
         let admission = crate::memory::MemoryGrantCoordinator::new(memory_config.total_query_memory());
+        let execution_mode = Arc::new(parking_lot::RwLock::new("auto".to_string()));
         Ok(Self {
             store,
             tx_store,
@@ -162,7 +164,16 @@ impl SQLEngine {
             auth,
             memory_config,
             admission,
+            execution_mode,
         })
+    }
+
+    pub fn execution_mode(&self) -> String {
+        self.execution_mode.read().clone()
+    }
+
+    pub fn set_execution_mode(&self, mode: &str) {
+        *self.execution_mode.write() = mode.to_lowercase();
     }
 
     pub fn memory_config(&self) -> &crate::memory::MemoryConfig {
@@ -322,6 +333,9 @@ impl SQLEngine {
         if trimmed_upper.starts_with("SET WORK_MEM") {
             return self.execute_set_work_mem(trimmed);
         }
+        if trimmed_upper.starts_with("SET EXECUTION_MODE") {
+            return self.execute_set_execution_mode(trimmed);
+        }
         if trimmed_upper == "SHOW MAX_MATERIALIZED_ROWS" {
             let row = Row::new(vec![Value::Integer(self.memory_config.max_materialized_rows() as i32)]);
             return Ok(ExecutionResult::Query {
@@ -333,6 +347,13 @@ impl SQLEngine {
             let row = Row::new(vec![Value::BigInt(self.memory_config.work_mem() as i64)]);
             return Ok(ExecutionResult::Query {
                 columns: vec!["work_mem".to_string()],
+                rows: vec![row],
+            });
+        }
+        if trimmed_upper == "SHOW EXECUTION_MODE" {
+            let row = Row::new(vec![Value::String(self.execution_mode())]);
+            return Ok(ExecutionResult::Query {
+                columns: vec!["execution_mode".to_string()],
                 rows: vec![row],
             });
         }
@@ -675,6 +696,99 @@ impl SQLEngine {
         };
         self.memory_config.set_work_mem(bytes);
         Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_set_execution_mode(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let val_part = sql.split('=').nth(1)
+            .or_else(|| sql.split_whitespace().nth(2))
+            .ok_or_else(|| H2Error::Execution("Expected value in SET execution_mode = 'auto'|'row'|'vectorized'".to_string()))?;
+        let mode = val_part.trim().trim_matches(';').trim_matches('\'').trim_matches('"').to_lowercase();
+        match mode.as_str() {
+            "auto" | "row" | "vectorized" => {
+                self.set_execution_mode(&mode);
+                Ok(ExecutionResult::Ddl)
+            }
+            _ => Err(H2Error::Execution(format!(
+                "Invalid execution mode '{}'. Expected 'auto', 'row', or 'vectorized'",
+                mode
+            ))),
+        }
+    }
+
+    fn try_execute_vectorized_aggregate(
+        &self,
+        projection: &[SelectItem],
+        filtered_rows: &[Row],
+        base_table_def: &TableDef,
+        ctx: &RowContext,
+    ) -> Option<(Vec<String>, Vec<Row>)> {
+        let current_mode = self.execution_mode();
+        let should_vectorize = current_mode == "vectorized" || (current_mode == "auto" && filtered_rows.len() >= 64);
+        if !should_vectorize {
+            return None;
+        }
+
+        let mut ops = Vec::new();
+        let mut col_names = Vec::new();
+
+        for item in projection {
+            col_names.push(get_select_item_name(item));
+            let expr = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                _ => return None,
+            };
+            match expr {
+                Expr::Function(func) => {
+                    let fname = func.name.to_string().to_uppercase();
+                    let args = match &func.args {
+                        sqlparser::ast::FunctionArguments::List(arg_list) => &arg_list.args,
+                        sqlparser::ast::FunctionArguments::None => &Vec::new(),
+                        _ => return None,
+                    };
+                    if args.is_empty() && fname == "COUNT" {
+                        ops.push(crate::vectorized::VectorAggregateOp::CountStar);
+                    } else if args.len() == 1 {
+                        let arg_expr = match &args[0] {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) if fname == "COUNT" => {
+                                ops.push(crate::vectorized::VectorAggregateOp::CountStar);
+                                continue;
+                            }
+                            _ => return None,
+                        };
+                        if let Expr::Identifier(ident) = arg_expr {
+                            let col_name = ident.value.to_lowercase();
+                            if let Some(col_idx) = ctx.resolve_column(None, &col_name) {
+                                match fname.as_str() {
+                                    "COUNT" => ops.push(crate::vectorized::VectorAggregateOp::Count(col_idx)),
+                                    "SUM" => ops.push(crate::vectorized::VectorAggregateOp::Sum(col_idx)),
+                                    "AVG" => ops.push(crate::vectorized::VectorAggregateOp::Avg(col_idx)),
+                                    "MIN" => ops.push(crate::vectorized::VectorAggregateOp::Min(col_idx)),
+                                    "MAX" => ops.push(crate::vectorized::VectorAggregateOp::Max(col_idx)),
+                                    _ => return None,
+                                }
+                            } else {
+                                return None;
+                            }
+                        } else {
+                            return None;
+                        }
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+
+        let schema = crate::vectorized::create_arrow_schema(&base_table_def.columns);
+        let batch = crate::vectorized::rows_to_record_batch(&schema, filtered_rows).ok()?;
+        let chunk = crate::vectorized::VectorChunk::new(batch);
+        let mem_op = Box::new(crate::vectorized::MemoryBatchOperator::single(chunk));
+        let mut agg_op = crate::vectorized::VectorizedAggregate::new(mem_op, ops);
+        let agg_row = agg_op.execute_aggregate().ok()?;
+
+        Some((col_names, vec![agg_row]))
     }
 
     /// キューテーブルの保持ポリシー（RETENTION_TIME, MAX_BYTES）に基づき古いメッセージをパージ（Head Truncation）
@@ -3327,6 +3441,14 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
                     };
                     lines.push(scan_type);
 
+                    let current_mode = self.execution_mode();
+                    let chosen_exec_mode = if current_mode == "vectorized" || (current_mode == "auto" && est_rows >= 128) {
+                        "Vectorized (Apache Arrow)"
+                    } else {
+                        "Row (Volcano)"
+                    };
+                    lines.push(format!("ExecutionMode: {}", chosen_exec_mode));
+
                     for join in &from_table.joins {
                         let join_tbl = match &join.relation {
                             TableFactor::Table { name, .. } => name.to_string(),
@@ -4042,62 +4164,101 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
                 let is_aggregate = !group_by_exprs.is_empty() || has_agg || select.having.is_some();
 
                 let (result_columns, projected_rows) = if is_aggregate {
-                    let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
-                    for row in filtered_rows {
-                        let mut key = Vec::with_capacity(group_by_exprs.len());
-                        for expr in &group_by_exprs {
-                            key.push(evaluate_expr_context(expr, &ctx, &row)?);
-                        }
-                        if let Some(pos) = groups.iter().position(|(k, _)| k == &key) {
-                            groups[pos].1.push(row);
+                    let (result_columns, mut rows) = if group_by_exprs.is_empty() && select.having.is_none() {
+                        if let Some((vec_cols, vec_rows)) = self.try_execute_vectorized_aggregate(
+                            &select.projection,
+                            &filtered_rows,
+                            &base_table_def,
+                            &ctx,
+                        ) {
+                            (vec_cols, vec_rows)
                         } else {
-                            groups.push((key, vec![row]));
-                        }
-                    }
+                            let groups = vec![(Vec::<Value>::new(), filtered_rows)];
 
-                    if groups.is_empty() && group_by_exprs.is_empty() {
-                        groups.push((Vec::new(), Vec::new()));
-                    }
+                            let mut result_columns = Vec::new();
+                            for item in &select.projection {
+                                result_columns.push(get_select_item_name(item));
+                            }
 
-                    let mut result_columns = Vec::new();
-                    for item in &select.projection {
-                        result_columns.push(get_select_item_name(item));
-                    }
-
-                    let mut rows = Vec::new();
-                    for (_key, group_rows) in groups {
-                        let mut row_vals = Vec::new();
-                        for item in &select.projection {
-                            let val = match item {
-                                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                                    let proc_expr = self.preprocess_subqueries_with_ctes(tx, expr, &current_ctes)?;
-                                    evaluate_aggregate_expr(&proc_expr, &ctx, &group_rows)?
+                            let mut rows = Vec::new();
+                            for (_key, group_rows) in groups {
+                                let mut row_vals = Vec::new();
+                                for item in &select.projection {
+                                    let val = match item {
+                                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                                            let proc_expr = self.preprocess_subqueries_with_ctes(tx, expr, &current_ctes)?;
+                                            evaluate_aggregate_expr(&proc_expr, &ctx, &group_rows)?
+                                        }
+                                        SelectItem::Wildcard(_) => {
+                                            return Err(H2Error::Execution("Wildcard in aggregate query not supported".to_string()));
+                                        }
+                                        _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
+                                    };
+                                    row_vals.push(val);
                                 }
-                                SelectItem::Wildcard(_) => {
-                                    return Err(H2Error::Execution("Wildcard in aggregate query not supported".to_string()));
-                                }
-                                _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
-                            };
-                            row_vals.push(val);
+                                rows.push(Row::new(row_vals));
+                            }
+                            (result_columns, rows)
                         }
-                        let agg_row = Row::new(row_vals);
-
-                        // HAVING 句の評価
-                        let mut matches_having = true;
-                        if let Some(having) = &select.having {
-                            let proc_having = self.preprocess_subqueries_with_ctes(tx, having, &current_ctes)?;
-                            let having_val = evaluate_aggregate_expr(&proc_having, &ctx, &group_rows)?;
-                            if let Value::Boolean(b) = having_val {
-                                matches_having = b;
+                    } else {
+                        let mut groups: Vec<(Vec<Value>, Vec<Row>)> = Vec::new();
+                        for row in filtered_rows {
+                            let mut key = Vec::with_capacity(group_by_exprs.len());
+                            for expr in &group_by_exprs {
+                                key.push(evaluate_expr_context(expr, &ctx, &row)?);
+                            }
+                            if let Some(pos) = groups.iter().position(|(k, _)| k == &key) {
+                                groups[pos].1.push(row);
                             } else {
-                                matches_having = false;
+                                groups.push((key, vec![row]));
                             }
                         }
 
-                        if matches_having {
-                            rows.push(agg_row);
+                        if groups.is_empty() && group_by_exprs.is_empty() {
+                            groups.push((Vec::new(), Vec::new()));
                         }
-                    }
+
+                        let mut result_columns = Vec::new();
+                        for item in &select.projection {
+                            result_columns.push(get_select_item_name(item));
+                        }
+
+                        let mut rows = Vec::new();
+                        for (_key, group_rows) in groups {
+                            let mut row_vals = Vec::new();
+                            for item in &select.projection {
+                                let val = match item {
+                                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                                        let proc_expr = self.preprocess_subqueries_with_ctes(tx, expr, &current_ctes)?;
+                                        evaluate_aggregate_expr(&proc_expr, &ctx, &group_rows)?
+                                    }
+                                    SelectItem::Wildcard(_) => {
+                                        return Err(H2Error::Execution("Wildcard in aggregate query not supported".to_string()));
+                                    }
+                                    _ => return Err(H2Error::Execution("Unsupported select item".to_string())),
+                                };
+                                row_vals.push(val);
+                            }
+                            let agg_row = Row::new(row_vals);
+
+                            // HAVING 句の評価
+                            let mut matches_having = true;
+                            if let Some(having) = &select.having {
+                                let proc_having = self.preprocess_subqueries_with_ctes(tx, having, &current_ctes)?;
+                                let having_val = evaluate_aggregate_expr(&proc_having, &ctx, &group_rows)?;
+                                if let Value::Boolean(b) = having_val {
+                                    matches_having = b;
+                                } else {
+                                    matches_having = false;
+                                }
+                            }
+
+                            if matches_having {
+                                rows.push(agg_row);
+                            }
+                        }
+                        (result_columns, rows)
+                    };
 
                     // 集約クエリの ORDER BY
                     if let Some(order_by) = &query.order_by {

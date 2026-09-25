@@ -30,3 +30,4 @@ tokio = { workspace = true, features = ["full"] }
 rust_decimal = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+arrow = { workspace = true }

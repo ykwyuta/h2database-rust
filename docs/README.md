@@ -71,5 +71,11 @@
     - 4 つの問題点（行数不明・カーディナリティ不明・JOIN 順序固定・Range Scan 未対応）
     - 段階的改善ロードマップ（近似行数カウンタ・ANALYZE 文・選択率推定・コストベース JOIN 最適化）
 
-
-
+11. [11. Apache Arrow 互換ベクトル化実行と行ベース実行の両立方式設計書 (11_arrow_vectorized_and_row_hybrid_execution.md)](./11_arrow_vectorized_and_row_hybrid_execution.md)
+    - なぜ Arrow ベクトル化と行ベース（Volcano）の両立（HTAP）が必要か
+    - モルフォロジック（多態的）ハイブリッド実行アーキテクチャ
+    - VectorChunk 設計と `h2_types::Value` ⇔ Apache Arrow 型マッピング
+    - デュアル Operator Trait と境界アダプタ（RowToVector / VectorToRow）
+    - Slotted Page からの直接転置（Direct Column Transposition）によるゼロコピー化
+    - 統計情報基盤と CBO を連携した自動実行パス判定（Adaptive Rule & Runtime Promotion）
+    - DuckDB, SQL Server (Batch Mode on Rowstore) 等とのアーキテクチャ比較と段階的ロードマップ

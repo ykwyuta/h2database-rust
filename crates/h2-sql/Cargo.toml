@@ -17,4 +17,5 @@ rust_decimal = { workspace = true }
 chrono = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true }
+arrow = { workspace = true }
 

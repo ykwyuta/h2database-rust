@@ -633,6 +633,7 @@ pub struct MemoryGrantCoordinator {
 
 #### 1. Apache Arrow 互換のベクトル化カラムナ実行 (Vectorized Engine)
 行単位のループ処理をやめ、1024 行単位の列配列（Vector Chunk）としてレジスタにロードし、SIMD 命令を活用して一括処理します（DuckDB や ClickHouse と同等のスループットを達成）。
+※ 既存の行ベース実行とベクトル化実行を高い次元で両立させる具体的なハイブリッド方式（境界アダプタ、Slotted Page 直接転置、CBO アダプティブ切り替え等）の設計書は、[11. Apache Arrow 互換ベクトル化実行と行ベース実行の両立方式設計書 (11_arrow_vectorized_and_row_hybrid_execution.md)](./11_arrow_vectorized_and_row_hybrid_execution.md) を参照してください。
 
 #### 2. ロックフリー・インメモリインデックス（Bw-Tree / Adaptive Radix Tree）
 高並行書き込みにおけるミューテックス競合をゼロにするため、Atomic CAS による Delta 更新を行う **Bw-Tree** や、キーのプレフィックスを圧縮保持する **ART (Adaptive Radix Tree)** をインメモリモードに導入します。
