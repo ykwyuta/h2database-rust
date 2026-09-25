@@ -13,9 +13,21 @@ fn main() -> Result<()> {
     let mut user_arg: Option<String> = None;
     let mut password_arg: Option<String> = None;
 
+    let mut init_pgbench: Option<usize> = None;
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "-i" | "--init-pgbench" => {
+                let mut scale = 1;
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    if let Ok(s) = args[i + 1].parse::<usize>() {
+                        scale = s;
+                        i += 1;
+                    }
+                }
+                init_pgbench = Some(scale);
+            }
             "-f" | "--file" => {
                 if i + 1 < args.len() {
                     script_file = Some(args[i + 1].clone());
@@ -69,6 +81,12 @@ fn main() -> Result<()> {
     if let Some(ref u) = user_arg {
         conn.authenticate(u, password_arg.as_deref(), "127.0.0.1")
             .with_context(|| format!("Authentication failed for user '{}'", u))?;
+    }
+
+    // 0. pgbench テーブル初期化 (-i / --init-pgbench [scale])
+    if let Some(scale) = init_pgbench {
+        init_pgbench_tables(&conn, scale)?;
+        return Ok(());
     }
 
     // 1. ワンライナーコマンドの実行 (-c "SQL")
@@ -285,4 +303,61 @@ fn split_sql_statements(script: &str) -> Vec<String> {
     }
 
     statements
+}
+
+fn init_pgbench_tables(conn: &Connection, scale: usize) -> Result<()> {
+    println!("Initializing pgbench tables (scale {} = {} accounts)...", scale, scale * 100_000);
+    let start = std::time::Instant::now();
+    let _ = conn.execute("DROP TABLE IF EXISTS pgbench_history;");
+    let _ = conn.execute("DROP TABLE IF EXISTS pgbench_tellers;");
+    let _ = conn.execute("DROP TABLE IF EXISTS pgbench_accounts;");
+    let _ = conn.execute("DROP TABLE IF EXISTS pgbench_branches;");
+
+    conn.execute("CREATE TABLE pgbench_branches (bid INT PRIMARY KEY, bbalance INT, filler VARCHAR(88));")?;
+    conn.execute("CREATE TABLE pgbench_tellers (tid INT PRIMARY KEY, bid INT, tbalance INT, filler VARCHAR(84));")?;
+    conn.execute("CREATE TABLE pgbench_accounts (aid INT PRIMARY KEY, bid INT, abalance INT, filler VARCHAR(84));")?;
+    conn.execute("CREATE TABLE pgbench_history (tid INT, bid INT, aid INT, delta INT, mtime TIMESTAMP, filler VARCHAR(22));")?;
+
+    for b in 1..=scale {
+        conn.execute(&format!("INSERT INTO pgbench_branches VALUES ({}, 0, 'branch');", b))?;
+    }
+    for t in 1..=(scale * 10) {
+        let b = ((t - 1) % scale) + 1;
+        conn.execute(&format!("INSERT INTO pgbench_tellers VALUES ({}, {}, 0, 'teller');", t, b))?;
+    }
+
+    let total_accounts = scale * 100_000;
+    let batch_size = 1000;
+    let chunk_size = 10_000;
+
+    let mut aid = 1;
+    while aid <= total_accounts {
+        let chunk_end = (aid + chunk_size - 1).min(total_accounts);
+        conn.execute("BEGIN;")?;
+        while aid <= chunk_end {
+            let next_aid = (aid + batch_size).min(chunk_end + 1);
+            let mut sql = String::with_capacity(batch_size * 40);
+            sql.push_str("INSERT INTO pgbench_accounts VALUES ");
+            for a in aid..next_aid {
+                let bid = ((a - 1) % scale) + 1;
+                use std::fmt::Write;
+                let _ = write!(sql, "({},{},1000,'filler'),", a, bid);
+            }
+            sql.pop();
+            sql.push(';');
+            conn.execute(&sql)?;
+            aid = next_aid;
+        }
+        conn.execute("COMMIT;")?;
+        if (aid - 1) % 100_000 == 0 || aid > total_accounts {
+            let pct = ((aid - 1) as f64 / total_accounts as f64) * 100.0;
+            println!("  Inserted {} of {} accounts ({:.0}%, elapsed: {:.2?})...", aid - 1, total_accounts, pct, start.elapsed());
+        }
+    }
+
+    // Checkpoint to flush to disk
+    let _ = conn.execute("CHECKPOINT;");
+
+    println!("Completed pgbench initialization ({} accounts) in {:.2?}", total_accounts, start.elapsed());
+    Ok(())
 }
