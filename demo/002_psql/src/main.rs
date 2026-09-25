@@ -9,10 +9,15 @@ async fn main() -> H2Result<()> {
     println!("  H2 Database in Rust - PostgreSQL Wire Protocol Demo Server");
     println!("============================================================");
 
-    // 1. データベースファイルを開く
-    let db_path = "psql_demo.h2";
-    let conn = Connection::open(db_path)?;
-    println!("[INFO] Opened database at: {}", db_path);
+    // 1. データベースファイルを開く (H2_DB_PATH またはデフォルト psql_demo.h2)
+    let db_path = std::env::var("H2_DB_PATH").unwrap_or_else(|_| "psql_demo.h2".to_string());
+    let conn = if db_path == ":memory:" {
+        println!("[INFO] Opened in-memory database.");
+        Connection::open_in_memory()?
+    } else {
+        println!("[INFO] Opened database at: {}", db_path);
+        Connection::open(&db_path)?
+    };
 
     // 2. 初期テーブルとデモデータの準備
     conn.execute(
@@ -39,13 +44,14 @@ async fn main() -> H2Result<()> {
         println!("[INFO] Initialized demo data (3 server nodes).");
     }
 
-    // 3. PostgreSQL ワイヤプロトコルサーバーを開始 (ポート 5432)
-    let bind_addr: SocketAddr = "127.0.0.1:5432".parse().unwrap();
+    // 3. PostgreSQL ワイヤプロトコルサーバーを開始 (ポート 5433 または PG_PORT)
+    let port = std::env::var("PG_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(5433);
+    let bind_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
     let actual_addr = match conn.start_pg_server(bind_addr).await {
         Ok(addr) => addr,
         Err(e) => {
-            eprintln!("[WARN] Port 5432 might be in use ({e}). Trying automatic port...");
-            let fallback: SocketAddr = "127.0.0.1:0".parse().unwrap();
+            eprintln!("[WARN] Port {} might be in use ({e}). Trying automatic port...", port);
+            let fallback: SocketAddr = "0.0.0.0:0".parse().unwrap();
             conn.start_pg_server(fallback).await?
         }
     };

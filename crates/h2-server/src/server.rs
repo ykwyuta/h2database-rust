@@ -165,7 +165,6 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
 
                 let trimmed = sql.trim_end_matches(';').trim();
                 let upper = trimmed.to_uppercase();
-                tracing::debug!("PG query: {}", trimmed);
 
                 if trimmed.is_empty() {
                     let tx_status = if active_tx.is_some() { b'T' } else { b'I' };

@@ -272,6 +272,8 @@ impl Transaction {
         let commit_version = self.store.mvstore().current_version() + 1;
         let undo_logs = self.undo_log.read();
 
+        let has_changes = !undo_logs.is_empty();
+
         for log in undo_logs.iter() {
             let _key_guard = self.store.lock_manager().lock_key(&log.map_name, &log.key);
             let map = self.store.mvstore().open_map(&log.map_name);
@@ -289,7 +291,9 @@ impl Transaction {
 
         *status = TransactionStatus::Committed;
         self.store.remove_active_tx(self.tx_id);
-        self.store.mvstore().commit()?;
+        if has_changes {
+            self.store.mvstore().commit()?;
+        }
         Ok(())
     }
 
