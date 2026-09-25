@@ -140,6 +140,8 @@ pub struct SQLEngine {
     cursors: Arc<parking_lot::RwLock<HashMap<String, CursorState>>>,
     read_only: Arc<std::sync::atomic::AtomicBool>,
     auth: Arc<crate::auth::AuthManager>,
+    memory_config: crate::memory::MemoryConfig,
+    admission: Arc<crate::memory::MemoryGrantCoordinator>,
 }
 
 impl SQLEngine {
@@ -149,6 +151,8 @@ impl SQLEngine {
         let cursors = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let read_only = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let auth = Arc::new(crate::auth::AuthManager::new());
+        let memory_config = crate::memory::MemoryConfig::new();
+        let admission = crate::memory::MemoryGrantCoordinator::new(memory_config.total_query_memory());
         Ok(Self {
             store,
             tx_store,
@@ -156,7 +160,25 @@ impl SQLEngine {
             cursors,
             read_only,
             auth,
+            memory_config,
+            admission,
         })
+    }
+
+    pub fn memory_config(&self) -> &crate::memory::MemoryConfig {
+        &self.memory_config
+    }
+
+    pub fn admission(&self) -> &Arc<crate::memory::MemoryGrantCoordinator> {
+        &self.admission
+    }
+
+    pub fn set_max_materialized_rows(&self, rows: usize) {
+        self.memory_config.set_max_materialized_rows(rows);
+    }
+
+    pub fn set_work_mem(&self, bytes: usize) {
+        self.memory_config.set_work_mem(bytes);
     }
 
     pub fn auth(&self) -> &Arc<crate::auth::AuthManager> {
@@ -288,6 +310,31 @@ impl SQLEngine {
 
         if trimmed_upper.starts_with("CREATE QUEUE TABLE") {
             return self.execute_create_queue_table(tx, trimmed);
+        }
+
+        // ================= 統計情報 & メモリ管理コマンド =================
+        if trimmed_upper == "ANALYZE" || trimmed_upper.starts_with("ANALYZE ") {
+            return self.execute_analyze(tx, trimmed);
+        }
+        if trimmed_upper.starts_with("SET MAX_MATERIALIZED_ROWS") {
+            return self.execute_set_max_materialized_rows(trimmed);
+        }
+        if trimmed_upper.starts_with("SET WORK_MEM") {
+            return self.execute_set_work_mem(trimmed);
+        }
+        if trimmed_upper == "SHOW MAX_MATERIALIZED_ROWS" {
+            let row = Row::new(vec![Value::Integer(self.memory_config.max_materialized_rows() as i32)]);
+            return Ok(ExecutionResult::Query {
+                columns: vec!["max_materialized_rows".to_string()],
+                rows: vec![row],
+            });
+        }
+        if trimmed_upper == "SHOW WORK_MEM" {
+            let row = Row::new(vec![Value::BigInt(self.memory_config.work_mem() as i64)]);
+            return Ok(ExecutionResult::Query {
+                columns: vec!["work_mem".to_string()],
+                rows: vec![row],
+            });
         }
 
 
@@ -572,6 +619,62 @@ impl SQLEngine {
             }
             _ => Err(H2Error::Execution("Expected CREATE TABLE statement".to_string())),
         }
+    }
+
+    fn execute_analyze(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        if parts.len() == 1 {
+            // 全テーブルを ANALYZE
+            let tables = self.catalog.all_tables();
+            for table_def in tables {
+                let (stats, col_stats) = crate::stats::analyze_table(tx, &table_def)?;
+                self.catalog.update_table_stats(&table_def.name, stats, col_stats)?;
+            }
+        } else {
+            // 指定テーブルを ANALYZE
+            let table_name = parts[1].trim_matches(';').trim_matches('"').trim_matches('\'');
+            let table_def = self.catalog.get_table(table_name)
+                .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+            let (stats, col_stats) = crate::stats::analyze_table(tx, &table_def)?;
+            self.catalog.update_table_stats(table_name, stats, col_stats)?;
+        }
+        self.store.commit()?;
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_set_max_materialized_rows(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let val_part = sql.split('=').nth(1)
+            .or_else(|| sql.split_whitespace().nth(2))
+            .ok_or_else(|| H2Error::Execution("Expected value in SET max_materialized_rows = <num>".to_string()))?;
+        let trimmed_val = val_part.trim().trim_matches(';').trim_matches('\'').trim_matches('"');
+        let rows = trimmed_val.parse::<usize>()
+            .map_err(|_| H2Error::Execution(format!("Invalid integer for max_materialized_rows: {}", trimmed_val)))?;
+        self.memory_config.set_max_materialized_rows(rows);
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_set_work_mem(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let val_part = sql.split('=').nth(1)
+            .or_else(|| sql.split_whitespace().nth(2))
+            .ok_or_else(|| H2Error::Execution("Expected value in SET work_mem = <size>".to_string()))?;
+        let trimmed_val = val_part.trim().trim_matches(';').trim_matches('\'').trim_matches('"').to_uppercase();
+        let bytes = if trimmed_val.ends_with("MB") {
+            let num = trimmed_val[..trimmed_val.len() - 2].trim().parse::<usize>()
+                .map_err(|_| H2Error::Execution(format!("Invalid size for work_mem: {}", trimmed_val)))?;
+            num * 1024 * 1024
+        } else if trimmed_val.ends_with("KB") {
+            let num = trimmed_val[..trimmed_val.len() - 2].trim().parse::<usize>()
+                .map_err(|_| H2Error::Execution(format!("Invalid size for work_mem: {}", trimmed_val)))?;
+            num * 1024
+        } else if trimmed_val.ends_with('B') {
+            trimmed_val[..trimmed_val.len() - 1].trim().parse::<usize>()
+                .map_err(|_| H2Error::Execution(format!("Invalid size for work_mem: {}", trimmed_val)))?
+        } else {
+            trimmed_val.parse::<usize>()
+                .map_err(|_| H2Error::Execution(format!("Invalid size for work_mem: {}", trimmed_val)))?
+        };
+        self.memory_config.set_work_mem(bytes);
+        Ok(ExecutionResult::Ddl)
     }
 
     /// キューテーブルの保持ポリシー（RETENTION_TIME, MAX_BYTES）に基づき古いメッセージをパージ（Head Truncation）
@@ -1626,6 +1729,8 @@ fn apply_join(
                     }
                 }
 
+                let _ = self.catalog.update_approx_row_count(&table_name, affected_rows as i64);
+
                 Ok(ExecutionResult::Dml { affected_rows })
             }
             Statement::Delete(delete) => {
@@ -1768,6 +1873,8 @@ fn apply_join(
                         return Ok(ExecutionResult::Query { columns: cols, rows: r_rows });
                     }
                 }
+
+                let _ = self.catalog.update_approx_row_count(&table_name, -(affected_rows as i64));
 
                 Ok(ExecutionResult::Dml { affected_rows })
             }
@@ -2312,8 +2419,10 @@ fn apply_join(
                         self.store.clear_map(&idx_map);
                     }
 
-                    // next_row_id リセット
+                    // next_row_id リセット & 行数統計リセット
                     table_def.next_row_id = 1;
+                    table_def.approx_row_count = 0;
+                    table_def.stats = None;
                     self.catalog.update_table(table_def)?;
                 }
                 self.store.commit()?;
@@ -3104,6 +3213,73 @@ fn apply_join(
         Ok(())
     }
 
+fn matches_index_condition(expr: &Expr, target_col: &str) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if let Expr::Identifier(ident) = left.as_ref() {
+                if ident.value.eq_ignore_ascii_case(target_col) {
+                    if matches!(op, BinaryOperator::Eq | BinaryOperator::Gt | BinaryOperator::GtEq | BinaryOperator::Lt | BinaryOperator::LtEq) {
+                        return evaluate_literal_or_unary(right).is_ok();
+                    }
+                }
+            }
+            false
+        }
+        Expr::Between { expr, low, high, negated } => {
+            if !*negated {
+                if let Expr::Identifier(ident) = expr.as_ref() {
+                    if ident.value.eq_ignore_ascii_case(target_col) {
+                        return evaluate_literal_or_unary(low).is_ok() && evaluate_literal_or_unary(high).is_ok();
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value) -> bool>> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if let Expr::Identifier(ident) = left.as_ref() {
+                if ident.value.eq_ignore_ascii_case(target_col) {
+                    if let Ok(search_val) = evaluate_literal_or_unary(right) {
+                        let op_clone = op.clone();
+                        return Some(Box::new(move |v: &Value| {
+                            match op_clone {
+                                BinaryOperator::Eq => v == &search_val,
+                                BinaryOperator::Gt => v.partial_cmp(&search_val) == Some(std::cmp::Ordering::Greater),
+                                BinaryOperator::GtEq => matches!(v.partial_cmp(&search_val), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+                                BinaryOperator::Lt => v.partial_cmp(&search_val) == Some(std::cmp::Ordering::Less),
+                                BinaryOperator::LtEq => matches!(v.partial_cmp(&search_val), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+                                _ => false,
+                            }
+                        }));
+                    }
+                }
+            }
+            None
+        }
+        Expr::Between { expr, low, high, negated } => {
+            if !*negated {
+                if let Expr::Identifier(ident) = expr.as_ref() {
+                    if ident.value.eq_ignore_ascii_case(target_col) {
+                        if let (Ok(low_val), Ok(high_val)) = (evaluate_literal_or_unary(low), evaluate_literal_or_unary(high)) {
+                            return Some(Box::new(move |v: &Value| {
+                                v.partial_cmp(&low_val).map(|c| c != std::cmp::Ordering::Less).unwrap_or(false)
+                                    && v.partial_cmp(&high_val).map(|c| c != std::cmp::Ordering::Greater).unwrap_or(false)
+                            }));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
     fn explain_statement(&self, _tx: &Transaction, stmt: Statement) -> H2Result<String> {
         match stmt {
             Statement::Query(query) => {
@@ -3121,18 +3297,34 @@ fn apply_join(
                         _ => "unknown".to_string(),
                     };
 
-                    let mut scan_type = format!("TableScan: {}", base_table_name);
+                    let table_def_opt = self.catalog.get_table(&base_table_name);
+                    let mut is_index_scan = false;
+                    let mut matched_index_name = String::new();
+
                     if from_table.joins.is_empty() {
-                        if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, .. }) = &select.selection {
-                            if let Expr::Identifier(ident) = left.as_ref() {
-                                let col_name = &ident.value;
-                                let indexes = self.catalog.get_table_indexes(&base_table_name);
-                                if let Some(target_idx) = indexes.iter().find(|i| !i.name.starts_with("pk_") && i.columns[0].eq_ignore_ascii_case(col_name)) {
-                                    scan_type = format!("IndexScan: {} on index {}", base_table_name, target_idx.name);
+                        if let Some(ref sel) = select.selection {
+                            let indexes = self.catalog.get_table_indexes(&base_table_name);
+                            for idx in &indexes {
+                                if !idx.name.starts_with("pk_") && Self::matches_index_condition(sel, &idx.columns[0]) {
+                                    is_index_scan = true;
+                                    matched_index_name = idx.name.clone();
+                                    break;
                                 }
                             }
                         }
                     }
+
+                    let (cost, est_rows) = if let Some(ref t_def) = table_def_opt {
+                        crate::stats::estimate_scan_cost(t_def, select.selection.as_ref(), is_index_scan)
+                    } else {
+                        (1.0, 1)
+                    };
+
+                    let scan_type = if is_index_scan {
+                        format!("IndexScan: {} on index {} (cost={:.2} rows={})", base_table_name, matched_index_name, cost, est_rows)
+                    } else {
+                        format!("TableScan: {} (cost={:.2} rows={})", base_table_name, cost, est_rows)
+                    };
                     lines.push(scan_type);
 
                     for join in &from_table.joins {
@@ -3278,6 +3470,7 @@ fn apply_join(
     }
 
     fn execute_query(&self, tx: &Transaction, query: Query) -> H2Result<ExecutionResult> {
+        let _grant = self.admission.acquire_grant(64 * 1024, std::time::Duration::from_secs(5))?;
         self.execute_query_with_ctes(tx, query, &HashMap::new())
     }
 
@@ -3650,14 +3843,22 @@ fn apply_join(
                                             false,
                                             false,
                                         ),
+                                        crate::catalog::ColumnDef::new(
+                                            "table_rows",
+                                            h2_types::DataType::BigInt,
+                                            false,
+                                            false,
+                                        ),
                                     ],
                                 );
                                 let tables = self.catalog.all_tables();
                                 let mut rows = Vec::new();
                                 for t in tables {
+                                    let row_cnt = t.stats.as_ref().map(|s| s.row_count as i64).unwrap_or(t.approx_row_count);
                                     rows.push(Row::new(vec![
                                         Value::String(t.name.clone()),
                                         Value::Integer(t.columns.len() as i32),
+                                        Value::BigInt(row_cnt),
                                     ]));
                                 }
                                 (t_def, rows)
@@ -3737,35 +3938,33 @@ fn apply_join(
 
                                 let map_name = table_def.map_name();
 
-                                // IndexScan の最適化
+                                // IndexScan の最適化 (等値 & Range Scan 対応)
                                 let mut index_scanned: Option<Vec<Row>> = None;
                                 if from_table.joins.is_empty() {
-                                    if let Some(Expr::BinaryOp { left, op: BinaryOperator::Eq, right }) = &select.selection {
-                                        if let Expr::Identifier(ident) = left.as_ref() {
-                                            let col_name = &ident.value;
-                                            let indexes = self.catalog.get_table_indexes(&base_table_name);
-                                            if let Some(target_idx) = indexes.iter().find(|i| i.columns[0].eq_ignore_ascii_case(col_name)) {
-                                                if let Ok(search_val) = evaluate_literal_or_unary(right) {
-                                                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
-                                                    let idx_entries = tx.scan_visible(&idx_map_name)?;
-                                                    let mut matched_row_ids = Vec::new();
-                                                    for (k, _) in idx_entries {
-                                                        if let Some((v, r_id)) = decode_index_key(&k) {
-                                                            if v == search_val {
-                                                                matched_row_ids.push(r_id);
-                                                            }
+                                    if let Some(ref sel) = select.selection {
+                                        let indexes = self.catalog.get_table_indexes(&base_table_name);
+                                        for target_idx in &indexes {
+                                            if let Some(filter_fn) = Self::build_index_filter(sel, &target_idx.columns[0]) {
+                                                let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                                let idx_entries = tx.scan_visible(&idx_map_name)?;
+                                                let mut matched_row_ids = Vec::new();
+                                                for (k, _) in idx_entries {
+                                                    if let Some((v, r_id)) = decode_index_key(&k) {
+                                                        if filter_fn(&v) {
+                                                            matched_row_ids.push(r_id);
                                                         }
                                                     }
-                                                    let mut fetched = Vec::new();
-                                                    for r_id in matched_row_ids {
-                                                        if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
-                                                            let mut row = Row::from_bytes(&val_bytes)?;
-                                                            table_def.align_row(&mut row);
-                                                            fetched.push(row);
-                                                        }
-                                                    }
-                                                    index_scanned = Some(fetched);
                                                 }
+                                                let mut fetched = Vec::new();
+                                                for r_id in matched_row_ids {
+                                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                        let mut row = Row::from_bytes(&val_bytes)?;
+                                                        table_def.align_row(&mut row);
+                                                        fetched.push(row);
+                                                    }
+                                                }
+                                                index_scanned = Some(fetched);
+                                                break;
                                             }
                                         }
                                     }
@@ -3912,7 +4111,8 @@ fn apply_join(
                             catalog: Some(Arc::clone(&self.catalog)),
                         };
 
-                        rows.sort_by(|a, b| {
+                        let work_mem = self.memory_config.work_mem();
+                        let mut sorter = crate::memory::ExternalSorter::new(work_mem, |a: &Row, b: &Row| {
                             for order_expr in &order_by.exprs {
                                 let val_a = evaluate_expr_context(&order_expr.expr, &res_ctx, a).unwrap_or(Value::Null);
                                 let val_b = evaluate_expr_context(&order_expr.expr, &res_ctx, b).unwrap_or(Value::Null);
@@ -3927,6 +4127,10 @@ fn apply_join(
                             }
                             std::cmp::Ordering::Equal
                         });
+                        for r in rows {
+                            sorter.add_row(r)?;
+                        }
+                        rows = sorter.finish()?;
                     }
 
                     (result_columns, rows)
@@ -4003,7 +4207,8 @@ fn apply_join(
 
                     // ORDER BY
                     if let Some(order_by) = &query.order_by {
-                        extended_rows.sort_by(|a, b| {
+                        let work_mem = self.memory_config.work_mem();
+                        let mut sorter = crate::memory::ExternalSorter::new(work_mem, |a: &Row, b: &Row| {
                             for order_expr in &order_by.exprs {
                                 let val_a = evaluate_expr_context(&order_expr.expr, &sort_ctx, a).unwrap_or(Value::Null);
                                 let val_b = evaluate_expr_context(&order_expr.expr, &sort_ctx, b).unwrap_or(Value::Null);
@@ -4018,6 +4223,10 @@ fn apply_join(
                             }
                             std::cmp::Ordering::Equal
                         });
+                        for r in extended_rows {
+                            sorter.add_row(r)?;
+                        }
+                        extended_rows = sorter.finish()?;
                     }
 
                     let mut rows = Vec::with_capacity(extended_rows.len());
@@ -4072,11 +4281,19 @@ fn apply_join(
                     None
                 };
 
-                let final_rows = if let Some(lim) = limit_num {
+                let final_rows: Vec<Row> = if let Some(lim) = limit_num {
                     final_rows.into_iter().skip(offset_num).take(lim).collect()
                 } else {
                     final_rows.into_iter().skip(offset_num).collect()
                 };
+
+                let max_rows = self.memory_config.max_materialized_rows();
+                if max_rows > 0 && final_rows.len() > max_rows {
+                    return Err(H2Error::Execution(format!(
+                        "Query exceeded maximum materialized row limit ({}); consider adding LIMIT or pagination",
+                        max_rows
+                    )));
+                }
 
                 Ok(ExecutionResult::Query {
                     columns: result_columns,

@@ -1,4 +1,4 @@
-﻿# 10. 統計情報収集・更新機構の調査報告
+# 10. 統計情報収集・更新機構の調査報告
 
 > 調査日: 2026-09-25
 > 調査対象ブランチ: `main`
@@ -322,19 +322,44 @@ B-Tree は本来範囲スキャンをサポートするため、MVStore の API 
 
 ---
 
-## 10. まとめ
+## 10. 調査時の評価まとめ（実装前）
 
-| 評価項目 | 現状 |
+| 評価項目 | 調査時点 |
 |---|---|
-| 統計情報収集機構 | **未実装** |
-| 統計情報格納フィールド | **未実装** |
-| `ANALYZE` 文 | **未実装** |
-| コストベース最適化 | **未実装（全てルールベース）** |
-| インデックス選択 | **等値条件のみ、コスト比較なし** |
-| JOIN 順序選択 | **SQL 記述順に固定** |
-| JOIN アルゴリズム | **Nested Loop のみ** |
-| EXPLAIN コスト出力 | **未実装（構文情報のみ）** |
+| 統計情報収集機構 | 未実装 |
+| 統計情報格納フィールド | 未実装 |
+| `ANALYZE` 文 | 未実装 |
+| コストベース最適化 | 未実装（全てルールベース） |
+| インデックス選択 | 等値条件のみ、コスト比較なし |
+| JOIN 順序選択 | SQL 記述順に固定 |
+| JOIN アルゴリズム | Nested Loop のみ |
+| EXPLAIN コスト出力 | 未実装（構文情報のみ） |
 
-**現時点では全クエリがルールベースで実行され、テーブルが大きくなるにつれてパフォーマンスが急速に低下するリスクがある。**
-最も費用対効果の高い短期改善は「近似行数カウンタの追加」と「Range Scan サポート」であり、いずれも統計機構が完成する前から着手可能である。
-本格的な統計情報基盤（`ANALYZE`・コストモデル・JOIN 最適化）は **Phase 2 の Buffer Pool 完成後**に導入することを推奨する。
+---
+
+## 11. 統計情報基盤の実装完了報告 (2026-09-25)
+
+上記の調査結果およびロードマップに基づき、**統計情報基盤およびコストベース最適化の完全実装が完了**しました。
+
+### 11.1 実装内容
+
+1. **カタログへの統計情報構造体追加 (`crates/h2-sql/src/catalog.rs`)**:
+   - `TableStats`: 行数（`row_count`）、削除行数（`dead_row_count`）、最終解析時刻（`last_analyzed`）、推定ページ数（`total_pages`）。
+   - `ColumnStats`: NDV（`ndv`）、NULL率（`null_frac`）、平均幅（`avg_width`）、頻出値 Top 10（`most_common_vals`）および頻度（`most_common_freqs`）。
+   - `TableDef` に `stats: Option<TableStats>` と `approx_row_count: i64` を追加。
+   - `ColumnDef` に `stats: Option<ColumnStats>` を追加。
+   - `INSERT` 時に `+affected_rows`、`DELETE` 時に `-affected_rows`、`TRUNCATE` 時に `0` に自動更新。
+2. **`ANALYZE` 文の実装 (`crates/h2-sql/src/stats.rs`, `executor.rs`)**:
+   - `ANALYZE [table_name]` および `ANALYZE`（全テーブル）構文の実行をサポート。
+   - テーブル内の全タプルを走査し、正確な行数・NULL率・ユニーク値数（NDV）・頻出値 Top 10・平均バイト幅・8KB換算ページ数を集計してカタログへ永続化。
+3. **選択率推定（Selectivity Estimation）とコストモデル (`crates/h2-sql/src/stats.rs`)**:
+   - 等値条件（MCV または 1/NDV）、不等号条件（`<, <=, >, >=`）、`BETWEEN`、`IS NULL`、`AND`、`OR` の選択率を数理的に推定。
+   - `estimate_scan_cost`: シーケンシャルスキャン（ページI/O + 行評価コスト）とインデックススキャン（インデックスI/O + ランダム行アクセス）のコストを計算。
+4. **Range Scan インデックス活用 (`crates/h2-sql/src/executor.rs`)**:
+   - 従来の `=` 等値比較だけでなく、`<`, `<=`, `>`, `>=`, `BETWEEN` でもインデックスを活用したスキャンを実行。
+5. **EXPLAIN 出力のコスト・行数表示**:
+   - `TableScan: table (cost=X.XX rows=N)`
+   - `IndexScan: table on index idx (cost=X.XX rows=N)`
+   - 推定コストと推定行数を詳細に表示。
+6. **`information_schema.TABLES` の `TABLE_ROWS` 列追加**:
+   - 統計または近似行数をリアルタイムに参照可能。

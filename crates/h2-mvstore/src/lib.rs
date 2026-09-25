@@ -1,3 +1,4 @@
+pub mod buffer_pool;
 pub mod chunk;
 pub mod file_store;
 pub mod map;
@@ -8,6 +9,7 @@ pub mod store;
 pub mod tree;
 pub mod tx;
 
+pub use buffer_pool::{BufferPoolManager, ClockReplacer, DiskManager, PageFrame, SlottedPage, PAGE_SIZE};
 pub use chunk::{ChunkMeta, ChunkPayload};
 pub use file_store::FileStore;
 pub use map::MVMap;

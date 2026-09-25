@@ -10,8 +10,27 @@ fn default_schema() -> String {
     "public".to_string()
 }
 
+/// カラム統計情報
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ColumnStats {
+    pub ndv: u64,
+    pub null_frac: f64,
+    pub avg_width: f64,
+    pub most_common_vals: Vec<h2_types::Value>,
+    pub most_common_freqs: Vec<f64>,
+}
+
+/// テーブル統計情報
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableStats {
+    pub row_count: u64,
+    pub dead_row_count: u64,
+    pub last_analyzed: Option<u64>,
+    pub total_pages: u64,
+}
+
 /// カラム定義
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -21,6 +40,8 @@ pub struct ColumnDef {
     pub physical_index: Option<usize>,
     #[serde(default)]
     pub sequence_name: Option<String>,
+    #[serde(default)]
+    pub stats: Option<ColumnStats>,
 }
 
 impl ColumnDef {
@@ -32,6 +53,7 @@ impl ColumnDef {
             is_primary_key,
             physical_index: None,
             sequence_name: None,
+            stats: None,
         }
     }
 }
@@ -102,7 +124,7 @@ pub struct UniqueConstraintDef {
 }
 
 /// テーブル定義
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableDef {
     pub name: String,
     #[serde(default = "default_schema")]
@@ -121,6 +143,10 @@ pub struct TableDef {
     pub retention_duration_ms: Option<u64>,
     #[serde(default)]
     pub max_bytes: Option<u64>,
+    #[serde(default)]
+    pub stats: Option<TableStats>,
+    #[serde(default)]
+    pub approx_row_count: i64,
 }
 
 impl TableDef {
@@ -146,6 +172,8 @@ impl TableDef {
             is_queue: false,
             retention_duration_ms: None,
             max_bytes: None,
+            stats: None,
+            approx_row_count: 0,
         }
     }
 
@@ -186,6 +214,8 @@ impl TableDef {
             is_queue: true,
             retention_duration_ms,
             max_bytes,
+            stats: None,
+            approx_row_count: 0,
         }
     }
 
@@ -603,6 +633,41 @@ impl Catalog {
         }
 
         Ok(())
+    }
+
+    pub fn update_table_stats(
+        &self,
+        table_name: &str,
+        stats: TableStats,
+        column_stats: HashMap<String, ColumnStats>,
+    ) -> H2Result<()> {
+        let mut table = self.get_table(table_name)
+            .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+        table.stats = Some(stats);
+        for col in &mut table.columns {
+            if let Some(cs) = column_stats.get(&col.name.to_lowercase()) {
+                col.stats = Some(cs.clone());
+            }
+        }
+        self.update_table(table)
+    }
+
+    pub fn update_approx_row_count(&self, table_name: &str, delta: i64) -> H2Result<()> {
+        let mut table = match self.get_table(table_name) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        table.approx_row_count = (table.approx_row_count + delta).max(0);
+        self.update_table(table)
+    }
+
+    pub fn reset_approx_row_count(&self, table_name: &str, count: i64) -> H2Result<()> {
+        let mut table = match self.get_table(table_name) {
+            Some(t) => t,
+            None => return Ok(()),
+        };
+        table.approx_row_count = count.max(0);
+        self.update_table(table)
     }
 
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> H2Result<()> {

@@ -3,22 +3,18 @@ pub mod catalog;
 pub mod executor;
 pub mod expression;
 pub mod fts;
+pub mod memory;
 pub mod parser;
 pub mod row;
+pub mod stats;
 
 pub use auth::{AuthManager, Privilege, UserInfo};
-
-
-
-
-
-pub use catalog::{Catalog, ColumnDef, IndexDef, TableDef};
-
-
-
+pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats};
 pub use executor::{ExecutionResult, SQLEngine};
 pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
+pub use memory::{ExternalSorter, MemoryConfig, MemoryGrant, MemoryGrantCoordinator, MemoryTracker};
 pub use row::Row;
+pub use stats::{analyze_table, estimate_scan_cost, estimate_selectivity};
 
 #[cfg(test)]
 mod tests {

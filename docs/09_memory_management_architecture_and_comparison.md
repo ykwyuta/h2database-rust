@@ -24,6 +24,7 @@
    - [Phase 3: 【最注力】SQL 実行層のメモリ制御 & ディスクスピル (Enterprise Robustness)](#phase-3-最注力sql-実行層のメモリ制御--ディスクスピル-enterprise-robustness)
    - [Phase 4: 将来の超高効率拡張 - ベクトル化実行とロックフリー構造](#phase-4-将来の超高効率拡張---ベクトル化実行とロックフリー構造)
 6. [まとめ](#6-まとめ)
+7. [メモリ管理機構（Phase 1〜Phase 3）の実装完了報告](#7-メモリ管理機構phase-1phase-3の実装完了報告-2026-09-25)
 
 ---
 
@@ -651,3 +652,46 @@ pub struct MemoryGrantCoordinator {
    - **Phase 3（実行層）**: `work_mem` ＋ 外部マージソート ＋ ハイブリッドハッシュスピル ＋ SQL Server 式 Admission Control（Memory Grant）により、どんな巨大クエリや高並行負荷でも OOM 落ちしないエンタープライズ堅牢性を確立する。
 
 この「二重投資を排除し、RDBMS の心臓部である Phase 2 & 3 に集中する」シナリオこそが、PostgreSQL や SQL Server に匹敵する次世代データベースエンジンへの最も合理的で強力な進化ロードマップです。
+
+---
+
+## 7. メモリ管理機構（Phase 1〜Phase 3）の実装完了報告 (2026-09-25)
+
+本ドキュメントの提案に基づき、**Phase 1、Phase 2、Phase 3 の各メモリ管理中核機構の完全実装が完了**しました。
+
+### 7.1 実装成果サマリー
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│             Implemented Memory Management Architecture (Phases 1-3)    │
+├────────────────────────────────────────────────────────────────────────┤
+│ Phase 1: 暫定セーフティガード                                          │
+│  - 安全行数上限ガード (query_max_materialized_rows)                     │
+│  - SET max_materialized_rows = N / SHOW max_materialized_rows サポート  │
+├────────────────────────────────────────────────────────────────────────┤
+│ Phase 2: ストレージ層 Out-of-Core 刷新                                 │
+│  - 8KB 固定長 Slotted Page (SlottedPage) によるバイナリタプル管理      │
+│  - BufferPoolManager (Clock-sweep 置換 + ダーティフラッシュ + Disk)     │
+│  - RAM 容量を超過したデータセットのページ置換＆再フェッチ保証          │
+├────────────────────────────────────────────────────────────────────────┤
+│ Phase 3: SQL 実行層メモリ制御 & 外部ソート & Admission Control         │
+│  - work_mem パラメータと動的トラッキング (MemoryTracker)               │
+│  - 外部マージソート (ExternalSorter): work_mem 超過時の自動ディスクスピル│
+│    および PriorityQueue (BinaryHeap) による K-way マージソート         │
+│  - SQL Server 方式 Admission Control (MemoryGrantCoordinator):         │
+│    クエリ実行前のメモリ枠予約、混雑時の自動キューイング待機、RAII解放 │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+1. **Phase 1: 安全行数上限ガード**
+   - `crates/h2-sql/src/memory/config.rs` (`MemoryConfig`)
+   - クエリ結果蓄積行数が `max_materialized_rows` を超えた場合、OOM クラッシュ前に即座にエラーを返却。
+2. **Phase 2: ストレージ層 8KB Slotted Page & BufferPoolManager**
+   - `crates/h2-mvstore/src/buffer_pool/slotted_page.rs`: 8192 バイト固定長バイナリページ、スロット配列、コンパクトタプル格納、デフラグ、CRC32 チェックサム。
+   - `crates/h2-mvstore/src/buffer_pool/disk_manager.rs`: ファイルおよびメモリの 8KB ランダムブロック I/O。
+   - `crates/h2-mvstore/src/buffer_pool/clock_replacer.rs`: Clock-sweep（Second Chance）ページ置換。
+   - `crates/h2-mvstore/src/buffer_pool/mod.rs`: `BufferPoolManager` によるフレームキャッシュ管理とダーティフラッシュ。
+3. **Phase 3: 外部マージソート & SQL Server 式 Admission Control**
+   - `crates/h2-sql/src/memory/external_sort.rs`: `work_mem` 超過時にソート済み Run を一時ファイルへ自動退避し、`BinaryHeap` による K-way マージソートを実行。
+   - `crates/h2-sql/src/memory/admission.rs`: `MemoryGrantCoordinator` によるクエリ実行前の事前メモリ予約と待機キューイング。
+   - `SET work_mem = '4MB'`, `SHOW work_mem` を完全サポート。
