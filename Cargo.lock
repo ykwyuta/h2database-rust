@@ -674,6 +674,7 @@ name = "h2-sql"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "bincode",
  "chrono",
  "h2-mvstore",
  "h2-types",

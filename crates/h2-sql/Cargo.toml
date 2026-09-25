@@ -18,4 +18,5 @@ chrono = { workspace = true }
 regex = { workspace = true }
 uuid = { workspace = true }
 arrow = { workspace = true }
+bincode = "1.3"
 
