@@ -50,3 +50,11 @@
    - JMS 2.0/3.0 準拠インターフェースと Kafka 風オフセットシーク（`seek`, `rewind`, timestamp seek）
    - 二重保持ポリシー（保持期間 & 容量上限超過時のオンライン Head Truncation GC）
 
+8. [08. コンピュート・ストレージ分離アーキテクチャ設計 (08_decoupled_storage_architecture.md)](./08_decoupled_storage_architecture.md)
+   - AWS Aurora / AlloyDB 型のコンピュート・ストレージ完全分離設計
+   - "The Log is the Database"（ネットワーク越しには WAL ログレコードのみ送信、ダーティページ転送の完全撤廃）
+   - 共有分散ストレージフリートとゼロストレージ・リードレプリカ（追加ストレージコスト 0）
+   - 4/6 クォーラム書き込み、AZ 障害耐性、ピアツーピア・ゴシップ自己修復
+   - 組み込みモード（Local MVStore）と分離モード（Distributed LogStore）のハイブリッド統合
+
+
