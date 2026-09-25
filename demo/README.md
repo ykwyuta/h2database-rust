@@ -21,6 +21,8 @@
 | [**demo/011 専用CLI: 高度SQL**](./011_cli_advanced_sql/README.md) | 専用CLI・高度SQL | `h2-cli`, Online DDL, 再帰CTE, ウィンドウ関数 | 専用 CLI から実行する Instant/Online DDL, UPSERT, 再帰CTE, 6種のJOIN, 集合演算, ウィンドウ関数, 日本語全文検索, 外部キーCASCADE デモ |
 | [**demo/012 専用CLI: システム・運用**](./012_cli_system_and_maintenance/README.md) | 専用CLI・運用保守 | `h2-cli`, SEQUENCE, カーソル, BACKUP/COPY | 専用 CLI から実行する シーケンス生成器, SERIAL, INTERVAL日時計算, サーバサイドカーソル走査, 高度数学・正規表現関数, CSVデータ移行, 物理バックアップ・リストア, VACUUM デモ |
 | [**demo/013 専用CLI: トランザクショナルMQ**](./013_cli_transactional_mq/README.md) | 専用CLI・ネイティブMQ | `h2-cli`, `QUEUE TABLE`, アトミックロールバック | 専用 CLI から直接実行する `CREATE QUEUE TABLE`、アトミックコミット＆ロールバック（Outbox不要の実証）、Kafka風オフセットシーク再生、安全ガード実演デモ |
+| [**demo/014 専用CLI: ユーザー認証・アクセス元制限・テーブル権限管理**](./014_cli_auth_and_permissions/README.md) | 専用CLI・セキュリティ | `h2-cli`, DCL, 認証, ホスト制限, 権限管理 | 専用 CLI から実行する ユーザー作成（CREATE USER）、パスワード認証、ホストIP/CIDR制限、テーブル単位の権限付与・剥奪（GRANT/REVOKE SELECT/INSERT/UPDATE/DELETE）、権限昇格拒否デモ |
+| [**demo/015 Spring Boot & JMS: JmsTemplate & @JmsListener**](./015_spring_boot_jms_template_and_listener/README.md) | Spring JMS パターン集 | Spring Boot 3.4, Spring JMS, JmsTemplate, @JmsListener, @SendTo | Spring JMS の標準機能（`JmsTemplate.convertAndSend`、`receiveAndConvert`、`@JmsListener` 非同期購読、`@SendTo` による自動返信 RPC、`@Header` プロパティ注入、`@Transactional` アトミックロールバック）を網羅したデモ |
 
 ---
 
@@ -67,4 +69,11 @@ cargo run -p h2-cli -- -f demo/012_cli_system_and_maintenance/script.sql
 
 # 13. 専用CLI デモ 3: トランザクショナル・キューテーブル デモの実行
 cargo run -p h2-cli -- -f demo/013_cli_transactional_mq/script.sql
+
+# 14. 専用CLI デモ 4: ユーザー認証・アクセス元制限・テーブル権限管理 デモの実行
+cargo run -p h2-cli -- -f demo/014_cli_auth_and_permissions/script.sql
+
+# 15. Spring Boot & JMS (JmsTemplate & @JmsListener パターン集) デモの実行
+# (別ターミナルで cargo run -p demo-spring-boot-server を起動後)
+cd demo/015_spring_boot_jms_template_and_listener && run_demo.bat  # または mvn spring-boot:run
 ```

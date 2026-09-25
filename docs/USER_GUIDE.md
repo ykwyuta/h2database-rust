@@ -1280,9 +1280,48 @@ public void onOrderEvent(Message message) {
 }
 ```
 
-### 4.5 実践デモプロジェクト
+### 4.5 JmsTemplate と @JmsListener による実践パターン
+
+Spring JMS が提供する高度なエンタープライズパターン（POJO 自動マッピング、`@SendTo` による Request-Reply、`@Header` プロパティ注入、アトミックロールバック）がそのまま透過的に動作します。
+
+```java
+// 1. POJO 送信とメッセージヘッダー付与
+@Service
+public class PaymentClient {
+    @Autowired
+    private JmsTemplate jmsTemplate;
+
+    public void sendPaymentRequest(PaymentRequest req) {
+        jmsTemplate.convertAndSend("payment_request_queue", req, message -> {
+            message.setStringProperty("sourceApp", "BillingService");
+            message.setStringProperty("priorityLevel", "HIGH");
+            return message;
+        });
+    }
+
+    // 2. 同期ポーリング受信
+    public PaymentResponse pollReplySync() {
+        return (PaymentResponse) jmsTemplate.receiveAndConvert("payment_reply_queue");
+    }
+}
+
+// 3. @JmsListener による非同期購読と @SendTo 自動返信 (RPC パターン)
+@Component
+public class PaymentProcessorListener {
+    @JmsListener(destination = "payment_request_queue")
+    @SendTo("payment_reply_queue")
+    public PaymentResponse process(@Payload PaymentRequest request,
+                                  @Header("sourceApp") String sourceApp) {
+        log.info("Processing payment from source: {}", sourceApp);
+        return new PaymentResponse(request.getId(), "SUCCESS", "TX-12345");
+    }
+}
+```
+
+### 4.6 実践デモプロジェクト
 - **[demo/009_spring_boot_mybatis](../demo/009_spring_boot_mybatis/README.md)**: 全SQL機能 ＋ Primary/Standby 同期レプリケーション動的ルーティング
 - **[demo/010_spring_boot_jms](../demo/010_spring_boot_jms/README.md)**: Spring JMS スタンダード ＋ MyBatis トランザクショナル・キューテーブル（Outbox レス・アトミック実証 & Kafka 風オフセットリプレイ）
+- **[demo/015_spring_boot_jms_template_and_listener](../demo/015_spring_boot_jms_template_and_listener/README.md)**: Spring JMS パターン集（`JmsTemplate` 送受信、`@JmsListener` 非同期購読、`@SendTo` Request-Reply RPC、`@Header` プロパティ連携、`@Transactional` ロールバック検証）
 
 ---
 
@@ -1363,6 +1402,7 @@ h2> .read script.sql
 - **[demo/011 専用CLI: 高度な SQL & クエリ演算](../demo/011_cli_advanced_sql/README.md)**: Instant/Online DDL, UPSERT, 再帰CTE, 6種のJOIN, 集合演算, ウィンドウ関数, 日本語全文検索, 外部キーCASCADE
 - **[demo/012 専用CLI: システム・運用・カーソル](../demo/012_cli_system_and_maintenance/README.md)**: シーケンス生成器 (SEQUENCE), SERIAL, INTERVAL日時計算, サーバサイドカーソル走査, 高度数学・正規表現関数, CSVデータ移行, 物理バックアップ・リストア, VACUUM
 - **[demo/013 専用CLI: トランザクショナルMQ](../demo/013_cli_transactional_mq/README.md)**: トランザクショナル・キューテーブル, アトミックコミット＆ロールバック (Outbox不要の実証), Kafka風オフセットシーク再生, 安全ガード
+- **[demo/014 専用CLI: ユーザー認証・アクセス元制限・テーブル権限管理](../demo/014_cli_auth_and_permissions/README.md)**: ユーザー作成 (CREATE USER), パスワード認証, ホストIP/CIDR制限, テーブル単位の権限付与・剥奪 (GRANT/REVOKE SELECT/INSERT/UPDATE/DELETE), 権限昇格拒否
 
 ## 4. ストレージのオンライン・コンパクション (Concurrent Vacuum によるファイル縮小)
 
@@ -1389,6 +1429,57 @@ conn.vacuum()?;
 // 非同期 API
 async_conn.vacuum().await?;
 ```
+
+## 5. ユーザー認証・アクセス元制限・テーブル権限管理 (DCL & Security)
+
+H2 Database Rust は、マルチテナント環境やエンタープライズ運用に必要な**ユーザー認証**、**クライアント IP/ホスト制限**、および**テーブル単位のきめ細かなアクセス制御（DCL: GRANT / REVOKE）**を完全サポートしています。
+
+### ユーザーの作成・変更・削除 (`CREATE / ALTER / DROP USER`)
+
+```sql
+-- 1. 管理者（ADMIN）ユーザーの作成（ホスト制限なし）
+CREATE USER admin_alice WITH PASSWORD 'SecureSecret123!' ADMIN;
+
+-- 2. 社内 LAN (192.168.1.0/24) および ローカルホストからのみ接続可能な一般ユーザーの作成
+CREATE USER app_service WITH PASSWORD 'AppPass2026' ALLOW HOST '192.168.1.0/24', '127.0.0.1';
+
+-- 3. パスワードの変更やホスト許可リストの更新
+ALTER USER app_service WITH PASSWORD 'NewAppPass2026' ALLOW HOST '10.0.0.0/8';
+
+-- 4. ユーザーの削除
+DROP USER app_service;
+```
+
+### テーブル単位のアクセス権限管理 (`GRANT / REVOKE`)
+
+権限付与の最小単位はテーブルで、行や列の過剰な複雑性を排したシンプルかつ高速な認可機構を提供します。
+
+| 権限 | 許可される操作 |
+| :--- | :--- |
+| `SELECT` | 対象テーブルの参照・集計クエリ |
+| `INSERT` | 対象テーブルへの行挿入 |
+| `UPDATE` | 対象テーブルの既存行の更新 |
+| `DELETE` | 対象テーブルの行削除 |
+| `ALL` / `ALL PRIVILEGES` | 上記すべてのデータ操作権限 |
+
+```sql
+-- 参照専用ロールとして SELECT 権限のみ付与
+GRANT SELECT ON orders TO reporting_user;
+
+-- 更新・挿入権限を個別に付与
+GRANT INSERT, UPDATE ON orders TO payment_service;
+
+-- 特定の権限を剥奪
+REVOKE UPDATE ON orders FROM payment_service;
+
+-- 全権限の一括剥奪
+REVOKE ALL PRIVILEGES ON orders FROM reporting_user;
+```
+
+> [!TIP]
+> - 管理者権限（`ADMIN`）を持つユーザーは、すべてのテーブルに対する全操作権限を常に保持します。
+> - 一般ユーザーが未許可の操作を試みると、`H2Error::PermissionDenied`（SQLSTATE 42501）が発生し、不正アクセスを確実にブロックします。
+> - 一般ユーザーが `CREATE USER` や `GRANT` による権限昇格を試みた場合も、`Privilege Escalation Denied` として即座に拒絶されます。
 
 ---
 
@@ -1653,6 +1744,12 @@ REVOKE UPDATE ON TABLE orders FROM 'operator';
 | `DECLARE CURSOR` | `DECLARE cur CURSOR FOR SELECT ...;` | サーバサイドカーソルの定義 |
 | `FETCH` | `FETCH [NEXT / PRIOR / FIRST / LAST / ABSOLUTE n] FROM cur;` | カーソルからの行フェッチ |
 | `CLOSE` | `CLOSE cur;` | カーソルのクローズとリソース解放 |
+| `CREATE USER` | `CREATE USER u WITH PASSWORD 'pwd' [ALLOW HOST 'ip/cidr', ...] [ADMIN]` | 認証ユーザーの作成・ホスト制限設定 |
+| `ALTER USER` | `ALTER USER u WITH PASSWORD 'new_pwd' [ALLOW HOST 'ip/cidr', ...]` | ユーザー設定・パスワード・ホスト制限の変更 |
+| `DROP USER` | `DROP USER [IF EXISTS] u` | ユーザーの削除 |
+| `GRANT` | `GRANT SELECT, INSERT ON tbl TO u` | テーブルに対するデータ操作権限の付与 |
+| `REVOKE` | `REVOKE UPDATE, DELETE ON tbl FROM u` | テーブルに対するデータ操作権限の剥奪 |
+| `SHOW GRANTS` | `SHOW GRANTS FOR u;` | 指定ユーザーに付与されているテーブル権限の一覧表示 |
 
 ### 組み込み関数・演算子
 

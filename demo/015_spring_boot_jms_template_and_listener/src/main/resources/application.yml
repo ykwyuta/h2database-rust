@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: demo-spring-boot-jms-patterns
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jms_patterns_db?preferQueryMode=simple
+    username: postgres
+    password: ""
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: HikariPool-JMS-Patterns
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 3000
+      connection-test-query: SELECT 1
+
+logging:
+  level:
+    root: INFO
+    com.example.jms: INFO
+    org.springframework.jms: INFO

@@ -206,6 +206,7 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                         "client_encoding" => "UTF8",
                         "server_version" => "15.0 (h2-rust)",
                         "standard_conforming_strings" => "on",
+                        "transaction_isolation" | "default_transaction_isolation" => "read committed",
                         _ => "on",
                     };
                     stream.write_all(&PgMessageBuilder::row_description(&[var])).await?;
