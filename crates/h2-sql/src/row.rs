@@ -273,3 +273,76 @@ fn decode_value(bytes: &[u8]) -> Option<(Value, usize)> {
         _ => None,
     }
 }
+
+/// 指定カラムの値だけをゼロコピーで抽出（数値の場合は i64/f64 にキャストして返却）
+pub fn extract_numeric_column(bytes: &[u8], target_col: usize) -> Option<(i64, f64)> {
+    if bytes.len() < 5 || bytes[0] != 0xAA {
+        return None;
+    }
+    let count = u32::from_le_bytes(bytes[1..5].try_into().ok()?) as usize;
+    if target_col >= count {
+        return None;
+    }
+    let mut offset = 5;
+    for col in 0..=target_col {
+        if offset >= bytes.len() {
+            return None;
+        }
+        let tag = bytes[offset];
+        let (val_i64, val_f64, size) = match tag {
+            0 => (0, 0.0, 1),
+            1 => {
+                if offset + 2 > bytes.len() { return None; }
+                (if bytes[offset + 1] != 0 { 1 } else { 0 }, if bytes[offset + 1] != 0 { 1.0 } else { 0.0 }, 2)
+            }
+            2 => {
+                if offset + 2 > bytes.len() { return None; }
+                let v = bytes[offset + 1] as i8 as i64;
+                (v, v as f64, 2)
+            }
+            3 => {
+                if offset + 3 > bytes.len() { return None; }
+                let v = i16::from_le_bytes(bytes[offset + 1..offset + 3].try_into().ok()?) as i64;
+                (v, v as f64, 3)
+            }
+            4 => {
+                if offset + 5 > bytes.len() { return None; }
+                let v = i32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().ok()?) as i64;
+                (v, v as f64, 5)
+            }
+            5 => {
+                if offset + 9 > bytes.len() { return None; }
+                let v = i64::from_le_bytes(bytes[offset + 1..offset + 9].try_into().ok()?);
+                (v, v as f64, 9)
+            }
+            6 => {
+                if offset + 5 > bytes.len() { return None; }
+                let v = f32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().ok()?);
+                (v as i64, v as f64, 5)
+            }
+            7 => {
+                if offset + 9 > bytes.len() { return None; }
+                let v = f64::from_le_bytes(bytes[offset + 1..offset + 9].try_into().ok()?);
+                (v as i64, v, 9)
+            }
+            9 | 10 | 14 | 15 => {
+                if offset + 5 > bytes.len() { return None; }
+                let len = u32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().ok()?) as usize;
+                (0, 0.0, 5 + len)
+            }
+            8 => (0, 0.0, 17),
+            11 => (0, 0.0, 5),
+            12 => (0, 0.0, 9),
+            13 => (0, 0.0, 13),
+            _ => return None,
+        };
+        if col == target_col {
+            if tag == 0 {
+                return None; // Null
+            }
+            return Some((val_i64, val_f64));
+        }
+        offset += size;
+    }
+    None
+}

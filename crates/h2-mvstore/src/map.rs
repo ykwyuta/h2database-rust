@@ -55,6 +55,10 @@ impl MVMap {
         self.tree.read().scan_all()
     }
 
+    pub fn for_each_entry<F: FnMut(&[u8], &[u8])>(&self, f: F) {
+        self.tree.read().for_each_entry(f)
+    }
+
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<Entry> {
         self.tree.read().scan_prefix(prefix)
     }

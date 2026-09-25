@@ -1113,13 +1113,10 @@ impl SQLEngine {
         }
     }
 
-    fn try_execute_vectorized_aggregate(
-        &self,
+    fn parse_aggregate_ops(
         projection: &[SelectItem],
-        filtered_rows: &[Row],
-        base_table_def: &TableDef,
         ctx: &RowContext,
-    ) -> Option<(Vec<String>, Vec<Row>)> {
+    ) -> Option<(Vec<String>, Vec<crate::vectorized::VectorAggregateOp>)> {
         let mut ops = Vec::new();
         let mut col_names = Vec::new();
 
@@ -1172,6 +1169,146 @@ impl SQLEngine {
                 _ => return None,
             }
         }
+        Some((col_names, ops))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn try_execute_pushdown_aggregate<'a, I>(
+        ops: &[crate::vectorized::VectorAggregateOp],
+        col_names: &[String],
+        raw_val_bytes_iter: I,
+        table_def: &TableDef,
+    ) -> ExecutionResult
+    where
+        I: IntoIterator<Item = &'a [u8]>,
+    {
+        let mut sums = vec![0.0f64; ops.len()];
+        let mut counts = vec![0i64; ops.len()];
+        let mut mins = vec![f64::MAX; ops.len()];
+        let mut maxs = vec![f64::MIN; ops.len()];
+        let mut min_ints = vec![i64::MAX; ops.len()];
+        let mut max_ints = vec![i64::MIN; ops.len()];
+
+        for val_bytes in raw_val_bytes_iter {
+            for (i, op) in ops.iter().enumerate() {
+                match op {
+                    crate::vectorized::VectorAggregateOp::CountStar => {
+                        counts[i] += 1;
+                    }
+                    crate::vectorized::VectorAggregateOp::Count(col) => {
+                        if crate::row::extract_numeric_column(val_bytes, *col).is_some() {
+                            counts[i] += 1;
+                        }
+                    }
+                    crate::vectorized::VectorAggregateOp::Sum(col) => {
+                        if let Some((_vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                            sums[i] += vf;
+                            counts[i] += 1;
+                        }
+                    }
+                    crate::vectorized::VectorAggregateOp::Avg(col) => {
+                        if let Some((_vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                            sums[i] += vf;
+                            counts[i] += 1;
+                        }
+                    }
+                    crate::vectorized::VectorAggregateOp::Min(col) => {
+                        if let Some((vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                            if vf < mins[i] { mins[i] = vf; }
+                            if vi < min_ints[i] { min_ints[i] = vi; }
+                            counts[i] += 1;
+                        }
+                    }
+                    crate::vectorized::VectorAggregateOp::Max(col) => {
+                        if let Some((vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                            if vf > maxs[i] { maxs[i] = vf; }
+                            if vi > max_ints[i] { max_ints[i] = vi; }
+                            counts[i] += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        Self::build_pushdown_aggregate_result(ops, col_names, &counts, &sums, &mins, &maxs, &min_ints, &max_ints, table_def)
+    }
+
+    pub(crate) fn build_pushdown_aggregate_result(
+        ops: &[crate::vectorized::VectorAggregateOp],
+        col_names: &[String],
+        counts: &[i64],
+        sums: &[f64],
+        mins: &[f64],
+        maxs: &[f64],
+        min_ints: &[i64],
+        max_ints: &[i64],
+        table_def: &TableDef,
+    ) -> ExecutionResult {
+        let mut row_values = Vec::with_capacity(ops.len());
+        for (i, op) in ops.iter().enumerate() {
+            match op {
+                crate::vectorized::VectorAggregateOp::CountStar | crate::vectorized::VectorAggregateOp::Count(_) => {
+                    row_values.push(Value::BigInt(counts[i]));
+                }
+                crate::vectorized::VectorAggregateOp::Sum(_) => {
+                    if counts[i] == 0 {
+                        row_values.push(Value::Null);
+                    } else {
+                        row_values.push(Value::BigInt(sums[i] as i64));
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Avg(_) => {
+                    if counts[i] == 0 {
+                        row_values.push(Value::Null);
+                    } else {
+                        row_values.push(Value::Double(sums[i] / counts[i] as f64));
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Min(col) => {
+                    if counts[i] == 0 {
+                        row_values.push(Value::Null);
+                    } else {
+                        match table_def.columns.get(*col).map(|c| &c.data_type) {
+                            Some(h2_types::DataType::TinyInt | h2_types::DataType::SmallInt | h2_types::DataType::Integer | h2_types::DataType::BigInt) => {
+                                row_values.push(Value::BigInt(min_ints[i]));
+                            }
+                            _ => {
+                                row_values.push(Value::Double(mins[i]));
+                            }
+                        }
+                    }
+                }
+                crate::vectorized::VectorAggregateOp::Max(col) => {
+                    if counts[i] == 0 {
+                        row_values.push(Value::Null);
+                    } else {
+                        match table_def.columns.get(*col).map(|c| &c.data_type) {
+                            Some(h2_types::DataType::TinyInt | h2_types::DataType::SmallInt | h2_types::DataType::Integer | h2_types::DataType::BigInt) => {
+                                row_values.push(Value::BigInt(max_ints[i]));
+                            }
+                            _ => {
+                                row_values.push(Value::Double(maxs[i]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        ExecutionResult::Query {
+            columns: col_names.to_vec(),
+            rows: vec![Row::new(row_values)],
+        }
+    }
+
+    fn try_execute_vectorized_aggregate(
+        &self,
+        projection: &[SelectItem],
+        filtered_rows: &[Row],
+        base_table_def: &TableDef,
+        ctx: &RowContext,
+    ) -> Option<(Vec<String>, Vec<Row>)> {
+        let (col_names, ops) = Self::parse_aggregate_ops(projection, ctx)?;
 
         let current_mode = self.execution_mode();
         if current_mode == "vectorized" {
@@ -2590,10 +2727,12 @@ fn apply_join(
                                         }
                                     }
 
-                                    let old_key = encode_composite_index_key(&old_vals, row_id);
-                                    tx.remove(&idx_map_name, &old_key)?;
-                                    let new_key = encode_composite_index_key(&new_vals, row_id);
-                                    tx.put(&idx_map_name, new_key, vec![])?;
+                                    if old_vals != new_vals {
+                                        let old_key = encode_composite_index_key(&old_vals, row_id);
+                                        tx.remove(&idx_map_name, &old_key)?;
+                                        let new_key = encode_composite_index_key(&new_vals, row_id);
+                                        tx.put(&idx_map_name, new_key, vec![])?;
+                                    }
                                 }
                             }
 
@@ -2658,10 +2797,12 @@ fn apply_join(
                                         }
                                     }
 
-                                    let old_key = encode_composite_index_key(&old_vals, row_id);
-                                    tx.remove(&idx_map_name, &old_key)?;
-                                    let new_key = encode_composite_index_key(&new_vals, row_id);
-                                    tx.put(&idx_map_name, new_key, vec![])?;
+                                    if old_vals != new_vals {
+                                        let old_key = encode_composite_index_key(&old_vals, row_id);
+                                        tx.remove(&idx_map_name, &old_key)?;
+                                        let new_key = encode_composite_index_key(&new_vals, row_id);
+                                        tx.put(&idx_map_name, new_key, vec![])?;
+                                    }
                                 }
                             }
 
@@ -4687,6 +4828,77 @@ pub(crate) fn convert_value_bounds_to_bytes(
 
                                 let map_name = table_def.map_name();
 
+                                let mut ctx = RowContext::from_table_def(&table_def, base_table_alias.as_deref());
+                                ctx.catalog = Some(Arc::clone(&self.catalog));
+
+                                let is_simple_agg = from_table.joins.is_empty()
+                                    && match &select.group_by {
+                                        GroupByExpr::Expressions(exprs, _) => exprs.is_empty(),
+                                        _ => true,
+                                    }
+                                    && select.having.is_none();
+                                let pushdown_ops = if is_simple_agg {
+                                    Self::parse_aggregate_ops(&select.projection, &ctx)
+                                } else {
+                                    None
+                                };
+
+                                // 0. 全表走査のプッシュダウン集約（Full Scan Aggregate）
+                                if let Some((ref col_names, ref ops)) = pushdown_ops {
+                                    if select.selection.is_none() {
+                                        let mut sums = vec![0.0f64; ops.len()];
+                                        let mut counts = vec![0i64; ops.len()];
+                                        let mut mins = vec![f64::MAX; ops.len()];
+                                        let mut maxs = vec![f64::MIN; ops.len()];
+                                        let mut min_ints = vec![i64::MAX; ops.len()];
+                                        let mut max_ints = vec![i64::MIN; ops.len()];
+
+                                        tx.for_each_visible(&map_name, |_k, val_bytes| {
+                                            for (i, op) in ops.iter().enumerate() {
+                                                match op {
+                                                    crate::vectorized::VectorAggregateOp::CountStar => {
+                                                        counts[i] += 1;
+                                                    }
+                                                    crate::vectorized::VectorAggregateOp::Count(col) => {
+                                                        if crate::row::extract_numeric_column(val_bytes, *col).is_some() {
+                                                            counts[i] += 1;
+                                                        }
+                                                    }
+                                                    crate::vectorized::VectorAggregateOp::Sum(col) => {
+                                                        if let Some((_vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                                                            sums[i] += vf;
+                                                            counts[i] += 1;
+                                                        }
+                                                    }
+                                                    crate::vectorized::VectorAggregateOp::Avg(col) => {
+                                                        if let Some((_vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                                                            sums[i] += vf;
+                                                            counts[i] += 1;
+                                                        }
+                                                    }
+                                                    crate::vectorized::VectorAggregateOp::Min(col) => {
+                                                        if let Some((vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                                                            if vf < mins[i] { mins[i] = vf; }
+                                                            if vi < min_ints[i] { min_ints[i] = vi; }
+                                                            counts[i] += 1;
+                                                        }
+                                                    }
+                                                    crate::vectorized::VectorAggregateOp::Max(col) => {
+                                                        if let Some((vi, vf)) = crate::row::extract_numeric_column(val_bytes, *col) {
+                                                            if vf > maxs[i] { maxs[i] = vf; }
+                                                            if vi > max_ints[i] { max_ints[i] = vi; }
+                                                            counts[i] += 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        })?;
+
+                                        let res = Self::build_pushdown_aggregate_result(ops, col_names, &counts, &sums, &mins, &maxs, &min_ints, &max_ints, &table_def);
+                                        return Ok(res);
+                                    }
+                                }
+
                                 // IndexScan の最適化 (等値 Point Lookup & Range Scan 対応)
                                 let mut index_scanned: Option<Vec<Row>> = None;
                                 if from_table.joins.is_empty() {
@@ -4717,6 +4929,52 @@ pub(crate) fn convert_value_bounds_to_bytes(
                                                             }
                                                         }
                                                     }
+
+                                                    // Point Select ファストパス: 単一ユニーク行かつ単純射影
+                                                    if target_idx.is_unique && from_table.joins.is_empty() && pushdown_ops.is_none() {
+                                                        let is_agg = select.projection.iter().any(|item| match item {
+                                                             SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => has_aggregate_func(expr),
+                                                             _ => false,
+                                                        });
+                                                        let has_group = match &select.group_by {
+                                                             GroupByExpr::Expressions(exprs, _) => !exprs.is_empty(),
+                                                             _ => false,
+                                                        };
+                                                        let is_simple_projection = !select.projection.is_empty() && select.projection.iter().all(|item| match item {
+                                                            SelectItem::UnnamedExpr(Expr::Identifier(ident)) | SelectItem::ExprWithAlias { expr: Expr::Identifier(ident), .. } => {
+                                                                table_def.column_index(&ident.value.to_lowercase()).is_some()
+                                                            }
+                                                            SelectItem::Wildcard(_) => true,
+                                                            _ => false,
+                                                        });
+                                                        if !is_agg && !has_group && is_simple_projection && query.order_by.is_none() && query.limit.is_none() {
+                                                            let mut out_cols = Vec::new();
+                                                            let mut out_rows = Vec::new();
+                                                            for row in &fetched {
+                                                                let mut row_vals = Vec::new();
+                                                                for item in &select.projection {
+                                                                    match item {
+                                                                        SelectItem::UnnamedExpr(Expr::Identifier(ident)) | SelectItem::ExprWithAlias { expr: Expr::Identifier(ident), .. } => {
+                                                                            let c_name = ident.value.to_lowercase();
+                                                                            if let Some(c_idx) = table_def.column_index(&c_name) {
+                                                                                row_vals.push(row.values.get(c_idx).cloned().unwrap_or(Value::Null));
+                                                                            }
+                                                                        }
+                                                                        SelectItem::Wildcard(_) => {
+                                                                            row_vals.extend(row.values.clone());
+                                                                        }
+                                                                        _ => {}
+                                                                    }
+                                                                }
+                                                                out_rows.push(Row::new(row_vals));
+                                                            }
+                                                            for item in &select.projection {
+                                                                out_cols.push(get_select_item_name(item));
+                                                            }
+                                                            return Ok(ExecutionResult::Query { columns: out_cols, rows: out_rows });
+                                                        }
+                                                    }
+
                                                     index_scanned = Some(fetched);
                                                     break;
                                                 }
@@ -4744,6 +5002,65 @@ pub(crate) fn convert_value_bounds_to_bytes(
                                                                 std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
                                                             },
                                                         )?;
+
+                                                        // Range Scan プッシュダウン集約
+                                                        if let Some((ref col_names, ref ops)) = pushdown_ops {
+                                                            let mut sums = vec![0.0f64; ops.len()];
+                                                            let mut counts = vec![0i64; ops.len()];
+                                                            let mut mins = vec![f64::MAX; ops.len()];
+                                                            let mut maxs = vec![f64::MIN; ops.len()];
+                                                            let mut min_ints = vec![i64::MAX; ops.len()];
+                                                            let mut max_ints = vec![i64::MIN; ops.len()];
+
+                                                            for (k, _) in &matched {
+                                                                if k.len() >= 8 {
+                                                                    let r_id = u64::from_be_bytes(k[k.len() - 8..].try_into().unwrap());
+                                                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                                        for (i, op) in ops.iter().enumerate() {
+                                                                            match op {
+                                                                                crate::vectorized::VectorAggregateOp::CountStar => {
+                                                                                    counts[i] += 1;
+                                                                                }
+                                                                                crate::vectorized::VectorAggregateOp::Count(col) => {
+                                                                                    if crate::row::extract_numeric_column(&val_bytes, *col).is_some() {
+                                                                                        counts[i] += 1;
+                                                                                    }
+                                                                                }
+                                                                                crate::vectorized::VectorAggregateOp::Sum(col) => {
+                                                                                    if let Some((_vi, vf)) = crate::row::extract_numeric_column(&val_bytes, *col) {
+                                                                                        sums[i] += vf;
+                                                                                        counts[i] += 1;
+                                                                                    }
+                                                                                }
+                                                                                crate::vectorized::VectorAggregateOp::Avg(col) => {
+                                                                                    if let Some((_vi, vf)) = crate::row::extract_numeric_column(&val_bytes, *col) {
+                                                                                        sums[i] += vf;
+                                                                                        counts[i] += 1;
+                                                                                    }
+                                                                                }
+                                                                                crate::vectorized::VectorAggregateOp::Min(col) => {
+                                                                                    if let Some((vi, vf)) = crate::row::extract_numeric_column(&val_bytes, *col) {
+                                                                                        if vf < mins[i] { mins[i] = vf; }
+                                                                                        if vi < min_ints[i] { min_ints[i] = vi; }
+                                                                                        counts[i] += 1;
+                                                                                    }
+                                                                                }
+                                                                                crate::vectorized::VectorAggregateOp::Max(col) => {
+                                                                                    if let Some((vi, vf)) = crate::row::extract_numeric_column(&val_bytes, *col) {
+                                                                                        if vf > maxs[i] { maxs[i] = vf; }
+                                                                                        if vi > max_ints[i] { max_ints[i] = vi; }
+                                                                                        counts[i] += 1;
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            let res = Self::build_pushdown_aggregate_result(ops, col_names, &counts, &sums, &mins, &maxs, &min_ints, &max_ints, &table_def);
+                                                            return Ok(res);
+                                                        }
+
                                                         let mut fetched = Vec::with_capacity(matched.len());
                                                         for (k, _) in matched {
                                                             if let Some((_v, r_id)) = decode_index_key(&k) {

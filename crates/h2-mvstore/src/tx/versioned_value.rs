@@ -96,4 +96,53 @@ impl VersionedValue {
     pub fn rollback_uncommitted(&mut self) {
         self.uncommitted = None;
     }
+
+    /// 高速ゼロコピー可視性判定（単一コミット世代の典型パターンをゼロアロケーションで判定）
+    #[inline(always)]
+    pub fn read_visible_raw(bytes: &[u8], _reader_tx_id: u64, snapshot_version: u64) -> Option<&[u8]> {
+        if bytes.len() >= 26 && bytes[0] == 0 {
+            // uncommitted is None
+            if let Ok(hist_len_bytes) = bytes[1..9].try_into() {
+                let hist_len = u64::from_le_bytes(hist_len_bytes);
+                if hist_len == 1 && bytes[9] == 1 {
+                    // committed_history.len() == 1, value is Some
+                    if let Ok(val_len_bytes) = bytes[10..18].try_into() {
+                        let val_len = u64::from_le_bytes(val_len_bytes) as usize;
+                        if bytes.len() == 18 + val_len + 8 {
+                            if let Ok(commit_ver_bytes) = bytes[18 + val_len..26 + val_len].try_into() {
+                                let commit_ver = u64::from_le_bytes(commit_ver_bytes);
+                                if commit_ver <= snapshot_version {
+                                    return Some(&bytes[18..18 + val_len]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_read_visible_raw_fast_path() {
+        let payload = b"fast path test payload 12345";
+        let vv = VersionedValue::new_committed(payload.to_vec(), 10);
+        let bytes = vv.to_bytes().unwrap();
+
+        // 正常判定 (snapshot_version >= commit_version)
+        let visible = VersionedValue::read_visible_raw(&bytes, 1, 10);
+        assert_eq!(visible, Some(payload.as_slice()));
+
+        let visible2 = VersionedValue::read_visible_raw(&bytes, 1, 20);
+        assert_eq!(visible2, Some(payload.as_slice()));
+
+        // 未来のバージョンは非可視
+        let invisible = VersionedValue::read_visible_raw(&bytes, 1, 5);
+        assert_eq!(invisible, None);
+    }
 }

@@ -214,6 +214,26 @@ impl MVTree {
         }
     }
 
+    /// 全エントリをゼロアロケーションで走査
+    pub fn for_each_entry<F: FnMut(&[u8], &[u8])>(&self, mut f: F) {
+        self.traverse_for_each(&self.root, &mut f);
+    }
+
+    fn traverse_for_each<F: FnMut(&[u8], &[u8])>(&self, node: &Page, f: &mut F) {
+        match node {
+            Page::Leaf { entries } => {
+                for entry in entries {
+                    f(&entry.key, &entry.value);
+                }
+            }
+            Page::Branch { children, .. } => {
+                for child in children {
+                    self.traverse_for_each(child, f);
+                }
+            }
+        }
+    }
+
     /// 指定されたプレフィックスで始まる全エントリの高速走査（B+Tree の二分探索）
     pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<Entry> {
         let mut results = Vec::new();

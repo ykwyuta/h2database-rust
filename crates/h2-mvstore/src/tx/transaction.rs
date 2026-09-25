@@ -55,6 +55,10 @@ impl Transaction {
             return Ok(None);
         };
 
+        if let Some(val) = VersionedValue::read_visible_raw(&val_bytes, self.tx_id, self.snapshot_version) {
+            return Ok(Some(val.to_vec()));
+        }
+
         let vv: VersionedValue = VersionedValue::from_bytes(&val_bytes)?;
 
         Ok(vv.read_visible(self.tx_id, self.snapshot_version).map(|v| v.to_vec()))
@@ -254,6 +258,22 @@ impl Transaction {
         Ok(visible_entries)
     }
 
+    /// 可視な全エントリをゼロコピーで走査 (ゼロアロケーション)
+    pub fn for_each_visible<F: FnMut(&[u8], &[u8])>(&self, map_name: &str, mut f: F) -> H2Result<()> {
+        self.check_open()?;
+        let map = self.store.mvstore().open_map(map_name);
+        map.for_each_entry(|k, raw_v| {
+            if let Some(val) = VersionedValue::read_visible_raw(raw_v, self.tx_id, self.snapshot_version) {
+                f(k, val);
+            } else if let Ok(vv) = VersionedValue::from_bytes(raw_v) {
+                if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
+                    f(k, val);
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// 指定プレフィックスで始まる可視なエントリを高速走査 (B+Tree Prefix Scan)
     pub fn scan_prefix_visible(&self, map_name: &str, prefix: &[u8]) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.check_open()?;
@@ -263,7 +283,9 @@ impl Transaction {
         let mut visible_entries = Vec::new();
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
+            if let Some(val) = VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version) {
+                visible_entries.push((entry.key, val.to_vec()));
+            } else if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
                     visible_entries.push((entry.key, val.to_vec()));
                 }
@@ -287,7 +309,9 @@ impl Transaction {
         let mut visible_entries = Vec::with_capacity(raw_entries.len());
         for entry in raw_entries {
             h2_types::check_query_timeout()?;
-            if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
+            if let Some(val) = VersionedValue::read_visible_raw(&entry.value, self.tx_id, self.snapshot_version) {
+                visible_entries.push((entry.key, val.to_vec()));
+            } else if let Ok(vv) = VersionedValue::from_bytes(&entry.value) {
                 if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
                     visible_entries.push((entry.key, val.to_vec()));
                 }
