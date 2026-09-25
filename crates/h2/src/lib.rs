@@ -43,6 +43,7 @@ enum TxCommand {
     Rollback,
     SetStatementTimeout(u64),
     Vacuum,
+    Checkpoint,
     Other,
 }
 
@@ -64,6 +65,8 @@ fn parse_tx_command(sql: &str) -> TxCommand {
         TxCommand::Rollback
     } else if trimmed.eq_ignore_ascii_case("VACUUM") {
         TxCommand::Vacuum
+    } else if trimmed.eq_ignore_ascii_case("CHECKPOINT") {
+        TxCommand::Checkpoint
     } else if let Some(ms) = parse_set_timeout(trimmed) {
         TxCommand::SetStatementTimeout(ms)
     } else {
@@ -353,6 +356,10 @@ impl Connection {
                 self.vacuum()?;
                 Ok(0)
             }
+            TxCommand::Checkpoint => {
+                self.sync()?;
+                Ok(0)
+            }
             TxCommand::Other => {
                 let guard = self.current_tx.lock();
                 let user_guard = self.current_user.read();
@@ -449,6 +456,10 @@ impl Connection {
                 self.vacuum()?;
                 Ok(ExecutionResult::Dml { affected_rows: 0 })
             }
+            TxCommand::Checkpoint => {
+                self.sync()?;
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
             TxCommand::Other => {
                 let guard = self.current_tx.lock();
                 let user_guard = self.current_user.read();
@@ -504,6 +515,11 @@ impl Connection {
     /// ストレージのコンパクション（Vacuum）を実行し、古い死にチャンクを破棄してファイルを縮小
     pub fn vacuum(&self) -> H2Result<()> {
         self.store.compact()
+    }
+
+    /// OS ページキャッシュ上のデータをディスクへ物理同期 (fsync)
+    pub fn sync(&self) -> H2Result<()> {
+        self.store.sync()
     }
 
     #[cfg(feature = "server")]

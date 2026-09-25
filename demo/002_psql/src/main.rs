@@ -72,7 +72,23 @@ async fn main() -> H2Result<()> {
     println!("  Press Ctrl+C to stop the server.");
     println!();
 
+    // 4. バックグラウンド非同期同期タスク (1秒間隔で OS キャッシュを fsync)
+    let sync_conn = conn.clone();
+    let is_memory = db_path == ":memory:";
+    let sync_handle = tokio::spawn(async move {
+        if is_memory {
+            return;
+        }
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let _ = sync_conn.sync();
+        }
+    });
+
     tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
-    println!("\n[INFO] Shutting down PG-Wire demo server. Bye!");
+    println!("\n[INFO] Flushed data and shutting down PG-Wire demo server. Bye!");
+    sync_handle.abort();
+    let _ = conn.sync();
     Ok(())
 }

@@ -39,7 +39,10 @@ impl MVStore {
             // メタデータマップから登録済みマップのルート情報を復元
             for entry in metadata_tree.scan_all() {
                 let map_name = String::from_utf8_lossy(&entry.key).to_string();
-                if let Ok(root_page) = serde_json::from_slice::<Page>(&entry.value) {
+                let root_page_opt = bincode::deserialize::<Page>(&entry.value)
+                    .ok()
+                    .or_else(|| serde_json::from_slice::<Page>(&entry.value).ok());
+                if let Some(root_page) = root_page_opt {
                     let tree = MVTree {
                         root: Arc::new(root_page),
                         max_entries_per_page: 32,
@@ -139,9 +142,7 @@ impl MVStore {
         let mut metadata_tree = MVTree::default();
         let maps = self.maps.read();
         for (name, map) in maps.iter() {
-            let tree_guard = map.tree.read();
-            let root_bytes = serde_json::to_vec(&*tree_guard.root)
-                .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+            let root_bytes = map.get_serialized_root()?;
             metadata_tree.put(name.as_bytes().to_vec(), root_bytes);
         }
 
@@ -163,6 +164,14 @@ impl MVStore {
         }
 
         Ok(new_version)
+    }
+
+    pub fn set_sync_on_commit(&self, sync: bool) {
+        self.file_store.write().set_sync_on_commit(sync);
+    }
+
+    pub fn sync(&self) -> H2Result<()> {
+        self.file_store.write().sync()
     }
 
     /// 全マップの全エントリをスキャンして取得（初期スナップショット送信用）

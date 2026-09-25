@@ -61,6 +61,7 @@ pub struct FileStore {
     path: Option<PathBuf>,
     file: Option<File>,
     header: Header,
+    sync_on_commit: bool,
 }
 
 impl FileStore {
@@ -92,10 +93,15 @@ impl FileStore {
             Header::deserialize(&buf)?
         };
 
+        let sync_on_commit = std::env::var("H2_SYNC_COMMIT")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+
         Ok(Self {
             path: Some(path_buf),
             file: Some(file),
             header,
+            sync_on_commit,
         })
     }
 
@@ -108,6 +114,7 @@ impl FileStore {
                 last_chunk_offset: 0,
                 last_chunk_length: 0,
             },
+            sync_on_commit: false,
         }
     }
 
@@ -136,7 +143,6 @@ impl FileStore {
 
         let end_offset = file.seek(SeekFrom::End(0))?;
         file.write_all(&chunk_bytes)?;
-        file.sync_data()?;
 
         // ヘッダの更新
         self.header.version = chunk.meta.version;
@@ -145,8 +151,21 @@ impl FileStore {
 
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&self.header.serialize())?;
-        file.sync_all()?;
+        if self.sync_on_commit {
+            file.sync_all()?;
+        }
 
+        Ok(())
+    }
+
+    pub fn set_sync_on_commit(&mut self, sync: bool) {
+        self.sync_on_commit = sync;
+    }
+
+    pub fn sync(&mut self) -> H2Result<()> {
+        if let Some(file) = &mut self.file {
+            file.sync_all()?;
+        }
         Ok(())
     }
 

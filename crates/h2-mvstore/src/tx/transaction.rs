@@ -259,6 +259,25 @@ impl Transaction {
         Ok(visible_entries)
     }
 
+    /// 指定プレフィックスで始まる可視なエントリを高速走査 (B+Tree Prefix Scan)
+    pub fn scan_prefix_visible(&self, map_name: &str, prefix: &[u8]) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.check_open()?;
+        let map = self.store.mvstore().open_map(map_name);
+        let raw_entries = map.scan_prefix(prefix);
+
+        let mut visible_entries = Vec::new();
+        for entry in raw_entries {
+            h2_types::check_query_timeout()?;
+            if let Ok(vv) = serde_json::from_slice::<VersionedValue>(&entry.value) {
+                if let Some(val) = vv.read_visible(self.tx_id, self.snapshot_version) {
+                    visible_entries.push((entry.key, val.to_vec()));
+                }
+            }
+        }
+
+        Ok(visible_entries)
+    }
+
     /// コミット
     pub fn commit(&self) -> H2Result<()> {
         let mut status = self.status.write();

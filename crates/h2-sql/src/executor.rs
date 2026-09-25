@@ -143,6 +143,7 @@ pub struct SQLEngine {
     memory_config: crate::memory::MemoryConfig,
     admission: Arc<crate::memory::MemoryGrantCoordinator>,
     execution_mode: Arc<parking_lot::RwLock<String>>,
+    plan_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<Statement>>>>,
 }
 
 impl SQLEngine {
@@ -155,6 +156,7 @@ impl SQLEngine {
         let memory_config = crate::memory::MemoryConfig::new();
         let admission = crate::memory::MemoryGrantCoordinator::new(memory_config.total_query_memory());
         let execution_mode = Arc::new(parking_lot::RwLock::new("auto".to_string()));
+        let plan_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         Ok(Self {
             store,
             tx_store,
@@ -165,6 +167,7 @@ impl SQLEngine {
             memory_config,
             admission,
             execution_mode,
+            plan_cache,
         })
     }
 
@@ -365,7 +368,20 @@ impl SQLEngine {
             sql_to_parse = format!("FETCH BACKWARD {}", num_part);
         }
 
-        let statements = parse_sql(&sql_to_parse)?;
+        let statements = {
+            let cached = self.plan_cache.read().get(&sql_to_parse).cloned();
+            if let Some(stmts) = cached {
+                stmts
+            } else {
+                let parsed = parse_sql(&sql_to_parse)?;
+                let mut cache = self.plan_cache.write();
+                if cache.len() >= 1024 {
+                    cache.clear();
+                }
+                cache.insert(sql_to_parse.clone(), parsed.clone());
+                parsed
+            }
+        };
         let mut last_result = ExecutionResult::Ddl;
 
         for stmt in statements {
@@ -1668,8 +1684,14 @@ fn apply_join(
                             let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), idx.name.to_lowercase());
                             let has_null = vals.iter().any(|v| v.is_null());
                             if idx.is_unique && !has_null {
-                                let existing = tx.scan_visible(&idx_map_name)?;
-                                for (k, _) in existing {
+                                let mut prefix = if vals.len() == 1 {
+                                    serde_json::to_vec(&vals[0]).unwrap_or_default()
+                                } else {
+                                    serde_json::to_vec(&vals).unwrap_or_default()
+                                };
+                                prefix.push(0x00);
+                                let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                for (k, _) in matched {
                                     if let Some((v, conflicting_row_id)) = decode_composite_index_key(&k) {
                                         if v == vals {
                                             if let Some(bytes) = tx.get(&map_name, &conflicting_row_id.to_le_bytes())? {
@@ -1740,8 +1762,14 @@ fn apply_join(
                                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                                        let existing = tx.scan_visible(&idx_map_name)?;
-                                                        for (k, _) in existing {
+                                                        let mut prefix = if new_vals.len() == 1 {
+                                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
+                                                        } else {
+                                                            serde_json::to_vec(&new_vals).unwrap_or_default()
+                                                        };
+                                                        prefix.push(0x00);
+                                                        let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                                        for (k, _) in matched {
                                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
                                                                 if v == new_vals && r_id != conflict_row_id {
                                                                     return Err(H2Error::Execution(format!(
@@ -1907,7 +1935,44 @@ fn apply_join(
 
                 let map_name = table_def.map_name();
                 let indexes = self.catalog.get_table_indexes(&table_name);
-                let entries = tx.scan_visible(&map_name)?;
+                let entries = if using_data.is_none() {
+                    let mut fast_entries = None;
+                    if let Some(ref sel) = delete.selection {
+                        if let Some((col_name, val)) = Self::extract_equality_predicate(sel) {
+                            for target_idx in &indexes {
+                                if target_idx.columns.len() == 1 && target_idx.columns[0].eq_ignore_ascii_case(&col_name) {
+                                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                    let casted_val = if let Some(c_idx) = table_def.column_index(&col_name) {
+                                        val.cast_to(&table_def.columns[c_idx].data_type).unwrap_or(val.clone())
+                                    } else {
+                                        val.clone()
+                                    };
+                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
+                                    prefix.push(0x00);
+                                    let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                    let mut fetched = Vec::with_capacity(matched_entries.len());
+                                    for (k, _) in matched_entries {
+                                        if let Some((_v, r_id)) = decode_index_key(&k) {
+                                            let key_bytes = r_id.to_le_bytes().to_vec();
+                                            if let Some(val_bytes) = tx.get(&map_name, &key_bytes)? {
+                                                fetched.push((key_bytes, val_bytes));
+                                            }
+                                        }
+                                    }
+                                    fast_entries = Some(fetched);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(fe) = fast_entries {
+                        fe
+                    } else {
+                        tx.scan_visible(&map_name)?
+                    }
+                } else {
+                    tx.scan_visible(&map_name)?
+                };
                 let mut affected_rows = 0;
                 let mut deleted_rows = Vec::new();
                 let target_ctx = RowContext::from_table_def(&table_def, target_alias.as_deref());
@@ -2022,7 +2087,44 @@ fn apply_join(
 
                 let map_name = table_def.map_name();
                 let indexes = self.catalog.get_table_indexes(&table_name);
-                let entries = tx.scan_visible(&map_name)?;
+                let entries = if from_data.is_none() {
+                    let mut fast_entries = None;
+                    if let Some(ref sel) = selection {
+                        if let Some((col_name, val)) = Self::extract_equality_predicate(sel) {
+                            for target_idx in &indexes {
+                                if target_idx.columns.len() == 1 && target_idx.columns[0].eq_ignore_ascii_case(&col_name) {
+                                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                    let casted_val = if let Some(c_idx) = table_def.column_index(&col_name) {
+                                        val.cast_to(&table_def.columns[c_idx].data_type).unwrap_or(val.clone())
+                                    } else {
+                                        val.clone()
+                                    };
+                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
+                                    prefix.push(0x00);
+                                    let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                    let mut fetched = Vec::with_capacity(matched_entries.len());
+                                    for (k, _) in matched_entries {
+                                        if let Some((_v, r_id)) = decode_index_key(&k) {
+                                            let key_bytes = r_id.to_le_bytes().to_vec();
+                                            if let Some(val_bytes) = tx.get(&map_name, &key_bytes)? {
+                                                fetched.push((key_bytes, val_bytes));
+                                            }
+                                        }
+                                    }
+                                    fast_entries = Some(fetched);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(fe) = fast_entries {
+                        fe
+                    } else {
+                        tx.scan_visible(&map_name)?
+                    }
+                } else {
+                    tx.scan_visible(&map_name)?
+                };
                 let mut affected_rows = 0;
                 let mut updated_rows = Vec::new();
                 let mut updated_keys = std::collections::HashSet::new();
@@ -2105,8 +2207,14 @@ fn apply_join(
                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let existing = tx.scan_visible(&idx_map_name)?;
-                                        for (k, _) in existing {
+                                        let mut prefix = if new_vals.len() == 1 {
+                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
+                                        } else {
+                                            serde_json::to_vec(&new_vals).unwrap_or_default()
+                                        };
+                                        prefix.push(0x00);
+                                        let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                        for (k, _) in matched {
                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
                                                 if v == new_vals && r_id != row_id {
                                                     return Err(H2Error::Execution(format!(
@@ -2172,8 +2280,14 @@ fn apply_join(
                                     let has_null = new_vals.iter().any(|v| v.is_null());
 
                                     if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let existing = tx.scan_visible(&idx_map_name)?;
-                                        for (k, _) in existing {
+                                        let mut prefix = if new_vals.len() == 1 {
+                                            serde_json::to_vec(&new_vals[0]).unwrap_or_default()
+                                        } else {
+                                            serde_json::to_vec(&new_vals).unwrap_or_default()
+                                        };
+                                        prefix.push(0x00);
+                                        let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                        for (k, _) in matched {
                                             if let Some((v, r_id)) = decode_composite_index_key(&k) {
                                                 if v == new_vals && r_id != row_id {
                                                     return Err(H2Error::Execution(format!(
@@ -3353,6 +3467,31 @@ fn matches_index_condition(expr: &Expr, target_col: &str) -> bool {
     }
 }
 
+fn extract_equality_predicate(expr: &Expr) -> Option<(String, Value)> {
+    match expr {
+        Expr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+            let get_ident = |e: &Expr| -> Option<String> {
+                match e {
+                    Expr::Identifier(ident) => Some(ident.value.clone()),
+                    Expr::CompoundIdentifier(parts) if parts.len() == 2 => Some(parts[1].value.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(col) = get_ident(left) {
+                if let Ok(val) = evaluate_literal_or_unary(right) {
+                    return Some((col, val));
+                }
+            } else if let Some(col) = get_ident(right) {
+                if let Ok(val) = evaluate_literal_or_unary(left) {
+                    return Some((col, val));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value) -> bool>> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
@@ -4060,33 +4199,68 @@ fn build_index_filter(expr: &Expr, target_col: &str) -> Option<Box<dyn Fn(&Value
 
                                 let map_name = table_def.map_name();
 
-                                // IndexScan の最適化 (等値 & Range Scan 対応)
+                                // IndexScan の最適化 (等値 Point Lookup & Range Scan 対応)
                                 let mut index_scanned: Option<Vec<Row>> = None;
                                 if from_table.joins.is_empty() {
                                     if let Some(ref sel) = select.selection {
                                         let indexes = self.catalog.get_table_indexes(&base_table_name);
-                                        for target_idx in &indexes {
-                                            if let Some(filter_fn) = Self::build_index_filter(sel, &target_idx.columns[0]) {
-                                                let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
-                                                let idx_entries = tx.scan_visible(&idx_map_name)?;
-                                                let mut matched_row_ids = Vec::new();
-                                                for (k, _) in idx_entries {
-                                                    if let Some((v, r_id)) = decode_index_key(&k) {
-                                                        if filter_fn(&v) {
-                                                            matched_row_ids.push(r_id);
+
+                                        // 1. 等値検索（Point Lookup）の高速B+Tree探索
+                                        if let Some((col_name, val)) = Self::extract_equality_predicate(sel) {
+                                            for target_idx in &indexes {
+                                                if target_idx.columns.len() == 1 && target_idx.columns[0].eq_ignore_ascii_case(&col_name) {
+                                                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                                    let casted_val = if let Some(c_idx) = table_def.column_index(&col_name) {
+                                                        val.cast_to(&table_def.columns[c_idx].data_type).unwrap_or(val.clone())
+                                                    } else {
+                                                        val.clone()
+                                                    };
+
+                                                    let mut prefix = serde_json::to_vec(&casted_val).unwrap_or_default();
+                                                    prefix.push(0x00);
+
+                                                    let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                                    let mut fetched = Vec::with_capacity(matched_entries.len());
+                                                    for (k, _) in matched_entries {
+                                                        if let Some((_v, r_id)) = decode_index_key(&k) {
+                                                            if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                                let mut row = Row::from_bytes(&val_bytes)?;
+                                                                table_def.align_row(&mut row);
+                                                                fetched.push(row);
+                                                            }
                                                         }
                                                     }
+                                                    index_scanned = Some(fetched);
+                                                    break;
                                                 }
-                                                let mut fetched = Vec::new();
-                                                for r_id in matched_row_ids {
-                                                    if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
-                                                        let mut row = Row::from_bytes(&val_bytes)?;
-                                                        table_def.align_row(&mut row);
-                                                        fetched.push(row);
+                                            }
+                                        }
+
+                                        // 2. Range Scan 等のインデックス検索
+                                        if index_scanned.is_none() {
+                                            for target_idx in &indexes {
+                                                if let Some(filter_fn) = Self::build_index_filter(sel, &target_idx.columns[0]) {
+                                                    let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                                    let idx_entries = tx.scan_visible(&idx_map_name)?;
+                                                    let mut matched_row_ids = Vec::new();
+                                                    for (k, _) in idx_entries {
+                                                        if let Some((v, r_id)) = decode_index_key(&k) {
+                                                            if filter_fn(&v) {
+                                                                matched_row_ids.push(r_id);
+                                                            }
+                                                        }
                                                     }
+                                                    let mut fetched = Vec::new();
+                                                    for r_id in matched_row_ids {
+                                                        if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
+                                                            let mut row = Row::from_bytes(&val_bytes)?;
+                                                            table_def.align_row(&mut row);
+                                                            fetched.push(row);
+                                                        }
+                                                    }
+                                                    index_scanned = Some(fetched);
+                                                    break;
                                                 }
-                                                index_scanned = Some(fetched);
-                                                break;
                                             }
                                         }
                                     }

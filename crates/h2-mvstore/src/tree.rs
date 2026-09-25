@@ -212,4 +212,46 @@ impl MVTree {
             }
         }
     }
+
+    /// 指定されたプレフィックスで始まる全エントリの高速走査（B+Tree の二分探索）
+    pub fn scan_prefix(&self, prefix: &[u8]) -> Vec<Entry> {
+        let mut results = Vec::new();
+        self.collect_prefix_entries(&self.root, prefix, &mut results);
+        results
+    }
+
+    fn collect_prefix_entries(&self, node: &Page, prefix: &[u8], out: &mut Vec<Entry>) {
+        match node {
+            Page::Leaf { entries } => {
+                let start_idx = match entries.binary_search_by(|e| e.key.as_slice().cmp(prefix)) {
+                    Ok(idx) => idx,
+                    Err(idx) => idx,
+                };
+                for entry in &entries[start_idx..] {
+                    if entry.key.starts_with(prefix) {
+                        out.push(entry.clone());
+                    } else if entry.key.as_slice() > prefix {
+                        break;
+                    }
+                }
+            }
+            Page::Branch { keys, children, .. } => {
+                for (i, child) in children.iter().enumerate() {
+                    if i > 0 {
+                        let l = &keys[i - 1];
+                        if prefix < l.as_slice() && !l.starts_with(prefix) {
+                            continue;
+                        }
+                    }
+                    if i < keys.len() {
+                        let r = &keys[i];
+                        if prefix >= r.as_slice() && !r.starts_with(prefix) {
+                            continue;
+                        }
+                    }
+                    self.collect_prefix_entries(child, prefix, out);
+                }
+            }
+        }
+    }
 }

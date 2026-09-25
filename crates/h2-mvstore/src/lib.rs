@@ -93,6 +93,13 @@ mod tests {
             let users_map = store.open_map("users");
             assert_eq!(users_map.get(b"user:3"), Some(b"Charlie".to_vec()));
             assert_eq!(users_map.scan_all().len(), 3);
+
+            // scan_prefix テスト
+            let user_entries = users_map.scan_prefix(b"user:");
+            assert_eq!(user_entries.len(), 3);
+            let u1_entries = users_map.scan_prefix(b"user:1");
+            assert_eq!(u1_entries.len(), 1);
+            assert_eq!(u1_entries[0].value, b"Alice");
         }
     }
 

@@ -174,31 +174,33 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     continue;
                 }
 
+                let mut out_buf = Vec::with_capacity(512);
+
                 // トランザクション制御コマンド
                 if upper == "BEGIN" || upper.starts_with("BEGIN ") || upper == "START TRANSACTION" {
                     if active_tx.is_none() {
                         active_tx = Some(engine.tx_store().begin());
                     }
-                    stream.write_all(&PgMessageBuilder::command_complete("BEGIN")).await?;
+                    out_buf.extend_from_slice(&PgMessageBuilder::command_complete("BEGIN"));
                 } else if upper == "COMMIT" || upper.starts_with("COMMIT ") || upper == "END" {
                     if let Some(tx) = active_tx.take() {
                         let res: H2Result<()> = tokio::task::spawn_blocking(move || tx.commit()).await
                             .map_err(|e| H2Error::Execution(e.to_string()))?;
                         if let Err(e) = res {
-                            stream.write_all(&PgMessageBuilder::error_response(&e.to_string())).await?;
+                            out_buf.extend_from_slice(&PgMessageBuilder::error_response(&e.to_string()));
                         } else {
-                            stream.write_all(&PgMessageBuilder::command_complete("COMMIT")).await?;
+                            out_buf.extend_from_slice(&PgMessageBuilder::command_complete("COMMIT"));
                         }
                     } else {
-                        stream.write_all(&PgMessageBuilder::command_complete("COMMIT")).await?;
+                        out_buf.extend_from_slice(&PgMessageBuilder::command_complete("COMMIT"));
                     }
                 } else if upper == "ROLLBACK" || upper.starts_with("ROLLBACK ") {
                     if let Some(tx) = active_tx.take() {
                         let _ = tokio::task::spawn_blocking(move || tx.rollback()).await;
                     }
-                    stream.write_all(&PgMessageBuilder::command_complete("ROLLBACK")).await?;
+                    out_buf.extend_from_slice(&PgMessageBuilder::command_complete("ROLLBACK"));
                 } else if upper.starts_with("SET ") {
-                    stream.write_all(&PgMessageBuilder::command_complete("SET")).await?;
+                    out_buf.extend_from_slice(&PgMessageBuilder::command_complete("SET"));
                 } else if upper.starts_with("SHOW ") {
                     let var = trimmed[5..].trim().to_lowercase();
                     let val = match var.as_str() {
@@ -208,11 +210,11 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                         "transaction_isolation" | "default_transaction_isolation" => "read committed",
                         _ => "on",
                     };
-                    stream.write_all(&PgMessageBuilder::row_description(&[var])).await?;
-                    stream.write_all(&PgMessageBuilder::data_row(&[h2_types::Value::String(val.to_string())])).await?;
-                    stream.write_all(&PgMessageBuilder::command_complete("SHOW")).await?;
+                    out_buf.extend_from_slice(&PgMessageBuilder::row_description(&[var]));
+                    out_buf.extend_from_slice(&PgMessageBuilder::data_row(&[h2_types::Value::String(val.to_string())]));
+                    out_buf.extend_from_slice(&PgMessageBuilder::command_complete("SHOW"));
                 } else if upper == "DISCARD ALL" || upper == "RESET ALL" {
-                    stream.write_all(&PgMessageBuilder::command_complete("DISCARD")).await?;
+                    out_buf.extend_from_slice(&PgMessageBuilder::command_complete("DISCARD"));
                 } else {
                     let eng = Arc::clone(&engine);
                     let sql_owned = trimmed.to_string();
@@ -241,7 +243,7 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     match exec_result {
                         Ok(result) => match result {
                             ExecutionResult::Ddl => {
-                                stream.write_all(&PgMessageBuilder::command_complete("CREATE TABLE")).await?;
+                                out_buf.extend_from_slice(&PgMessageBuilder::command_complete("CREATE TABLE"));
                             }
                             ExecutionResult::Dml { affected_rows } => {
                                 let tag = if upper.starts_with("INSERT") {
@@ -253,25 +255,26 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                                 } else {
                                     format!("OK {}", affected_rows)
                                 };
-                                stream.write_all(&PgMessageBuilder::command_complete(&tag)).await?;
+                                out_buf.extend_from_slice(&PgMessageBuilder::command_complete(&tag));
                             }
                             ExecutionResult::Query { columns, rows } => {
-                                stream.write_all(&PgMessageBuilder::row_description(&columns)).await?;
+                                out_buf.extend_from_slice(&PgMessageBuilder::row_description(&columns));
                                 for row in &rows {
-                                    stream.write_all(&PgMessageBuilder::data_row(&row.values)).await?;
+                                    out_buf.extend_from_slice(&PgMessageBuilder::data_row(&row.values));
                                 }
                                 let tag = format!("SELECT {}", rows.len());
-                                stream.write_all(&PgMessageBuilder::command_complete(&tag)).await?;
+                                out_buf.extend_from_slice(&PgMessageBuilder::command_complete(&tag));
                             }
                         },
                         Err(e) => {
-                            stream.write_all(&PgMessageBuilder::error_response(&e.to_string())).await?;
+                            out_buf.extend_from_slice(&PgMessageBuilder::error_response(&e.to_string()));
                         }
                     }
                 }
 
                 let tx_status = if active_tx.is_some() { b'T' } else { b'I' };
-                stream.write_all(&PgMessageBuilder::ready_for_query(tx_status)).await?;
+                out_buf.extend_from_slice(&PgMessageBuilder::ready_for_query(tx_status));
+                stream.write_all(&out_buf).await?;
                 stream.flush().await?;
             }
             b'X' => {
