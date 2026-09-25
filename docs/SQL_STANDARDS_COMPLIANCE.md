@@ -18,6 +18,8 @@
 | **関数・演算子** | SQL-92 / 拡張 | **高度な数学関数 (SIN, COS, TAN, LN, LOG, EXP, SQRT, POWER, ROUND, CEIL, FLOOR, TRUNC, MOD, PI等)**, **高度な文字列関数 (SUBSTR, TRIM, REPLACE, LPAD, RPAD, INITCAP, REVERSE, TRANSLATE, SPLIT_PART, `||`等)**, **正規表現演算 (`~`, `~*`, `!~`, `!~*`, `REGEXP_LIKE`, `REGEXP_REPLACE`, `REGEXP_SUBSTR`)**, **日付計算関数 (`DATE_ADD`, `DATE_SUB`, `DATEDIFF`, `DATE_PART`, `DATE_TRUNC`, `AGE`, `EXTRACT`)**, **シーケンス関数 (`NEXTVAL`, `CURRVAL`, `SETVAL`, Oracle記法)**, `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `COALESCE`, JSON 演算子 (`->`, `->>`), 日本語全文検索 (`FT_SEARCH`) | ユーザー定義関数(UDF) |
 | **データ管理・保守・カーソル** | SQL-92 / SQL:2003 / 拡張 | **バックアップ・リストア (`BACKUP TO`, `RESTORE FROM`, `SCRIPT TO`, `RUNSCRIPT FROM`)**, **COPY文 (`COPY tbl TO/FROM 'path' [WITH (FORMAT CSV, HEADER, DELIMITER)]`)**, **カーソル (`DECLARE cur CURSOR FOR query`, `FETCH ... FROM cur`, `CLOSE cur`)** | バックグラウンド非同期自動バックアップ |
 | **レプリケーション・高可用性** | PG互換 / 分散同期 | **2インスタンス同期構成 (Primary: Read-Write, Standby: Read-Only)**, **`synchronous_commit = remote_apply` 相当 (スタンバイ適用完了同期待機・ラグゼロ保証)**, **スタンバイ書き込み拒絶 (Read-Only 透過制御)**, **初期スナップショット自動同期** | 非同期レプリケーション、マルチスタンバイ・クォーラム同期 |
+| **ネイティブMQ・メッセージング** | JMS 2.0/3.0 / Kafka拡張 | **トランザクショナル・キューテーブル (`CREATE QUEUE TABLE ... WITH (RETENTION_HOURS, MAX_BYTES)`)**, **SQL透過エンキュー/デキュー (`INSERT`, `SELECT WHERE _offset >= n`)**, **JMS 2.0/3.0 準拠 API**, **Kafka風オフセットシーク (`seek`, `rewind`)**, **二重保持オンライン Head Truncation GC**, **Transactional Outbox 完全解消** | 複数パーティション分割トピック |
+| **分散ストレージ分離 (Auroraモデル)** | クラウドネイティブ分散 | **コンピュート・ストレージ完全分離 (`StorageEngine` トレイト)**, **"The Log is the Database" (WAL ログレコードのみ送信)**, **4/6 Quorum (3 AZ) 並行書き込み & Tail Latency 解消**, **ゼロストレージ・リードレプリカ (共有ストレージ)**, **ピアツーピア・ゴシップ自己修復**, **Fencing Token による瞬間フェイルオーバー** | クラウドマネージド自動ノードプロビジョニング |
 | **メタデータ・診断** | SQL-92 / SQL:2008 / MySQL互換 | `INFORMATION_SCHEMA.TABLES`, `INFORMATION_SCHEMA.COLUMNS`, `SHOW TABLES`, `SHOW COLUMNS`, `EXPLAIN` | `INFORMATION_SCHEMA.VIEWS / CONSTRAINTS`, `EXPLAIN ANALYZE` (実測プロファイリング) |
 
 ---
@@ -442,4 +444,6 @@ SQL 標準規格、PostgreSQL 互換構文、Java版 H2 Database の主要機能
 | ✅ **完了** | シーケンス管理 (`SEQUENCE`, `SERIAL`, `IDENTITY`) | DDL/関数 | 自動採番、連番生成、Oracle/PG構文両対応 |
 | ✅ **完了** | バックアップ・リストア、COPY文 (CSV)、カーソル (`CURSOR`) | 保守/DQL | 物理/論理バックアップ、CSV高速入出力、スクロール行フェッチ |
 | ✅ **完了** | **2インスタンス同期構成 (Read-Write / Read-Only, remote_apply)** | HA/レプリケーション | 高可用性・参照負荷分散・ゼロラグ強整合同期 |
+| ✅ **完了** | **トランザクショナル・キューテーブル & JMS API (Native MQ)** | メッセージング/MQ | DB同一トランザクション保証、JMS 2.0/3.0、Kafka風シーク、二重保持GC |
+| ✅ **完了** | **コンピュート・ストレージ完全分離アーキテクチャ (Auroraモデル)** | クラウド分散ストレージ | The Log is the Database、4/6 Quorum (3 AZ)、ゼロストレージ・リードレプリカ、瞬間昇格 |
 | ⛔ **対象外** | `SAVEPOINT` (セーブポイント) | TCL | ※高速MVCCとUndo Log簡潔性維持のため設計上対象外 |

@@ -5,7 +5,18 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
 
 > [!NOTE]
 > **SQL 標準規格との詳細な対比**:
-> 国際標準（ISO/IEC 9075: SQL-92, SQL:1999, SQL:2003, SQL:2016 等）に対する「何が実装できていて、何が未実装・制限事項か」の完全な適合性マトリクスは [SQL 標準規格 適合状況と機能比較 (SQL_STANDARDS_COMPLIANCE.md)](./SQL_STANDARDS_COMPLIANCE.md) をご覧く�- [Part II. データ型 (Data Types)](#part-ii-データ型-data-types)
+> 国際標準（ISO/IEC 9075: SQL-92, SQL:1999, SQL:2003, SQL:2016 等）に対する「何が実装できていて、何が未実装・制限事項か」の完全な適合性マトリクスは [SQL 標準規格 適合状況と機能比較 (SQL_STANDARDS_COMPLIANCE.md)](./SQL_STANDARDS_COMPLIANCE.md) をご覧ください。
+
+---
+
+## 📚 目次 (Table of Contents)
+
+- [Part I. チュートリアル (Tutorial)](#part-i-チュートリアル-tutorial)
+  - [1. はじめの一歩 (Getting Started)](#1-はじめの一歩-getting-started)
+  - [2. 同期 組み込みモード (Synchronous Embedded)](#2-同期-組み込みモード-synchronous-embedded)
+  - [3. 非同期 組み込みモード (Async with Tokio)](#3-非同期-組み込みモード-async-with-tokio)
+  - [4. PostgreSQL サーバーモード & 外部クライアント接続](#4-postgresql-サーバーモード--外部クライアント接続)
+- [Part II. データ型 (Data Types)](#part-ii-データ型-data-types)
   - [1. 基本数値型・真偽値](#1-基本数値型真偽値)
   - [2. 文字列・バイナリ型](#2-文字列バイナリ型)
   - [3. 日付・時刻型 (Date/Time)](#3-日付時刻型-datetime)
@@ -49,23 +60,7 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [1. 同期レプリケーション (PostgreSQL remote_apply 相当の Primary/Standby)](#1-同期レプリケーション-remote_apply)
   - [2. トランザクショナル・キューテーブル & JMS API (Native MQ)](#2-トランザクショナルキューテーブル--jms-api)
   - [3. AWS Aurora 型 コンピュート・ストレージ完全分離クラスタ (The Log is the Database)](#3-aws-aurora-型-コンピュートストレージ完全分離クラスタ)
-- [Part VIII. SQL コマンド & 関数リファレンス (Command Reference)](#part-viii-sql-コマンド--関数リファレンス-command-reference)��ン並行性制御) の特徴](#1-mvcc-マルチバージョン並行性制御-の特徴)
-  - [2. Rust API によるトランザクション (RAII 管理)](#2-rust-api-によるトランザクション-raii-管理)
-  - [3. SQL 文による明示的トランザクション (BEGIN, COMMIT, ROLLBACK)](#3-sql-文による明示的トランザクション-begin-commit-rollback)
-  - [4. セーブポイント (SAVEPOINT) についての設計方針](#4-セーブポイント-savepoint-についての設計方針)
-  - [5. デッドロック検出と自動キャンセル (Deadlock Detection & Victim Cancellation)](#5-デッドロック検出と自動キャンセル-deadlock-detection--victim-cancellation)
-  - [6. クエリ単位の実行タイムアウト (Statement / Query Timeout)](#6-クエリ単位の実行タイムアウト-statement--query-timeout)
-
-- [Part V. クライアント & 組み込み API ガイド (Client / Embedded APIs)](#part-v-クライアント--組み込み-api-ガイド-client--embedded-apis)
-  - [1. パラメータ付きクエリと SQL インジェクション対策](#1-パラメータ付きクエリと-sql-インジェクション対策)
-  - [2. 型安全なクエリ結果の走査 (`FromSql` & `Row::get_as`)](#2-型安全なクエリ結果の走査-fromsql--rowget_as)
-  - [3. Web フレームワーク連携 (Axum / Actix-web での利用)](#3-web-フレームワーク連携-axum--actix-web-での利用)
-- [Part VI. サーバー運用とメンテナンス (Server Administration & Maintenance)](#part-vi-サーバー運用とメンテナンス-server-administration--maintenance)
-  - [1. 組み込みと外部接続のハイブリッド運用](#1-組み込みと外部接続のハイブリッド運用)
-  - [2. DBeaver / DataGrip / psql からの接続](#2-dbeaver--datagrip--psql-からの接続)
-  - [3. 対話型 CLI シェル (`h2-cli`) の使い方](#3-対話型-cli-シェル-h2-cli-の使い方)
-  - [4. ストレージのコンパクション (Vacuum によるファイル縮小)](#4-ストレージのコンパクション-vacuum-によるファイル縮小)
-- [Part VII. SQL コマンド & 関数リファレンス (Command Reference)](#part-vii-sql-コマンド--関数リファレンス-command-reference)
+- [Part VIII. SQL コマンド & 関数リファレンス (Command Reference)](#part-viii-sql-コマンド--関数リファレンス-command-reference)
 
 ---
 
@@ -276,6 +271,53 @@ INSERT INTO user_profiles VALUES (1, '{"role": "admin", "settings": {"theme": "d
 SELECT id, attributes -> 'settings' ->> 'theme' AS theme
 FROM user_profiles
 WHERE attributes -> 'settings' ->> 'theme' = 'dark';
+```
+
+---
+
+## 6. 時間間隔型 (INTERVAL) & 自動採番型 (SERIAL, BIGSERIAL, IDENTITY)
+
+### 6.1 時間間隔型 (`INTERVAL`)
+期間や時間差を柔軟に表現・計算するためのデータ型です。ISO/PostgreSQL 互換の構文をサポートしています。
+
+```sql
+-- テーブル定義での利用
+CREATE TABLE subscriptions (
+    sub_id INT PRIMARY KEY,
+    plan_name VARCHAR,
+    duration INTERVAL NOT NULL
+);
+
+-- データ挿入
+INSERT INTO subscriptions VALUES (1, 'Pro Annual', INTERVAL '1 year 2 months');
+INSERT INTO subscriptions VALUES (2, 'Trial Pass', INTERVAL '14 days 6 hours 30 minutes');
+
+-- 日付時刻との加減算
+SELECT NOW() + INTERVAL '7 days' AS expires_at;
+SELECT AGE(TIMESTAMP '2026-09-25 12:00:00', TIMESTAMP '2024-01-01 00:00:00') AS diff;
+```
+
+### 6.2 自動採番型 (`SERIAL`, `BIGSERIAL`) & `IDENTITY`
+主キーなどの連番カラムを定義するための糖衣構文です。内部的には独立した `SEQUENCE` オブジェクトが自動生成され、デフォルト値として `NEXTVAL(...)` が紐付けられます。
+
+```sql
+-- PostgreSQL 互換の SERIAL / BIGSERIAL
+CREATE TABLE orders (
+    order_id SERIAL PRIMARY KEY,
+    customer_id INT NOT NULL,
+    total_amount DECIMAL(10, 2)
+);
+
+-- SQL 標準準拠の GENERATED ALWAYS AS IDENTITY
+CREATE TABLE audit_logs (
+    log_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    action VARCHAR,
+    logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- INSERT 時に自動採番
+INSERT INTO orders (customer_id, total_amount) VALUES (101, 4500.00);
+INSERT INTO orders (customer_id, total_amount) VALUES (102, 1280.50);
 ```
 
 ---
@@ -774,6 +816,123 @@ DROP VIEW IF EXISTS active_customers;
 
 ---
 
+## 12. シーケンス生成器 (SEQUENCE)
+
+独立した連番生成オブジェクトです。テーブルから独立して採番できるため、分散 ID や複数テーブル間での一意なキー採番に最適です。
+
+```sql
+-- シーケンスの作成 (START WITH, INCREMENT BY, MINVALUE, MAXVALUE, CYCLE)
+CREATE SEQUENCE order_seq INCREMENT BY 1 START WITH 1000;
+
+-- 連番の取得 (NEXTVAL) および現在値の確認 (CURRVAL)
+SELECT NEXTVAL('order_seq'); -- 1000
+SELECT NEXTVAL('order_seq'); -- 1001
+SELECT CURRVAL('order_seq'); -- 1001
+
+-- 任意の値への設定 (SETVAL)
+SELECT SETVAL('order_seq', 5000);
+
+-- シーケンスの変更と削除
+ALTER SEQUENCE order_seq RESTART WITH 100;
+DROP SEQUENCE IF EXISTS order_seq;
+```
+
+---
+
+## 13. バックアップとリストア (BACKUP / RESTORE)
+
+稼働中のデータベースから、整合性のある物理バックアップアーカイブを作成・復元します。
+
+```sql
+-- ZIP 圧縮形式で現在の全データベース状態をバックアップ
+BACKUP TO 'backup_20260925.zip';
+
+-- バックアップファイルからデータベースをリストア
+RESTORE FROM 'backup_20260925.zip';
+```
+
+---
+
+## 14. 一括データ移行 (COPY TO / FROM)
+
+CSV などの外部ファイルとテーブル間で、高速に一括データのエクスポート／インポートを行います。
+
+```sql
+-- CSV ファイルへのエクスポート (ヘッダー付き)
+COPY products TO 'products_export.csv' WITH (FORMAT CSV, HEADER);
+
+-- CSV ファイルからの高速インポート
+COPY products FROM 'products_data.csv' WITH (FORMAT CSV, HEADER);
+```
+
+---
+
+## 15. サーバサイドカーソル (CURSOR)
+
+大量のクエリ結果セットをメモリに一括ロードせず、カーソルを通じて行単位／バッチ単位で順次フェッチ（走査）します。
+
+```sql
+-- カーソルの宣言
+DECLARE art_cursor CURSOR FOR 
+    SELECT id, title, price FROM articles ORDER BY id;
+
+-- 前後・絶対位置・相対位置でのフェッチ
+FETCH NEXT FROM art_cursor;
+FETCH NEXT FROM art_cursor;
+FETCH PRIOR FROM art_cursor;
+FETCH FIRST FROM art_cursor;
+FETCH ABSOLUTE 10 FROM art_cursor;
+
+-- カーソルの解放
+CLOSE art_cursor;
+```
+
+---
+
+## 16. 高度な数学・文字列関数と正規表現演算子
+
+### 16.1 高度な数学関数
+- `LN(x)`, `EXP(x)`: 自然対数および指数関数
+- `LOG10(x)`, `LOG2(x)`: 常用対数・2底対数
+- `SIN(x)`, `COS(x)`, `TAN(x)`: 三角関数
+- `ASIN(x)`, `ACOS(x)`, `ATAN(x)`: 逆三角関数
+- `DEGREES(x)`, `RADIANS(x)`: 角度とラジアンの相互変換
+- `SIGN(x)`: 符号（1, 0, -1）
+- `TRUNC(x, [d])`: 切り捨て
+
+```sql
+SELECT LN(EXP(1.0)), SIGN(-42), TRUNC(123.456, 2);
+```
+
+### 16.2 高度な文字列関数
+- `REGEXP_REPLACE(str, pattern, replacement)`: 正規表現による文字列置換
+- `REGEXP_LIKE(str, pattern)`: 正規表現パターンマッチング述語
+- `INITCAP(str)`: 各単語の先頭を大文字化
+- `LPAD(str, len, [pad])`, `RPAD(str, len, [pad])`: 左右パディング
+- `REPEAT(str, n)`: 文字列の反復生成
+- `REVERSE(str)`: 文字列の反転
+- `TRANSLATE(str, from, to)`: 1文字ずつの置換マッピング
+- `SPLIT_PART(str, delim, field)`: デリミタ分割と特定フィールド抽出
+
+```sql
+SELECT INITCAP('postgresql compatible rust db'); -- 'Postgresql Compatible Rust Db'
+SELECT REGEXP_REPLACE('2026-09-25', '(\d{4})-(\d{2})-(\d{2})', '$1年$2月$3日');
+SELECT SPLIT_PART('user@example.com', '@', 1); -- 'user'
+```
+
+### 16.3 正規表現演算子
+- `~`: 正規表現一致（大文字小文字区別）
+- `~*`: 正規表現一致（大文字小文字不問）
+- `!~`: 正規表現不一致（大文字小文字区別）
+- `!~*`: 正規表現不一致（大文字小文字不問）
+
+```sql
+SELECT 'h2database-rust' ~ '^h2.*-rust$'; -- true
+SELECT 'HELLO' ~* 'hello';                -- true
+```
+
+---
+
 # Part IV. トランザクションと並行性制御 (Transactions & Concurrency)
 
 ## 1. MVCC (マルチバージョン並行性制御) の特徴
@@ -1133,7 +1292,151 @@ async_conn.vacuum().await?;
 
 ---
 
-# Part VII. SQL コマンド & 関数リファレンス (Command Reference)
+# Part VII. 高可用性・メッセージング・分散ストレージ分離 (HA, MQ & Decoupled Aurora Architecture)
+
+## 1. 同期レプリケーション (`remote_apply`)
+
+PostgreSQL の `synchronous_commit = remote_apply` 相当の同期レプリケーションをサポートします。
+
+```text
+┌──────────────────────┐                     ┌──────────────────────┐
+│ Primary (Read-Write) │                     │ Standby (Read-Only)  │
+│  - Executes DDL/DML  │                     │  - Replicates State  │
+│  - On COMMIT ───────┼─ TCP Replication ──>│  - Applies to MVStore│
+│  - Blocks until ACK  │<─ ACK (Applied) ────┤  - Serves RO Queries │
+└──────────────────────┘                     └──────────────────────┘
+```
+
+### 1.1 Primary と Standby の起動 (Rust API)
+
+```rust
+use h2::replication::{Instance, InstanceConfig, InstanceRole, SyncReplicationMode};
+use std::time::Duration;
+
+// 1. Primary インスタンスの起動
+let primary_config = InstanceConfig {
+    role: InstanceRole::Primary {
+        listen_addr: "127.0.0.1:5433".parse().unwrap(),
+        sync_mode: SyncReplicationMode::RemoteApply,
+        apply_timeout: Duration::from_secs(5),
+    },
+};
+let primary = Instance::open("primary.h2", primary_config)?;
+
+// 2. Standby インスタンスの起動 & 接続
+let standby_config = InstanceConfig::standby("127.0.0.1:5433".parse().unwrap());
+let standby = Instance::open("standby.h2", standby_config)?;
+
+// 3. Primary で書き込み、Standby で参照
+let p_conn = primary.connect()?;
+let s_conn = standby.connect()?;
+
+p_conn.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR);")?;
+p_conn.execute("INSERT INTO users VALUES (1, 'Alice');")?;
+
+// remote_apply により、COMMIT 完了時点で Standby でも即座に可視
+let rows = s_conn.query("SELECT * FROM users WHERE id = 1;")?;
+```
+
+---
+
+## 2. トランザクショナル・キューテーブル & JMS API (Native MQ)
+
+データベーストランザクションと完全に一体化したネイティブメッセージキューです。外部の Kafka や RabbitMQ を使わずに、**Transactional Outbox パターンを完全不要化**します。
+
+### 2.1 キューテーブルの定義と SQL 透過性
+
+```sql
+-- 保持期間 24 時間、容量上限 10MB のキューテーブル作成
+CREATE QUEUE TABLE orders_queue (payload VARCHAR) 
+    WITH (RETENTION_HOURS = 24, MAX_BYTES = 10485760);
+
+-- SQL によるエンキュー
+INSERT INTO orders_queue (payload) VALUES ('OrderCreated: #1001');
+
+-- SQL によるデキュー (_offset による順序保証)
+SELECT _offset, _msg_id, payload FROM orders_queue WHERE _offset >= 1 ORDER BY _offset;
+```
+
+> [!NOTE]
+> キューテーブルは不変ログ保護のため、`UPDATE`, `DELETE`, `TRUNCATE`, 二次インデックスの作成が自動的に安全ガード（禁止）されます。
+
+### 2.2 JMS 2.0/3.0 準拠 API & Kafka 風オフセットシーク
+
+```rust
+use h2::jms::{AcknowledgeMode, JmsConnectionFactory};
+
+let factory = JmsConnectionFactory::new(conn.clone());
+let jms_conn = factory.create_connection()?;
+let session = jms_conn.create_session(false, AcknowledgeMode::AutoAcknowledge)?;
+let queue = session.create_queue("orders_queue")?;
+
+let producer = session.create_producer(&queue)?;
+let consumer = session.create_consumer(&queue, "worker-group-1")?;
+
+// メッセージ送信
+producer.send(session.create_text_message("Order #1002")?)?;
+
+// メッセージ受信
+if let Some(msg) = consumer.receive(None)? {
+    println!("Offset: {}, Text: {}", msg.get_offset(), msg.get_text());
+}
+
+// Kafka 風シーク (先頭へ巻き戻し、任意オフセットへジャンプ)
+consumer.seek_to_beginning()?;
+consumer.seek(5)?;
+```
+
+---
+
+## 3. AWS Aurora 型 コンピュート・ストレージ完全分離クラスタ
+
+AWS Aurora や Google Cloud AlloyDB のような**「コンピュート・ストレージ分離」**および**「ログそのものがデータベースである（The Log is the Database）」**アーキテクチャです。
+
+```mermaid
+graph TD
+    Primary[Primary Compute Node (RW)] ==>|1. Only WAL Records (Quorum Write)| S1[(Storage Node 1)]
+    Primary ==>|1. Only WAL Records (Quorum Write)| S2[(Storage Node 2)]
+    Primary ==>|1. Only WAL Records (Quorum Write)| S3[(Storage Node 3)]
+    Primary -.->|Metadata Invalidation| Replica1[Read Replica 1 (RO)]
+    Primary -.->|Metadata Invalidation| Replica2[Read Replica 2 (RO)]
+    Replica1 -.->|On-Demand Page Read| S1
+    Replica2 -.->|On-Demand Page Read| S3
+```
+
+### 3.1 主な特徴
+1. **The Log is the Database**: ダーティデータページの転送やチェックポイントを完全撤廃し、軽量な WAL ログレコードのみを並行クォーラム送信（I/O を最大 80% 削減）。
+2. **4 of 6 Quorum (3 AZ)**: 6ノード中4ノードの書き込み ACK でコミット確定。低速ディスクの遅延（Tail Latency）を解消し、1 AZ（2ノード）が完全停止しても無停止稼働。
+3. **共有ストレージ・ゼロストレージ・リードレプリカ**: レプリカは専用ストレージを持たず、同一ストレージフリートを共有（ストレージコスト 0）。
+4. **瞬間フェイルオーバー**: Fencing Token による新世代リーダー昇格。ストレージ層がバックグラウンドで Redo マテリアライズ済みのため、クラッシュリカバリのログ総舐めが一切不要（数ミリ秒で昇格完了）。
+
+### 3.2 クラスタの利用 (Rust API)
+
+```rust
+use h2::storage::DecoupledCluster;
+
+// 6ノード分散ストレージ (4 of 6 Quorum, 3 AZ) ＋ 2台のリードレプリカ
+let mut cluster = DecoupledCluster::new_6nodes("aurora-prod", 2)?;
+
+let primary_conn = cluster.primary_connection();
+let replica_conn = cluster.replica_connection(0)?;
+
+// Primary で書き込み
+primary_conn.execute("CREATE TABLE fleet (id INT PRIMARY KEY, name VARCHAR);")?;
+primary_conn.execute("INSERT INTO fleet VALUES (1, 'Vessel-A');")?;
+
+// リードレプリカで即時参照 (キャッシュミス時は共有ストレージからオンデマンド読み出し)
+let rows = replica_conn.query("SELECT * FROM fleet WHERE id = 1;")?;
+
+// 瞬間フェイルオーバー (Fencing Token による新 Primary 昇格)
+let new_token = cluster.failover_to_replica(0)?;
+println!("Promoted to Primary with Fencing Token: {}", new_token.val());
+```
+
+---
+
+# Part VIII. SQL コマンド & 関数リファレンス (Command Reference)
+
 
 ### サポートされている SQL 文
 
@@ -1158,6 +1461,17 @@ async_conn.vacuum().await?;
 | `COMMIT` | `COMMIT;` / `END;` | トランザクションのコミット確定 |
 | `ROLLBACK` | `ROLLBACK;` | トランザクションのロールバック破棄 |
 | `VACUUM` | `VACUUM;` | ストレージのガベージ回収とファイル縮小 |
+| `CREATE SEQUENCE` | `CREATE SEQUENCE [IF NOT EXISTS] seq [INCREMENT BY n] [START WITH n]` | 独立した自動連番生成オブジェクトの作成 |
+| `ALTER SEQUENCE` | `ALTER SEQUENCE seq RESTART WITH n` | シーケンスの現在値再設定 |
+| `DROP SEQUENCE` | `DROP SEQUENCE [IF EXISTS] seq` | シーケンスの削除 |
+| `CREATE QUEUE TABLE` | `CREATE QUEUE TABLE q (payload VARCHAR) [WITH (RETENTION_HOURS = n, MAX_BYTES = m)]` | トランザクショナル・キューテーブル（Native MQ）の作成 |
+| `BACKUP TO` | `BACKUP TO 'backup.zip';` | 整合性のある物理データベースアーカイブの生成 |
+| `RESTORE FROM` | `RESTORE FROM 'backup.zip';` | バックアップアーカイブからの完全復元 |
+| `COPY TO` | `COPY tbl TO 'data.csv' WITH (FORMAT CSV, HEADER);` | テーブルから CSV ファイルへの高速一括エクスポート |
+| `COPY FROM` | `COPY tbl FROM 'data.csv' WITH (FORMAT CSV, HEADER);` | CSV ファイルからテーブルへの高速一括インポート |
+| `DECLARE CURSOR` | `DECLARE cur CURSOR FOR SELECT ...;` | サーバサイドカーソルの定義 |
+| `FETCH` | `FETCH [NEXT / PRIOR / FIRST / LAST / ABSOLUTE n] FROM cur;` | カーソルからの行フェッチ |
+| `CLOSE` | `CLOSE cur;` | カーソルのクローズとリソース解放 |
 
 ### 組み込み関数・演算子
 
@@ -1166,10 +1480,30 @@ async_conn.vacuum().await?;
 | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | `SELECT department, AVG(salary) FROM emp GROUP BY department` | 標準集約関数 |
 | `COALESCE` | `COALESCE(col1, col2, 'default')` | 最初の非 NULL 引数を返却 |
 | `UPPER`, `LOWER` | `UPPER(name)`, `LOWER(email)` | 大文字・小文字変換 |
+| `INITCAP` | `INITCAP('hello world')` | 各単語の先頭を大文字化 |
 | `CONCAT` | `CONCAT(first_name, ' ', last_name)` | 複数文字列の結合 |
 | `LENGTH`, `CHAR_LENGTH` | `LENGTH(title)` | 文字列の文字数を取得 |
-| `ABS` | `ABS(amount)` | 数値の絶対値を計算 |
+| `LPAD`, `RPAD` | `LPAD(id, 6, '0')` | 指定長までの左右パディング埋め |
+| `REPEAT` | `REPEAT('abc', 3)` | 文字列の繰り返し生成 |
+| `REVERSE` | `REVERSE('Rust')` | 文字列の反転 |
+| `TRANSLATE` | `TRANSLATE('12345', '14', 'ax')` | 1文字ずつの置換マッピング |
+| `SPLIT_PART` | `SPLIT_PART('a,b,c', ',', 2)` | 区切り文字による分割と特定位置の取得 |
+| `REGEXP_REPLACE` | `REGEXP_REPLACE(str, pattern, repl)` | 正規表現による文字列置換 |
+| `REGEXP_LIKE` | `REGEXP_LIKE(str, pattern)` | 正規表現パターン一致判定述語 |
+| `~`, `~*` | `'abc' ~* '^A'` | 正規表現一致演算子（大文字小文字区別 / 不問） |
+| `!~`, `!~*` | `'abc' !~ '^[0-9]'` | 正規表現不一致演算子（大文字小文字区別 / 不問） |
+| `ABS`, `SIGN` | `ABS(-5)`, `SIGN(-42)` | 絶対値および符号判定（1, 0, -1） |
+| `LN`, `EXP` | `LN(EXP(2.0))` | 自然対数および指数関数 |
+| `LOG10`, `LOG2` | `LOG10(100.0)`, `LOG2(8.0)` | 常用対数および2底対数 |
+| `SIN`, `COS`, `TAN` | `SIN(RADIANS(90))` | 三角関数 |
+| `ASIN`, `ACOS`, `ATAN` | `DEGREES(ATAN(1.0))` | 逆三角関数 |
+| `DEGREES`, `RADIANS` | `DEGREES(PI())`, `RADIANS(180)` | 角度とラジアンの相互変換 |
+| `TRUNC` | `TRUNC(123.456, 2)` | 指定桁数への切り捨て |
+| `NEXTVAL`, `CURRVAL` | `NEXTVAL('order_seq')`, `CURRVAL('order_seq')` | シーケンスの次値採番および現在値照会 |
+| `SETVAL` | `SETVAL('order_seq', 500)` | シーケンスの現在値直接設定 |
 | `NOW`, `CURRENT_TIMESTAMP` | `SELECT NOW()` | 現在の協定世界時（RFC 3339 形式）を取得 |
+| `AGE` | `AGE(end_time, start_time)` | 2つのタイムスタンプ間の時間差（INTERVAL）を算出 |
+| `DATE_ADD`, `DATE_SUB` | `DATE_ADD(NOW(), INTERVAL '7 days')` | 日付時刻の加算・減算 |
 | `CASE WHEN` | `CASE WHEN age >= 20 THEN 'adult' ELSE 'minor' END` | 条件分岐評価式 |
 | `IN`, `NOT IN` | `id IN (1, 2, 3)` / `id IN (SELECT user_id FROM orders)` | リストまたはサブクエリに含まれるか判定 |
 | `BETWEEN` | `price BETWEEN 100 AND 500` | 範囲内判定（境界含む） |
@@ -1180,7 +1514,7 @@ async_conn.vacuum().await?;
 | `->>` | `data ->> 'name'` | JSON オブジェクトの特定キー抽出（テキスト文字列返却） |
 | `JSON_EXTRACT` | `JSON_EXTRACT(data, '$.user.email')` | JSON パス式によるプロパティ抽出 |
 | `LIKE` | `col LIKE '%test%'` | パターンマッチング |
-| `+`, `-`, `*`, `/`, `%` | `price * 1.1` | 四則演算および剰余 |
+| `+`, `-`, `*`, `/`, `%` | `price * 1.1`, `NOW() + INTERVAL '1 day'` | 四則演算、剰余、INTERVAL演算 |
 | `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=` | `age >= 18` | 比較演算子（異なる数値型同士のクロス比較対応） |
 | `IS NULL`, `IS NOT NULL` | `optional_col IS NOT NULL` | NULL 検証 |
 | `AND`, `OR`, `NOT` | `a > 10 AND NOT (b = 0)` | 論理演算子 |

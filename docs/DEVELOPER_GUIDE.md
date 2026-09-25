@@ -14,6 +14,12 @@
   - [2.3 MVCC トランザクション & スナップショット分離](#23-mvcc-トランザクション--スナップショット分離)
   - [2.4 オンライン・コンパクション (Concurrent Vacuum) の仕組み](#24-オンラインコンパクション-concurrent-vacuum-の仕組み)
   - [2.5 オンライン & インスタント DDL (Instant / Online DDL) のアーキテクチャ](#25-オンライン--インスタント-ddl-instant--online-ddl-のアーキテクチャ)
+- [2.6 コンピュート・ストレージ分離アーキテクチャ (`StorageEngine` トレイト)](#26-コンピュートストレージ分離アーキテクチャ-storageengine-トレイト)
+  - [2.7 "The Log is the Database" スマートストレージノードの内部設計](#27-the-log-is-the-database-スマートストレージノードの内部設計)
+  - [2.8 クォーラム合意・Tail Latency 解消・ゴシップ自己修復](#28-クォーラム合意tail-latency-解消ゴシップ自己修復)
+  - [2.9 ゼロストレージ・リードレプリカ & Fencing Token 瞬間フェイルオーバー](#29-ゼロストレージリードレプリカ--fencing-token-瞬間フェイルオーバー)
+  - [2.10 トランザクショナル・キューテーブル & JMS API (Native MQ) の内部仕様](#210-トランザクショナルキューテーブル--jms-api-native-mq-の内部仕様)
+  - [2.11 同期レプリケーション (PostgreSQL remote_apply 相当) の内部仕様](#211-同期レプリケーション-postgresql-remote_apply-相当の内部仕様)
 - [3. SQL 処理系 (`h2-sql`) の内部仕様](#3-sql-処理系-h2-sql-の内部仕様)
   - [3.1 クエリ実行パイプライン](#31-クエリ実行パイプライン)
   - [3.2 カタログとマップ命名規則](#32-カタログとマップ命名規則)
@@ -145,6 +151,82 @@ Java 版 H2 Database のコアである **MVStore** のアーキテクチャを 
      - `MVStore::clear_map` により、内部ツリーを一括リセット。数百万行でも 1 行ずつ削除せず一瞬で空テーブル化。
   4. **Online Index Build (`CREATE INDEX CONCURRENTLY`)**:
      - MVCC スナップショット分離を利用して既存行を走査し、並行する更新トランザクションをブロックせずにインデックスツリーを構築。
+
+---
+
+## 2.6 コンピュート・ストレージ分離アーキテクチャ (`StorageEngine` トレイト)
+
+本データベースは、AWS Aurora や Google Cloud AlloyDB のような**「コンピュート・ストレージ完全分離」**を可能にするため、統一抽象トレイト [`StorageEngine`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/storage_engine.rs) を定義しています。
+
+```rust
+pub trait StorageEngine: Send + Sync {
+    fn latest_committed_lsn(&self) -> Lsn;
+    fn fencing_token(&self) -> FencingToken;
+    fn acquire_lease(&self, token: FencingToken) -> H2Result<()>;
+    fn append_logs(&self, records: &[LogRecord], token: FencingToken) -> H2Result<Lsn>;
+    fn wait_for_quorum_lsn(&self, lsn: Lsn) -> H2Result<()>;
+    fn get_key(&self, map_name: &str, key: &[u8], read_version: Lsn) -> H2Result<Option<Vec<u8>>>;
+    fn scan_range(&self, map_name: &str, start_key: Option<&[u8]>, end_key: Option<&[u8]>, read_version: Lsn) -> H2Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    fn get_page(&self, page_id: PageId, read_version: Lsn) -> H2Result<Vec<u8>>;
+    fn get_all_map_names(&self, read_version: Lsn) -> H2Result<Vec<String>>;
+}
+```
+
+- **`LocalMVStoreEngine`**: 内部の `MVStore` を直接呼び出し、組み込みモードで性能ペナルティ 0 を保証。
+- **`DistributedLogStorageEngine`**: リモートの分散ストレージフリートと通信し、クォーラム合意を管理。
+
+---
+
+## 2.7 "The Log is the Database" スマートストレージノードの内部設計
+
+コンピュートノードからストレージ層へは、8KB/16KBのデータページを一切転送せず、**WAL ログレコード（Mini-Transaction Delta）のみ**を送信します。
+
+[`SmartStorageNode`](file:///d:/workspace/h2database-rust/crates/h2/src/storage/smart_node.rs) は以下の内部機構を持ちます：
+1. **アペンドオンリー高速 WAL リングバッファ**: 受信した `LogRecord` を直列化・追記し、即座に ACK を返却。
+2. **バックグラウンド Redo マテリアライザー (`materialize_pending`)**: アペンドされたログを非同期にローカル B-Tree 構造へマージ。
+3. **オンデマンド動的 Redo 解決 (`get_key`, `scan_range`)**: バックグラウンド合成が追いついていない場合、要求 LSN までの未適用ログをインメモリで動的オーバーレイして即座に最新データを返却。
+
+---
+
+## 2.8 クォーラム合意・Tail Latency 解消・ゴシップ自己修復
+
+[`StorageFleet`](file:///d:/workspace/h2database-rust/crates/h2/src/storage/quorum.rs) は複数ストレージノード（2/3 Quorum または 4/6 Quorum across 3 AZ）を統括します。
+
+- **並行クォーラム書き込み (`append_logs_quorum`)**: 全ストレージノードへ非同期でログを送信し、`write_quorum` 台から ACK が返った瞬間にコミット確定。遅延ノード（Tail Latency）を完全に無視して高速完了。
+- **ゴシップ自己修復 (`gossip_sync_from` / `run_gossip_repair`)**: ノード間で所持 LSN 範囲を定期照合し、障害復旧したノードへ不足ログを自動ストリーミングして修復。
+
+---
+
+## 2.9 ゼロストレージ・リードレプリカ & Fencing Token 瞬間フェイルオーバー
+
+[`DecoupledComputeNode`](file:///d:/workspace/h2database-rust/crates/h2/src/storage/compute.rs) はステートレスなクエリ実行エンジンとして動作します。
+
+- **共有ストレージ・リードレプリカ**: 専用ストレージを持たず、同一ストレージフリートからオンデマンド読み出し。Primary からの軽量な `CacheInvalidationEvent` 通知によりローカルキャッシュをパージ。
+- **Fencing Token による瞬間昇格 (`promote_to_primary`)**: 単調増加する `FencingToken` を発行してストレージフリートから排他的リースを獲得。ストレージ層自身がマテリアライズ済みであるため、Redo 走査なしで即時 Primary 昇格完了。旧 Primary からの遅延パケットはストレージ層で弾かれ、Split-Brain を確実に防ぎます。
+
+---
+
+## 2.10 トランザクショナル・キューテーブル & JMS API (Native MQ) の内部仕様
+
+データベーストランザクションと完全に一体化したネイティブメッセージキューです。
+
+- **不変コミットログ構造**: `_offset`（1-indexed BigInt）、`_timestamp`、`_msg_id`、`_correlation_id` を自動付与し、追記型 B-Tree マップ `mq_<table_name>` に格納。
+- **厳格なガード**: キューの順序性と不変性を保証するため、`UPDATE`、`DELETE`、`TRUNCATE`、二次インデックスの作成を禁止し、`SELECT` は `_offset` への比較条件のみを許可。
+- **二重保持ポリシーによる Head Truncation GC**:
+  - 時間保持 (`RETENTION_HOURS` / `RETENTION_TIME`)
+  - 容量保持 (`MAX_BYTES`)
+  - `INSERT` 実行時またはバックグラウンドクリーナーが、期限切れ／容量超過した先頭オフセット範囲を O(log N) で一括パージ。
+- **JMS 2.0/3.0 プロバイダ & Kafka 風シーク**:
+  - [`JmsConnectionFactory`](file:///d:/workspace/h2database-rust/crates/h2/src/jms.rs)、`JmsSession`、`JmsProducer`、`JmsConsumer`
+  - `consumer.seek(offset)`, `consumer.seek_to_beginning()`, `consumer.seek_to_end()` による自由な再生。
+
+---
+
+## 2.11 同期レプリケーション (PostgreSQL remote_apply 相当) の内部仕様
+
+- **変更収集**: `MapChangeSink`（[`DefaultChangeCollector`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/replication.rs)）がトランザクション内の全マップ変更（Put/Remove/Clear）を捕捉。
+- **同期コミット制御**: Primary の `MVStore::commit()` 時に `ReplicationListener::on_commit` がトリガーされ、Standby がローカルストレージおよびカタログに適用完了した ACK を返すまで Primary の呼び出し元スレッドを同期待機（`remote_apply`）。
+- **読み取り専用ガード**: Standby インスタンスの `SQLEngine` は `set_read_only(true)` に設定され、書き込み DDL/DML が自動的に安全拒絶されます。
 
 ---
 
@@ -502,6 +584,23 @@ cargo test --test advanced_sql_tests
 
 ### 主要な統合テストファイル
 
+- **[`decoupled_storage_architecture_tests.rs`](file:///d:/workspace/h2database-rust/crates/h2/tests/decoupled_storage_architecture_tests.rs)**:
+  AWS Aurora 型 コンピュート・ストレージ完全分離アーキテクチャの包括的検証。
+  - 4/6 および 2/3 クォーラム書き込みと非同期 Redo マテリアライズ。
+  - 300ms 遅延ノードがあっても Quorum で即座に応答する Tail Latency 解消。
+  - 1 AZ（2ノード）喪失時の無停止稼働と、復旧時のゴシップ自己修復。
+  - ゼロストレージ・リードレプリカでの即時参照とキャッシュ無効化。
+  - Fencing Token による瞬間フェイルオーバーと Split-Brain 防止。
+- **[`transactional_queue_table_tests.rs`](file:///d:/workspace/h2database-rust/crates/h2/tests/transactional_queue_table_tests.rs)**:
+  トランザクショナル・キューテーブル（Native MQ）の包括的検証。
+  - SQL DDL ガード（UPDATE/DELETE/TRUNCATE/インデックス禁止）。
+  - JMS API（TextMessage, BytesMessage, Producer, Consumer）。
+  - Kafka 風オフセットシーク（`seek`, `rewind`, timestamp seek）。
+  - 二重保持ポリシー（時間 & 容量超過）による自動 Head Truncation GC。
+- **[`replication_remote_apply_tests.rs`](file:///d:/workspace/h2database-rust/crates/h2/tests/replication_remote_apply_tests.rs)**:
+  PostgreSQL `remote_apply` 相当の同期レプリケーション検証。
+  - Primary / Standby 間の初期スナップショット同期と即時可視性。
+  - Standby での Read-Only ガードと明示的トランザクション同期。
 - **[`h2_comprehensive_tests.rs`](file:///d:/workspace/h2database-rust/crates/h2/tests/h2_comprehensive_tests.rs)**:
   Java版 H2 Database を参考にした包括的ストレステスト。
   - `test_h2_mvcc_stress_and_concurrency`: 多数の並行リーダーとライターのスナップショット分離検証。
