@@ -10,6 +10,8 @@ fn main() -> Result<()> {
     let mut db_path = ":memory:".to_string();
     let mut script_file: Option<String> = None;
     let mut one_liner_command: Option<String> = None;
+    let mut user_arg: Option<String> = None;
+    let mut password_arg: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -23,6 +25,18 @@ fn main() -> Result<()> {
             "-c" | "--command" => {
                 if i + 1 < args.len() {
                     one_liner_command = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-u" | "--user" => {
+                if i + 1 < args.len() {
+                    user_arg = Some(args[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-p" | "--password" => {
+                if i + 1 < args.len() {
+                    password_arg = Some(args[i + 1].clone());
                     i += 1;
                 }
             }
@@ -51,6 +65,12 @@ fn main() -> Result<()> {
         Connection::open(&db_path)?
     };
 
+    // ユーザー指定があれば認証実行
+    if let Some(ref u) = user_arg {
+        conn.authenticate(u, password_arg.as_deref(), "127.0.0.1")
+            .with_context(|| format!("Authentication failed for user '{}'", u))?;
+    }
+
     // 1. ワンライナーコマンドの実行 (-c "SQL")
     if let Some(cmd) = one_liner_command {
         run_script(&conn, &cmd)?;
@@ -70,6 +90,9 @@ fn main() -> Result<()> {
     println!("==================================================");
     println!("  h2database-rust CLI shell (v0.1.0)");
     println!("  Connecting to: {}", db_path);
+    if let Some(ref u) = conn.current_user() {
+        println!("  Connected as user: {}", u);
+    }
     println!("  Type .help for instructions, .exit to quit");
     println!("==================================================");
 
@@ -104,6 +127,12 @@ fn main() -> Result<()> {
                 print_help();
             } else if trimmed == ".version" {
                 println!("Storage version: {}", conn.version());
+            } else if trimmed == ".user" {
+                println!("Current user: {}", conn.current_user().unwrap_or_else(|| "admin (unrestricted)".to_string()));
+            } else if trimmed.starts_with(".user ") {
+                let u = trimmed[6..].trim();
+                conn.set_current_user(Some(u));
+                println!("Switched current session user to '{}'", u);
             } else if trimmed.starts_with(".read ") {
                 let path = trimmed[6..].trim();
                 match fs::read_to_string(path) {
@@ -139,6 +168,8 @@ fn print_help() {
     println!("Usage: h2-cli [OPTIONS] [DB_PATH]");
     println!();
     println!("Options:");
+    println!("  -u, --user <USER>     Database user name");
+    println!("  -p, --password <PASS> Database password");
     println!("  -f, --file <PATH>     Execute SQL statements from a file and exit");
     println!("  -c, --command <SQL>   Execute single or multiple SQL statements and exit");
     println!("  --db <PATH>           Path to database file (default: :memory:)");
@@ -146,6 +177,7 @@ fn print_help() {
     println!();
     println!("Interactive Dot Commands:");
     println!("  .help                 Show this help");
+    println!("  .user                 Show or switch session user (.user or .user <NAME>)");
     println!("  .version              Show database version");
     println!("  .read <FILE>          Execute SQL script from file");
     println!("  .exit / .quit         Exit the shell");

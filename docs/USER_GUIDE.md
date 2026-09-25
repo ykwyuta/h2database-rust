@@ -61,7 +61,13 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [1. 同期レプリケーション (PostgreSQL remote_apply 相当の Primary/Standby)](#1-同期レプリケーション-remote_apply)
   - [2. トランザクショナル・キューテーブル & JMS API (Native MQ)](#2-トランザクショナルキューテーブル--jms-api)
   - [3. AWS Aurora 型 コンピュート・ストレージ完全分離クラスタ (The Log is the Database)](#3-aws-aurora-型-コンピュートストレージ完全分離クラスタ)
-- [Part VIII. SQL コマンド & 関数リファレンス (Command Reference)](#part-viii-sql-コマンド--関数リファレンス-command-reference)
+- [Part VIII. セキュリティ・認証とアクセス元権限管理 (Security & Access Control)](#part-viii-セキュリティ認証とアクセス元権限管理-security--access-control)
+  - [1. ユーザー管理 (CREATE USER, ALTER USER, DROP USER, SHOW USERS)](#1-ユーザー管理-create-user-alter-user-drop-user-show-users)
+  - [2. アクセス元ホスト／IP／CIDR 制限 (Host-based Access Control)](#2-アクセス元ホストipcidr-制限-host-based-access-control)
+  - [3. テーブル単位の権限管理 (GRANT, REVOKE, SHOW GRANTS)](#3-テーブル単位の権限管理-grant-revoke-show-grants)
+  - [4. クエリ実行時の厳格なアクセス制御 (Authorization Enforcement)](#4-クエリ実行時の厳格なアクセス制御-authorization-enforcement)
+  - [5. PGWire プロトコル経由のパスワード認証とハンドシェイク](#5-pgwire-プロトコル経由のパスワード認証とハンドシェイク)
+- [Part IX. SQL コマンド & 関数リファレンス (Command Reference)](#part-ix-sql-コマンド--関数リファレンス-command-reference)
 
 ---
 
@@ -1529,7 +1535,88 @@ println!("Promoted to Primary with Fencing Token: {}", new_token.val());
 
 ---
 
-# Part VIII. SQL コマンド & 関数リファレンス (Command Reference)
+# Part VIII. セキュリティ・認証とアクセス元権限管理 (Security & Access Control)
+
+h2database-rust は、エンタープライズ運用に必要な「ユーザー認証 (Authentication)」「アクセス元ホスト/IP制限 (Host-based Access Control)」「テーブル単位の権限管理 (Table-level Authorization / RBAC)」を備えています。
+
+## 1. ユーザー管理 (CREATE USER, ALTER USER, DROP USER, SHOW USERS)
+
+SQL DCL (Data Control Language) を用いて、直感的にユーザーを管理できます。
+
+```sql
+-- パスワードおよびアクセス元ホストを指定してユーザー作成
+CREATE USER 'analyst' PASSWORD 'analyst_pass' HOST 'localhost';
+
+-- サブネット CIDR を指定したユーザー作成
+CREATE USER 'operator' PASSWORD 'op_secret' HOST '192.168.1.0/24';
+
+-- 任意の接続元を許可するユーザー作成
+CREATE USER 'remote_app' PASSWORD 'token123' HOST '%';
+
+-- ユーザー情報の変更（パスワード変更、アクセス元ホスト変更）
+ALTER USER 'analyst' PASSWORD 'new_secret' HOST '%';
+
+-- 登録ユーザー一覧の照会
+SHOW USERS;
+-- 出力: username | allowed_hosts | is_superuser
+
+-- ユーザーの削除
+DROP USER 'operator';
+DROP USER IF EXISTS 'old_user';
+```
+
+## 2. アクセス元ホスト／IP／CIDR 制限 (Host-based Access Control)
+
+接続クライアントの IP アドレスに基づき、接続を許可するか厳格に検証します。
+
+| 構文 | 説明 | マッチ例 |
+| :--- | :--- | :--- |
+| `HOST 'localhost'` / `'127.0.0.1'` | ローカルマシンからの接続のみ許可 | `127.0.0.1`, `::1` |
+| `HOST '192.168.1.50'` | 特定の単一 IP アドレスのみ許可 | `192.168.1.50` |
+| `HOST '192.168.1.0/24'` | 特定のサブネット（CIDR 表記）からの接続を許可 | `192.168.1.1` 〜 `192.168.1.254` |
+| `HOST '10.0.0.0/8'` | プライベートクラスタネットワークからの接続を許可 | `10.x.x.x` |
+| `HOST '%'` または `HOST '*'` | すべてのホストからの接続を許可 | 任意の IP アドレス |
+
+## 3. テーブル単位の権限管理 (GRANT, REVOKE, SHOW GRANTS)
+
+権限付与の最小単位はテーブル単位であり、`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `ALL` を指定できます。
+
+```sql
+-- sales テーブルへの SELECT 権限を analyst に付与
+GRANT SELECT ON TABLE sales TO 'analyst';
+
+-- orders テーブルへの SELECT, INSERT, UPDATE 権限を operator に付与
+GRANT SELECT, INSERT, UPDATE ON TABLE orders TO 'operator';
+
+-- products テーブルへのすべての権限を付与
+GRANT ALL ON TABLE products TO 'operator';
+
+-- 付与されている権限一覧の確認
+SHOW GRANTS FOR 'analyst';
+-- 出力: table_name | privileges (例: sales | SELECT)
+
+-- 特定の権限の剥奪 (REVOKE)
+REVOKE UPDATE ON TABLE orders FROM 'operator';
+```
+
+## 4. クエリ実行時の厳格なアクセス制御 (Authorization Enforcement)
+
+- 認証されたユーザー（またはセッションに設定されたユーザー）が SQL クエリを発行すると、クエリ内で参照されるすべてのテーブルに対して要求権限（`SELECT`, `INSERT`, `UPDATE`, `DELETE`）が照合されます。
+- 権限が不足している場合、実行は即座に中断され、`H2Error::PermissionDenied`（PostgreSQL クライアントにはエラーレスポンス `E`）が返されます。
+- スーパーユーザー（`admin`, `postgres`, `sa`, `root` 等）はすべてのテーブルに対する操作および DDL（`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE`）が許可されます。一般ユーザーによる DDL 実行は自動的に拒否されます。
+
+## 5. PGWire プロトコル経由のパスワード認証とハンドシェイク
+
+外部クライアント（`psql`, DBeaver, JDBC, Spring Boot 等）が TCP/IP で接続した際、PGWire ハンドシェイクで透過的に認証が行われます。
+
+1. **StartupMessage**: クライアントから送信されたユーザー名と、ソケットの接続元 IP アドレスを取得。
+2. **ホスト制限チェック**: ユーザーの `allowed_hosts` と照合。拒否された場合は即座に接続切断。
+3. **パスワード認証**: ユーザーにパスワードが設定されている場合、`AuthenticationCleartextPassword` メッセージ（Code 3）を返し、クライアントから送信されたパスワードを検証。
+4. **セッション紐付け**: 認証完了後、セッションにユーザー名がバインドされ、以降の全クエリに対してテーブル権限チェックが適用されます。
+
+---
+
+# Part IX. SQL コマンド & 関数リファレンス (Command Reference)
 
 
 ### サポートされている SQL 文
