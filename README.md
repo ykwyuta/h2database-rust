@@ -30,6 +30,13 @@ Java版 [H2 Database](https://github.com/h2database/h2database) の先進的な�
   - `information_schema.tables`, `information_schema.columns` システムビューを提供。
 - **⚡ Tokio ネイティブ非同期 API (`AsyncConnection`)**:
   - `AsyncConnection::open(path).await` により Axum や Actix-web 等の非同期 Web サービスにそのまま統合可能。
+- **📬 トランザクショナル・キューテーブル (Transactional Queue Table & Native MQ)**:
+  - `CREATE QUEUE TABLE` によるデータベーストランザクション一体型メッセージキュー。JMS 2.0/3.0 準拠インターフェース、Kafka 風オフセットシーク（`seek`, `rewind`）、二重保持ポリシー（時間・容量上限）による自動 Head Truncation GC を完備し、Transactional Outbox パターンを完全不要化。
+- **☁️ AWS Aurora 型 コンピュート・ストレージ完全分離アーキテクチャ (The Log is the Database)**:
+  - コンピュートノードからストレージ層へは WAL ログレコードのみを転送（ダーティページ転送を完全撤廃）。
+  - スマートストレージノードによる非同期 B-Tree マテリアライズとオンデマンド Redo 解決。
+  - 4/6 Quorum（3 AZ）書き込みによる AZ 障害耐性と低速ディスクの遅延解消（Tail Latency Elimination）。
+  - 同一ストレージ層を共有するゼロストレージ・リードレプリカ、および Fencing Token による瞬間フェイルオーバー。
 
 ---
 
@@ -46,6 +53,8 @@ Java版 [H2 Database](https://github.com/h2database/h2database) の先進的な�
   4. [SQL処理系・型システム・実行エンジン](./docs/04_sql_parser_and_execution.md)
   5. [組み込みAPI・インターフェース設計](./docs/05_embedded_api_and_pgwire.md)
   6. [実装ロードマップとマイルストーン](./docs/06_roadmap_and_phases.md)
+  7. [トランザクショナル・キューテーブル設計](./docs/TRANSACTIONAL_QUEUE_TABLE_DESIGN.md)
+  8. [コンピュート・ストレージ分離アーキテクチャ設計 (Aurora Model)](./docs/08_decoupled_storage_architecture.md)
 
 ---
 
@@ -127,6 +136,34 @@ async fn main() -> H2Result<()> {
         let title: String = r.get_as(0)?;
         println!("Task: {title}");
     }
+
+    Ok(())
+}
+```
+
+### 3. AWS Aurora 型 コンピュート・ストレージ分離クラスタ
+
+```rust
+use h2::storage::DecoupledCluster;
+use h2::H2Result;
+
+fn main() -> H2Result<()> {
+    // 6ノード分散ストレージフリート (4 of 6 Quorum, 3 AZ) ＋ 2台のリードレプリカで起動
+    let mut cluster = DecoupledCluster::new_6nodes("aurora-prod", 2)?;
+
+    // 1. Primary でテーブル作成とデータ登録 (WAL ログレコードのみを並行クォーラム送信)
+    let primary_conn = cluster.primary_connection();
+    primary_conn.execute("CREATE TABLE accounts (id INT PRIMARY KEY, name VARCHAR, balance INT);")?;
+    primary_conn.execute("INSERT INTO accounts VALUES (1, 'Alice', 1000);")?;
+
+    // 2. ゼロストレージ・リードレプリカから即座に参照 (共有ストレージからオンデマンド読み出し)
+    let replica_conn = cluster.replica_connection(0)?;
+    let rows = replica_conn.query("SELECT * FROM accounts WHERE id = 1;")?;
+    println!("Replica read: {:?}", rows[0].get_as::<String>(1)?);
+
+    // 3. 瞬間フェイルオーバー (Fencing Token による新 Primary 昇格)
+    let new_fencing_token = cluster.failover_to_replica(0)?;
+    println!("Promoted to new primary with Fencing Token: {}", new_fencing_token.val());
 
     Ok(())
 }

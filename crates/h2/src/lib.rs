@@ -2,15 +2,21 @@
 use std::path::Path;
 use std::sync::Arc;
 
-pub use h2_mvstore::{MVStore, TransactionStatus};
+pub use h2_mvstore::{LocalMVStoreEngine, MVStore, StorageEngine, TransactionStatus};
 pub use h2_sql::{ExecutionResult, Row, SQLEngine};
-pub use h2_types::{DataType, FromSql, H2Error, H2Result, Value};
+pub use h2_types::{
+    CacheInvalidationEvent, DataType, FencingToken, FromSql, H2Error, H2Result, LogOpType,
+    LogRecord, Lsn, PageId, Value,
+};
 
 pub mod replication;
 pub use replication::{Instance, InstanceConfig, InstanceRole, SyncReplicationMode};
 
 pub mod jms;
 pub use jms::*;
+
+pub mod storage;
+pub use storage::*;
 
 #[cfg(feature = "async")]
 pub mod async_conn;
