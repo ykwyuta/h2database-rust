@@ -43,3 +43,10 @@
 6. [06. 実装ロードマップとマイルストーン (06_roadmap_and_phases.md)](./06_roadmap_and_phases.md)
    - フェーズ1（コアストレージと基本KV）からフェーズ5（高機能拡張・製品品質）までの段階的開発計画
    - テスト戦略（sqllogictest、Jepsen風クラッシュテスト、ベンチマーク）
+
+7. [07. トランザクショナル・キューテーブル設計 (TRANSACTIONAL_QUEUE_TABLE_DESIGN.md)](./TRANSACTIONAL_QUEUE_TABLE_DESIGN.md)
+   - DB 同一トランザクション下で扱えるネイティブ MQ（Transactional Outbox の完全解消）
+   - キューテーブル（Queue Table）としての SQL 透過性（`INSERT` / `SELECT` 対応、`UPDATE`/`DELETE`/追加インデックス禁止、`_offset` WHERE 句制限）
+   - JMS 2.0/3.0 準拠インターフェースと Kafka 風オフセットシーク（`seek`, `rewind`, timestamp seek）
+   - 二重保持ポリシー（保持期間 & 容量上限超過時のオンライン Head Truncation GC）
+
