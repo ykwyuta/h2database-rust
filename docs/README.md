@@ -57,4 +57,11 @@
    - 4/6 クォーラム書き込み、AZ 障害耐性、ピアツーピア・ゴシップ自己修復
    - 組み込みモード（Local MVStore）と分離モード（Distributed LogStore）のハイブリッド統合
 
+9. [09. メモリ管理機構の実装解説と他 RDBMS (PostgreSQL / SQL Server) との比較・改善提案 (09_memory_management_architecture_and_comparison.md)](./09_memory_management_architecture_and_comparison.md)
+   - 現行実装（MVStore, Executor, MVCC）のメモリモデルとアロケーション挙動の詳細分析
+   - PostgreSQL（MemoryContext, shared_buffers, work_mem）および SQL Server（SOS, Buffer Pool, Memory Grant, Columnstore）との徹底比較
+   - 現状の 5 つの重大な課題（RAM上限、全ツリー書き出し、Heap Churn、メモリ肥大化、OOMリスク）
+   - 4フェーズにわたる段階的改善ロードマップ（アリーナ・Slotted Row、Buffer Pool、外部ソート・Memory Grant、ベクトル化）
+
+
 

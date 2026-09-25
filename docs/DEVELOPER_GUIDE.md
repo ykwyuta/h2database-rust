@@ -20,6 +20,7 @@
   - [2.9 ゼロストレージ・リードレプリカ & Fencing Token 瞬間フェイルオーバー](#29-ゼロストレージリードレプリカ--fencing-token-瞬間フェイルオーバー)
   - [2.10 トランザクショナル・キューテーブル & JMS API (Native MQ) の内部仕様](#210-トランザクショナルキューテーブル--jms-api-native-mq-の内部仕様)
   - [2.11 同期レプリケーション (PostgreSQL remote_apply 相当) の内部仕様](#211-同期レプリケーション-postgresql-remote_apply-相当の内部仕様)
+  - [2.12 メモリ管理アーキテクチャ・課題と改善ロードマップ](#212-メモリ管理アーキテクチャ課題と改善ロードマップ)
 - [3. SQL 処理系 (`h2-sql`) の内部仕様](#3-sql-処理系-h2-sql-の内部仕様)
   - [3.1 クエリ実行パイプライン](#31-クエリ実行パイプライン)
   - [3.2 カタログとマップ命名規則](#32-カタログとマップ命名規則)
@@ -227,6 +228,23 @@ pub trait StorageEngine: Send + Sync {
 - **変更収集**: `MapChangeSink`（[`DefaultChangeCollector`](file:///d:/workspace/h2database-rust/crates/h2-mvstore/src/replication.rs)）がトランザクション内の全マップ変更（Put/Remove/Clear）を捕捉。
 - **同期コミット制御**: Primary の `MVStore::commit()` 時に `ReplicationListener::on_commit` がトリガーされ、Standby がローカルストレージおよびカタログに適用完了した ACK を返すまで Primary の呼び出し元スレッドを同期待機（`remote_apply`）。
 - **読み取り専用ガード**: Standby インスタンスの `SQLEngine` は `set_read_only(true)` に設定され、書き込み DDL/DML が自動的に安全拒絶されます。
+
+---
+
+## 2.12 メモリ管理アーキテクチャ・課題と改善ロードマップ
+
+本データベースのメモリ管理機構の詳細解説、PostgreSQL および Microsoft SQL Server との比較分析、現状の課題（Buffer Pool 不在、CoW によるヒープ断片化、無制限マテリアライズ等）、および 4 フェーズにわたる改善ロードマップについては、以下の専用技術仕様書を参照してください。
+
+👉 **[09. メモリ管理機構の実装解説と他 RDBMS (PostgreSQL / SQL Server) との比較・改善提案 (09_memory_management_architecture_and_comparison.md)](./09_memory_management_architecture_and_comparison.md)**
+
+### 主な比較とロードマップの要約
+1. **現状の実態**: 全データが Rust ヒープ上の `Arc<Page>` に常駐（インメモリ指向）。コミット時に全ツリーを JSON 化して追記。クエリ実行時に `Vec<Row>` に全件マテリアライズ（`work_mem` やディスクスピルなし）。
+2. **課題**: データセット上限が物理 RAM に依存、CoW 時の微小ヒープ割り当て・破棄、クエリ実行時の OOM リスク。
+3. **改善方針**:
+   - **Phase 1 (短期)**: クエリ単位のアリーナアロケータ（`bumpalo`）導入、行データのコンパクト化（Slotted Row）。
+   - **Phase 2 (中期)**: 8KB 固定長バイナリページ、Clock-sweep 方式の `BufferPoolManager`、WAL 差分コミット。
+   - **Phase 3 (堅牢化)**: `work_mem` ガード、外部マージソート、SQL Server 方式の Admission Control (Memory Grant)。
+   - **Phase 4 (将来拡張)**: Apache Arrow 互換のベクトル化実行エンジン、完全ロックフリー Bw-Tree。
 
 ---
 
