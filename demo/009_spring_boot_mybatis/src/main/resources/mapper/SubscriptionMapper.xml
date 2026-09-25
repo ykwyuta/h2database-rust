@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mybatis.mapper.SubscriptionMapper">
+
+    <resultMap id="SubscriptionResultMap" type="com.example.mybatis.model.Subscription">
+        <id property="id" column="id"/>
+        <result property="userId" column="user_id"/>
+        <result property="planName" column="plan_name"/>
+        <result property="startTime" column="start_time"/>
+        <result property="expireTime" column="expire_time"/>
+    </resultMap>
+
+    <!-- SERIAL 型テーブルの作成 -->
+    <update id="createSubscriptionTable">
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            plan_name VARCHAR(50) NOT NULL,
+            start_time TIMESTAMP NOT NULL,
+            expire_time TIMESTAMP NOT NULL
+        )
+    </update>
+
+    <!-- INTERVAL 型演算を用いた有効期限の自動計算 INSERT -->
+    <insert id="insertSubscription">
+        INSERT INTO subscriptions (user_id, plan_name, start_time, expire_time)
+        VALUES (
+            #{userId},
+            #{planName},
+            TIMESTAMP '2026-01-01 00:00:00',
+            TIMESTAMP '2026-01-01 00:00:00' + INTERVAL '30 DAYS'
+        )
+    </insert>
+
+    <!-- 全件検索 -->
+    <select id="findAllSubscriptions" resultMap="SubscriptionResultMap">
+        SELECT id, user_id, plan_name, start_time, expire_time
+        FROM subscriptions
+        ORDER BY id ASC
+    </select>
+
+</mapper>

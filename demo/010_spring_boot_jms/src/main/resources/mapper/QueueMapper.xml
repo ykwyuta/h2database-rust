@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.jms.mapper.QueueMapper">
+
+    <resultMap id="QueueMessageResultMap" type="com.example.jms.model.QueueMessage">
+        <result property="offset" column="_offset"/>
+        <result property="timestamp" column="_timestamp"/>
+        <result property="msgId" column="_msg_id"/>
+        <result property="payload" column="payload"/>
+    </resultMap>
+
+    <update id="dropOrderEventsQueue">
+        DROP TABLE IF EXISTS order_events_queue
+    </update>
+
+    <!-- H2 Database in Rust ネイティブ・トランザクショナル・キューテーブルの作成 -->
+    <update id="createOrderEventsQueue">
+        CREATE QUEUE TABLE IF NOT EXISTS order_events_queue (
+            payload VARCHAR NOT NULL
+        ) WITH (RETENTION_HOURS = 24, MAX_BYTES = 10485760)
+    </update>
+
+    <!-- メッセージのエンキュー (INSERT によるメッセージ投入) -->
+    <insert id="enqueueMessage">
+        INSERT INTO order_events_queue (payload)
+        VALUES (#{payload})
+    </insert>
+
+    <!-- Kafka 風のオフセット指定 SELECT (内部オフセット _offset 走査) -->
+    <select id="fetchMessagesFromOffset" resultMap="QueueMessageResultMap">
+        SELECT _offset, _timestamp, _msg_id, payload
+        FROM order_events_queue
+        WHERE _offset &gt;= #{fromOffset}
+        ORDER BY _offset ASC
+    </select>
+
+</mapper>

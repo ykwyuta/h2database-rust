@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.jms.mapper.OrderMapper">
+
+    <resultMap id="OrderResultMap" type="com.example.jms.model.Order">
+        <id property="id" column="id"/>
+        <result property="customerName" column="customer_name"/>
+        <result property="amount" column="amount"/>
+        <result property="status" column="status"/>
+    </resultMap>
+
+    <update id="dropOrderTable">
+        DROP TABLE IF EXISTS orders
+    </update>
+
+    <update id="createOrderTable">
+        CREATE TABLE IF NOT EXISTS orders (
+            id BIGINT PRIMARY KEY,
+            customerName VARCHAR(50) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            status VARCHAR(20) NOT NULL
+        )
+    </update>
+
+    <insert id="insertOrder" parameterType="com.example.jms.model.Order">
+        INSERT INTO orders (id, customerName, amount, status)
+        VALUES (#{id}, #{customerName}, #{amount}, #{status})
+    </insert>
+
+    <select id="findById" resultMap="OrderResultMap">
+        SELECT id, customerName AS customer_name, amount, status
+        FROM orders
+        WHERE id = #{id}
+    </select>
+
+    <select id="findAllOrders" resultMap="OrderResultMap">
+        SELECT id, customerName AS customer_name, amount, status
+        FROM orders
+        ORDER BY id ASC
+    </select>
+
+</mapper>

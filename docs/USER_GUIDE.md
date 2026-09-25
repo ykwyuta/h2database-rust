@@ -51,6 +51,7 @@ SQLite のような手軽な組み込み利用から、PostgreSQL 互換サー�
   - [1. パラメータ付きクエリと SQL インジェクション対策](#1-パラメータ付きクエリと-sql-インジェクション対策)
   - [2. 型安全なクエリ結果の走査 (`FromSql` & `Row::get_as`)](#2-型安全なクエリ結果の走査-fromsql--rowget_as)
   - [3. Web フレームワーク連携 (Axum / Actix-web での利用)](#3-web-フレームワーク連携-axum--actix-web-での利用)
+  - [4. Java / JVM エコシステム連携 (Spring Boot 4.1 + MyBatis & Spring JMS スタンダード)](#4-java--jvm-エコシステム連携-spring-boot-41--mybatis--spring-jms-スタンダード)
 - [Part VI. サーバー運用とメンテナンス (Server Administration & Maintenance)](#part-vi-サーバー運用とメンテナンス-server-administration--maintenance)
   - [1. 組み込みと外部接続のハイブリッド運用](#1-組み込みと外部接続のハイブリッド運用)
   - [2. DBeaver / DataGrip / psql からの接続](#2-dbeaver--datagrip--psql-からの接続)
@@ -1201,6 +1202,82 @@ pub fn create_app(db: AsyncConnection) -> Router {
 }
 ```
 
+## 4. Java / JVM エコシステム連携 (Spring Boot 4.1 + MyBatis & Spring JMS スタンダード)
+
+H2 Database in Rust は PostgreSQL ワイヤプロトコル（PGWire）を完全に実装しているため、Java 21 および **Spring Boot 4.1（Spring Framework 6.2+）**、**MyBatis（XML マッパー）**、**Spring JMS（`JmsTemplate`, `@JmsListener`）** とネイティブに接続・連携できます。
+
+### 4.1 接続設定 (`application.yml`)
+標準の PostgreSQL JDBC ドライバ（HikariCP 接続プール）を使用します。
+
+```yaml
+spring:
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://localhost:5432/mydb?preferQueryMode=simple
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+```
+
+### 4.2 MyBatis (XML マッパー) による高度な SQL の利用
+シーケンス（SEQUENCE）、SERIAL / INTERVAL 型、サーバサイドカーソル、正規表現、数学関数などを XML マッパーから自然に記述・実行できます。
+
+```xml
+<!-- SEQUENCE による採番と INSERT -->
+<insert id="insertUser">
+    INSERT INTO users (id, name, email, created_at)
+    VALUES (NEXTVAL('user_id_seq'), #{name}, #{email}, NOW())
+</insert>
+
+<!-- INTERVAL による期限切れ検索 -->
+<select id="findExpiring" resultType="com.example.Subscription">
+    SELECT id, plan, expires_at
+    FROM subscriptions
+    WHERE expires_at &lt; NOW() + INTERVAL '7 days'
+</select>
+```
+
+### 4.3 Primary / Standby レプリケーションの動的ルーティング
+Spring の `AbstractRoutingDataSource` と AOP を組み合わせることで、`@Transactional(readOnly = true)` を付与したサービスクエリを自動的に Standby ノード（Port: 5433）へ、更新クエリを Primary ノード（Port: 5432）へ自動ルーティングできます。
+
+```java
+@Transactional(readOnly = true)
+public User findUser(Long id) {
+    // 自動的に Standby (5433) へルーティング
+    return userMapper.findById(id);
+}
+```
+
+### 4.4 トランザクショナルMQ と Spring JMS (`JmsTemplate` & `@JmsListener`)
+H2 Database Rust の `CREATE QUEUE TABLE` は、Spring の同一 DB トランザクション（`@Transactional`）内でビジネスデータとキューメッセージを**完全にアトミックにコミット／ロールバック**します。
+これにより、従来の外部 MQ（RabbitMQ や Kafka 等）で必須だった**「Transactional Outbox パターン」や 2 相コミット（2PC/XA）が完全に不要**になります。
+
+```java
+@Transactional
+public void placeOrder(Order order) {
+    // 1. MyBatis で注文レコードを保存
+    orderMapper.insertOrder(order);
+
+    // 2. Spring 標準の JmsTemplate でイベントをキューテーブルへエンキュー
+    // (同一 DB トランザクションのコネクションを利用して自動 INSERT)
+    jmsTemplate.convertAndSend("order_events_queue", jsonPayload);
+
+    // ※ ここで例外が発生した場合、注文とキューの双方が完全かつアトミックにロールバックされます！
+}
+
+// 3. Spring 標準の @JmsListener での非同期受信
+@JmsListener(destination = "order_events_queue")
+public void onOrderEvent(Message message) {
+    // バックグラウンドで自動ポーリング・ディスパッチ
+}
+```
+
+### 4.5 実践デモプロジェクト
+- **[demo/009_spring_boot_mybatis](../demo/009_spring_boot_mybatis/README.md)**: 全SQL機能 ＋ Primary/Standby 同期レプリケーション動的ルーティング
+- **[demo/010_spring_boot_jms](../demo/010_spring_boot_jms/README.md)**: Spring JMS スタンダード ＋ MyBatis トランザクショナル・キューテーブル（Outbox レス・アトミック実証 & Kafka 風オフセットリプレイ）
+
 ---
 
 # Part VI. サーバー運用とメンテナンス (Server Administration & Maintenance)
@@ -1263,6 +1340,23 @@ h2> SELECT * FROM users;
 h2> .exit
 Bye!
 ```
+
+### スクリプト実行・非対話型オプション:
+```bash
+# スクリプトファイルを直接実行して終了
+cargo run -p h2-cli -- -f script.sql
+
+# ワンライナー SQL コマンドの直接実行
+cargo run -p h2-cli -- -c "SELECT 1 + 1; SHOW TABLES;"
+
+# 対話型シェル内からのスクリプト読み込み
+h2> .read script.sql
+```
+
+### 全機能を体験できる専用 CLI デモ集:
+- **[demo/011 専用CLI: 高度な SQL & クエリ演算](../demo/011_cli_advanced_sql/README.md)**: Instant/Online DDL, UPSERT, 再帰CTE, 6種のJOIN, 集合演算, ウィンドウ関数, 日本語全文検索, 外部キーCASCADE
+- **[demo/012 専用CLI: システム・運用・カーソル](../demo/012_cli_system_and_maintenance/README.md)**: シーケンス生成器 (SEQUENCE), SERIAL, INTERVAL日時計算, サーバサイドカーソル走査, 高度数学・正規表現関数, CSVデータ移行, 物理バックアップ・リストア, VACUUM
+- **[demo/013 専用CLI: トランザクショナルMQ](../demo/013_cli_transactional_mq/README.md)**: トランザクショナル・キューテーブル, アトミックコミット＆ロールバック (Outbox不要の実証), Kafka風オフセットシーク再生, 安全ガード
 
 ## 4. ストレージのオンライン・コンパクション (Concurrent Vacuum によるファイル縮小)
 

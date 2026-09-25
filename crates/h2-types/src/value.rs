@@ -182,6 +182,7 @@ impl Value {
 
     pub fn to_decimal(&self) -> Option<Decimal> {
         use rust_decimal::prelude::FromPrimitive;
+        use std::str::FromStr;
         match self {
             Value::Decimal(d) => Some(*d),
             Value::TinyInt(n) => Decimal::from_i8(*n),
@@ -190,6 +191,7 @@ impl Value {
             Value::BigInt(n) => Decimal::from_i64(*n),
             Value::Float(f) => Decimal::from_f32(*f),
             Value::Double(d) => Decimal::from_f64(*d),
+            Value::String(s) => Decimal::from_str(s.trim()).ok(),
             _ => None,
         }
     }

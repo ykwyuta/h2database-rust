@@ -25,11 +25,12 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
     match sql_type {
         SqlDataType::Boolean => Ok(DataType::Boolean),
         SqlDataType::TinyInt(_) => Ok(DataType::TinyInt),
-        SqlDataType::SmallInt(_) => Ok(DataType::SmallInt),
-        SqlDataType::Int(_) | SqlDataType::Integer(_) => Ok(DataType::Integer),
-        SqlDataType::BigInt(_) => Ok(DataType::BigInt),
-        SqlDataType::Float(_) | SqlDataType::Real => Ok(DataType::Float),
-        SqlDataType::Double | SqlDataType::DoublePrecision => Ok(DataType::Double),
+        SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::SmallInt),
+        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(DataType::Integer),
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) | SqlDataType::Int64 => Ok(DataType::BigInt),
+        SqlDataType::Float(_) | SqlDataType::Real | SqlDataType::Float4 => Ok(DataType::Float),
+        SqlDataType::Double | SqlDataType::DoublePrecision | SqlDataType::Float8 => Ok(DataType::Double),
+        SqlDataType::Bytea => Ok(DataType::Binary(None)),
         SqlDataType::Decimal(exact_info) | SqlDataType::Numeric(exact_info) => {
             match exact_info {
                 sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {

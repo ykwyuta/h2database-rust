@@ -262,6 +262,9 @@ impl Transaction {
     /// コミット
     pub fn commit(&self) -> H2Result<()> {
         let mut status = self.status.write();
+        if *status == TransactionStatus::Committed {
+            return Ok(());
+        }
         if *status != TransactionStatus::Open {
             return Err(H2Error::Transaction("Transaction is already closed".to_string()));
         }

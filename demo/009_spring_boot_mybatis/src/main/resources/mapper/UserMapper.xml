@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mybatis.mapper.UserMapper">
+
+    <resultMap id="UserResultMap" type="com.example.mybatis.model.User">
+        <id property="id" column="id"/>
+        <result property="username" column="username"/>
+        <result property="email" column="email"/>
+        <result property="status" column="status"/>
+        <result property="createdAt" column="created_at"/>
+    </resultMap>
+
+    <!-- 1. SEQUENCE の作成 (PostgreSQL / H2 互換構文) -->
+    <update id="createSequence">
+        CREATE SEQUENCE IF NOT EXISTS user_id_seq INCREMENT BY 1 START WITH 1000
+    </update>
+
+    <!-- 2. users テーブル作成 (DDL) -->
+    <update id="createUserTable">
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGINT PRIMARY KEY,
+            username VARCHAR(50) NOT NULL,
+            email VARCHAR(100) NOT NULL,
+            status VARCHAR(20) NOT NULL,
+            created_at TIMESTAMP
+        )
+    </update>
+
+    <!-- 3. シーケンスから次の採番 ID を取得 -->
+    <select id="getNextUserId" resultType="java.lang.Long">
+        SELECT NEXTVAL('user_id_seq')
+    </select>
+
+    <!-- 4. INSERT (CRUD) -->
+    <insert id="insertUser" parameterType="com.example.mybatis.model.User">
+        INSERT INTO users (id, username, email, status, created_at)
+        VALUES (#{id}, #{username}, #{email}, #{status}, #{createdAt})
+    </insert>
+
+    <!-- 5. ID での単一検索 -->
+    <select id="findById" resultMap="UserResultMap">
+        SELECT id, username, email, status, created_at
+        FROM users
+        WHERE id = #{id}
+    </select>
+
+    <!-- 6. 全件検索 (ORDER BY) -->
+    <select id="findAll" resultMap="UserResultMap">
+        SELECT id, username, email, status, created_at
+        FROM users
+        ORDER BY id ASC
+    </select>
+
+    <!-- 7. ステータス更新 (UPDATE) -->
+    <update id="updateStatus">
+        UPDATE users
+        SET status = #{status}
+        WHERE id = #{id}
+    </update>
+
+    <!-- 8. 削除 (DELETE) -->
+    <delete id="deleteById">
+        DELETE FROM users
+        WHERE id = #{id}
+    </delete>
+
+    <!-- 9. サーバサイドカーソル風ストリーミングフェッチ -->
+    <select id="fetchAllWithCursor" resultMap="UserResultMap" fetchSize="100" resultSetType="FORWARD_ONLY">
+        SELECT id, username, email, status, created_at
+        FROM users
+        ORDER BY id ASC
+    </select>
+
+</mapper>

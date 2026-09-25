@@ -497,7 +497,12 @@ impl SQLEngine {
                     max_bytes,
                 );
 
-                self.catalog.create_table(queue_def)?;
+                if let Err(e) = self.catalog.create_table(queue_def) {
+                    if create_table.if_not_exists && e.to_string().contains("already exists") {
+                        return Ok(ExecutionResult::Ddl);
+                    }
+                    return Err(e);
+                }
 
                 // 主キー用ユニークインデックス作成 (_offset)
                 let pk_index_name = format!("pk_{}", tbl_name.to_lowercase());
@@ -1127,7 +1132,12 @@ fn apply_join(
                     }
                 }
 
-                self.catalog.create_table(table_def)?;
+                if let Err(e) = self.catalog.create_table(table_def) {
+                    if create_table.if_not_exists && e.to_string().contains("already exists") {
+                        return Ok(ExecutionResult::Ddl);
+                    }
+                    return Err(e);
+                }
 
                 // 主キー用ユニークインデックス作成
                 if !pk.is_empty() {
@@ -2752,6 +2762,12 @@ fn apply_join(
                 }
                 Ok(ExecutionResult::Ddl)
             }
+            Statement::StartTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::SetVariable { .. }
+            | Statement::ShowVariable { .. }
+            | Statement::ShowVariables { .. } => Ok(ExecutionResult::Ddl),
             _ => Err(H2Error::Execution(format!("Unsupported statement: {:?}", stmt))),
         }
     }

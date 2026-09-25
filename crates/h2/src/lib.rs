@@ -378,6 +378,57 @@ impl Connection {
         }
     }
 
+    /// 任意の SQL 文を実行し、結果（Ddl, Dml, または Query { columns, rows }）を返す
+    pub fn execute_raw(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let _guard = self.setup_timeout_guard();
+        let cmd = parse_tx_command(sql);
+        match cmd {
+            TxCommand::Begin => {
+                let mut guard = self.current_tx.lock();
+                if guard.is_some() {
+                    return Err(H2Error::Transaction("Transaction is already active".to_string()));
+                }
+                *guard = Some(self.engine.tx_store().begin());
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
+            TxCommand::Commit => {
+                let mut guard = self.current_tx.lock();
+                let tx = guard.take().ok_or_else(|| {
+                    H2Error::Transaction("No active transaction to commit".to_string())
+                })?;
+                tx.commit()?;
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
+            TxCommand::Rollback => {
+                let mut guard = self.current_tx.lock();
+                let tx = guard.take().ok_or_else(|| {
+                    H2Error::Transaction("No active transaction to rollback".to_string())
+                })?;
+                tx.rollback()?;
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
+            TxCommand::SetStatementTimeout(ms) => {
+                self.set_query_timeout_ms(ms);
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
+            TxCommand::Vacuum => {
+                if self.engine.is_read_only() {
+                    return Err(H2Error::ReadOnly("Cannot execute VACUUM on a read-only instance".to_string()));
+                }
+                self.vacuum()?;
+                Ok(ExecutionResult::Dml { affected_rows: 0 })
+            }
+            TxCommand::Other => {
+                let guard = self.current_tx.lock();
+                if let Some(ref tx) = *guard {
+                    self.engine.execute_with_tx(tx, sql)
+                } else {
+                    self.engine.execute(sql)
+                }
+            }
+        }
+    }
+
     /// タイムアウトを指定してクエリ（SELECT）文を実行
     pub fn query_timeout(&self, sql: &str, timeout: Duration) -> H2Result<Vec<Row>> {
         let _guard = h2_types::set_query_timeout(Some(timeout));

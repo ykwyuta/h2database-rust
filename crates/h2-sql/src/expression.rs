@@ -444,8 +444,7 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                     _ => Err(H2Error::TypeError("ABS requires numeric argument".to_string())),
                 }
             } else if func_name == "NOW" || func_name == "CURRENT_TIMESTAMP" {
-                let now = chrono::Utc::now().to_rfc3339();
-                Ok(Value::String(now))
+                Ok(Value::Timestamp(chrono::Utc::now()))
             } else if func_name == "CURRENT_DATE" {
                 Ok(Value::Date(chrono::Utc::now().date_naive()))
             } else if func_name == "CURRENT_TIME" {
@@ -1224,6 +1223,37 @@ fn evaluate_arithmetic_op(left: &Value, op: &BinaryOperator, right: &Value) -> H
         (Value::Timestamp(ts), Value::Interval(iv)) if matches!(op, BinaryOperator::Minus) => {
             let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
             Ok(Value::Timestamp(add_interval_to_datetime(*ts, &neg_iv)))
+        }
+        (Value::String(s), Value::Interval(iv)) if matches!(op, BinaryOperator::Plus | BinaryOperator::Minus) => {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                let utc_dt = dt.with_timezone(&chrono::Utc);
+                let res = if matches!(op, BinaryOperator::Plus) {
+                    add_interval_to_datetime(utc_dt, iv)
+                } else {
+                    let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
+                    add_interval_to_datetime(utc_dt, &neg_iv)
+                };
+                Ok(Value::Timestamp(res))
+            } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+                let utc_dt = naive.and_utc();
+                let res = if matches!(op, BinaryOperator::Plus) {
+                    add_interval_to_datetime(utc_dt, iv)
+                } else {
+                    let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
+                    add_interval_to_datetime(utc_dt, &neg_iv)
+                };
+                Ok(Value::Timestamp(res))
+            } else if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                let res = if matches!(op, BinaryOperator::Plus) {
+                    add_interval_to_date(d, iv)
+                } else {
+                    let neg_iv = IntervalValue::new(-iv.months, -iv.days, -iv.microseconds);
+                    add_interval_to_date(d, &neg_iv)
+                };
+                Ok(Value::Date(res))
+            } else {
+                Err(H2Error::TypeError(format!("Cannot parse '{}' as date/time for INTERVAL operation", s)))
+            }
         }
         (Value::Interval(a), Value::Interval(b)) => match op {
             BinaryOperator::Plus => Ok(Value::Interval(IntervalValue::new(a.months + b.months, a.days + b.days, a.microseconds + b.microseconds))),

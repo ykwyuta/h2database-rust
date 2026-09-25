@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: demo-spring-boot-jms
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/jms_demo_db?preferQueryMode=simple
+    username: postgres
+    password: ""
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: HikariPool-JMS-Demo
+      maximum-pool-size: 10
+      connection-test-query: SELECT 1
+
+  jms:
+    listener:
+      auto-startup: true
+      acknowledge-mode: auto
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.example.jms.model
+  configuration:
+    map-underscore-to-camel-case: true
+    jdbc-type-for-null: "NULL"
+
+logging:
+  level:
+    root: INFO
+    com.example.jms: DEBUG
+    org.springframework.jms: INFO

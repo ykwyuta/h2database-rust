@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.example.mybatis.mapper.AnalyticsMapper">
+
+    <resultMap id="AnalyticsResultMap" type="com.example.mybatis.model.AnalyticsMetric">
+        <result property="metricName" column="metric_name"/>
+        <result property="rawVal" column="raw_val"/>
+        <result property="lnVal" column="ln_val"/>
+        <result property="expVal" column="exp_val"/>
+        <result property="truncVal" column="trunc_val"/>
+        <result property="initcapStr" column="initcap_str"/>
+        <result property="replacedStr" column="replaced_str"/>
+        <result property="regexMatched" column="regex_matched"/>
+    </resultMap>
+
+    <update id="createAnalyticsTable">
+        CREATE TABLE IF NOT EXISTS metrics (
+            metric_name VARCHAR(50) PRIMARY KEY,
+            raw_val DOUBLE NOT NULL
+        )
+    </update>
+
+    <insert id="insertMetric">
+        INSERT INTO metrics (metric_name, raw_val)
+        VALUES (#{name}, #{val})
+    </insert>
+
+    <!-- 高度な数学関数 (LN, EXP, TRUNC) と文字列関数 (INITCAP, REGEXP_REPLACE) の計算実演 -->
+    <select id="calculateAdvancedMetrics" resultMap="AnalyticsResultMap">
+        SELECT
+            metric_name,
+            raw_val,
+            LN(raw_val) AS ln_val,
+            EXP(raw_val) AS exp_val,
+            TRUNC(raw_val, 2) AS trunc_val,
+            INITCAP(metric_name) AS initcap_str,
+            REGEXP_REPLACE(metric_name, 'cpu', 'processor') AS replaced_str,
+            CASE WHEN metric_name ~ '^cpu_[0-9]+' THEN TRUE ELSE FALSE END AS regex_matched
+        FROM metrics
+        ORDER BY metric_name ASC
+    </select>
+
+    <!-- 正規表現演算子 (~) による高度なパターンフィルタリング -->
+    <select id="searchByRegex" resultMap="AnalyticsResultMap">
+        SELECT
+            metric_name,
+            raw_val,
+            LN(raw_val) AS ln_val,
+            EXP(raw_val) AS exp_val,
+            TRUNC(raw_val, 2) AS trunc_val,
+            INITCAP(metric_name) AS initcap_str,
+            metric_name AS replaced_str,
+            TRUE AS regex_matched
+        FROM metrics
+        WHERE metric_name ~ #{pattern}
+        ORDER BY metric_name ASC
+    </select>
+
+</mapper>

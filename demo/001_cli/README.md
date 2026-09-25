@@ -113,14 +113,28 @@ Query executed in 1.1ms. (DDL)
 
 ---
 
-## 🛠️ スクリプトの一括流し込み実行
+## 🛠️ スクリプトの一括実行
 
-Bash や PowerShell のパイプ機能を使って、SQL スクリプトを一括実行することも可能です。
+`h2-cli` はスクリプトファイルの直接実行に対応しています。
 
 ```bash
-# PowerShell
-Get-Content sample_queries.sql | cargo run -p h2-cli -- demo.h2
+# -f / --file オプションによるファイル直接実行
+cargo run -p h2-cli -- -f sample_queries.sql
 
-# Linux / macOS Bash
-cargo run -p h2-cli -- demo.h2 < sample_queries.sql
+# 対話型シェル内からスクリプト読み込み
+cargo run -p h2-cli
+h2> .read sample_queries.sql
 ```
+
+---
+
+## 📚 全機能を網羅した専用CLIデモ集
+
+H2 Database in Rust の全高度機能を専用 CLI から直接検証できるデモスイートが用意されています：
+
+- [**demo/011 専用CLI デモ 1: 高度な SQL & クエリ演算**](../011_cli_advanced_sql/README.md)
+  - Instant/Online DDL, UPSERT (ON CONFLICT), INSERT/UPDATE RETURNING, 再帰CTE, 6種のJOIN, 集合演算, ウィンドウ関数, 日本語全文検索, 外部キーCASCADE
+- [**demo/012 専用CLI デモ 2: システム・拡張型・運用・カーソル**](../012_cli_system_and_maintenance/README.md)
+  - シーケンス生成器 (SEQUENCE), SERIAL, INTERVAL日時計算, サーバサイドカーソル (FETCH NEXT/PRIOR/ABSOLUTE), 高度数学・正規表現関数, CSVデータ移行 (COPY TO/FROM), 物理バックアップ・リストア, VACUUM
+- [**demo/013 専用CLI デモ 3: トランザクショナル・キューテーブル**](../013_cli_transactional_mq/README.md)
+  - CREATE QUEUE TABLE, アトミックコミット＆ロールバック (Transactional Outbox不要の実証), Kafka風オフセットシーク再生, 安全ガード

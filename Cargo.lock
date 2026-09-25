@@ -193,6 +193,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "demo-spring-boot-server"
+version = "0.1.0"
+dependencies = [
+ "h2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -329,6 +339,7 @@ dependencies = [
  "h2-mvstore",
  "h2-sql",
  "h2-types",
+ "parking_lot",
  "thiserror",
  "tokio",
  "tracing",

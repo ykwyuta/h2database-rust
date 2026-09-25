@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: demo-spring-boot-mybatis
+
+  datasource:
+    primary:
+      jdbc-url: jdbc:postgresql://localhost:5432/primary_db?preferQueryMode=simple
+      username: postgres
+      password: ""
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        pool-name: HikariPool-Primary-RW
+        maximum-pool-size: 5
+        connection-test-query: SELECT 1
+    standby:
+      jdbc-url: jdbc:postgresql://localhost:5433/standby_db?preferQueryMode=simple
+      username: postgres
+      password: ""
+      driver-class-name: org.postgresql.Driver
+      hikari:
+        pool-name: HikariPool-Standby-RO
+        maximum-pool-size: 5
+        connection-test-query: SELECT 1
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.example.mybatis.model
+  configuration:
+    map-underscore-to-camel-case: true
+    jdbc-type-for-null: "NULL"
+
+logging:
+  level:
+    root: INFO
+    com.example.mybatis: DEBUG
+    org.springframework.jdbc.datasource: INFO

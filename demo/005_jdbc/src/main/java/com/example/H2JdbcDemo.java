@@ -13,7 +13,7 @@ import java.sql.Statement;
  */
 public class H2JdbcDemo {
 
-    private static final String JDBC_URL = "jdbc:postgresql://localhost:5432/mydb";
+    private static final String JDBC_URL = "jdbc:postgresql://localhost:5432/mydb?preferQueryMode=simple";
     private static final String DB_USER = "postgres";
     private static final String DB_PASS = ""; // パスワード不要
 
