@@ -1,0 +1,25 @@
+[package]
+name = "h2-mcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2-types = { path = "../h2-types" }
+h2-mvstore = { path = "../h2-mvstore" }
+h2-sql = { path = "../h2-sql" }
+h2 = { path = "../h2" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+tokio = { workspace = true, features = ["sync", "time", "macros", "net", "rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tower = { version = "0.5", features = ["timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = { workspace = true }
+futures-util = "0.3"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tempfile = "3.14"

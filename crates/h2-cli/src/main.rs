@@ -4,7 +4,8 @@ use std::io::{self, BufRead, Write};
 use anyhow::{Context, Result};
 use h2::{Connection, ExecutionResult, Value};
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     let mut db_path = ":memory:".to_string();
@@ -12,6 +13,10 @@ fn main() -> Result<()> {
     let mut one_liner_command: Option<String> = None;
     let mut user_arg: Option<String> = None;
     let mut password_arg: Option<String> = None;
+
+    let mut run_mcp = false;
+    let mut mcp_port = 8080u16;
+    let mut allow_write = false;
 
     let mut init_pgbench: Option<usize> = None;
 
@@ -58,6 +63,20 @@ fn main() -> Result<()> {
                     i += 1;
                 }
             }
+            "--mcp" => {
+                run_mcp = true;
+            }
+            "--port" => {
+                if i + 1 < args.len() {
+                    if let Ok(p) = args[i + 1].parse::<u16>() {
+                        mcp_port = p;
+                        i += 1;
+                    }
+                }
+            }
+            "--allow-write" => {
+                allow_write = true;
+            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(());
@@ -81,6 +100,33 @@ fn main() -> Result<()> {
     if let Some(ref u) = user_arg {
         conn.authenticate(u, password_arg.as_deref(), "127.0.0.1")
             .with_context(|| format!("Authentication failed for user '{}'", u))?;
+    }
+
+    // 0. MCP サーバーの起動 (--mcp [--port 8080] [--allow-write])
+    if run_mcp {
+        let mcp_addr: std::net::SocketAddr = format!("127.0.0.1:{}", mcp_port).parse()?;
+        let safety = if allow_write {
+            h2_mcp::McpSafetyConfig::new_permissive()
+        } else {
+            h2_mcp::McpSafetyConfig::default()
+        };
+
+        println!("================================================================================");
+        println!("  🤖 H2 Database Rust - Stateless Streamable-HTTP MCP Server");
+        println!("================================================================================");
+        println!("  MCP Endpoint:    http://{mcp_addr}/mcp");
+        println!("  Health Check:    http://{mcp_addr}/health");
+        println!("  Database:        {db_path}");
+        println!("  Write Mode:      {}", if allow_write { "ENABLED (query_write active)" } else { "READ-ONLY (safe mode)" });
+        println!("--------------------------------------------------------------------------------");
+        println!("  Configure Claude Desktop, Cursor, or AI Agents with this endpoint.");
+        println!("  Press Ctrl+C to terminate the server.");
+
+        let handle = h2_mcp::McpServer::bind(mcp_addr, std::sync::Arc::new(conn), safety).await?;
+        tokio::signal::ctrl_c().await?;
+        println!("\n[INFO] MCP server stopped. Goodbye!");
+        handle.join_handle.abort();
+        return Ok(());
     }
 
     // 0. pgbench テーブル初期化 (-i / --init-pgbench [scale])
@@ -191,6 +237,9 @@ fn print_help() {
     println!("  -f, --file <PATH>     Execute SQL statements from a file and exit");
     println!("  -c, --command <SQL>   Execute single or multiple SQL statements and exit");
     println!("  --db <PATH>           Path to database file (default: :memory:)");
+    println!("  --mcp                 Start Stateless Streamable-HTTP MCP server");
+    println!("  --port <PORT>         MCP server listen port (default: 8080)");
+    println!("  --allow-write         Allow modifying DDL/DML queries via MCP");
     println!("  -h, --help            Show this help message");
     println!();
     println!("Interactive Dot Commands:");

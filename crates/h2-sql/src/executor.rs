@@ -3683,7 +3683,7 @@ fn apply_join(
             Statement::ShowColumns { show_options, .. } => {
                 let table_name = if let Some(ref in_opt) = show_options.show_in {
                     if let Some(ref parent) = in_opt.parent_name {
-                        parent.to_string()
+                        parent.to_string().trim_matches('"').to_string()
                     } else {
                         return Err(H2Error::Execution("Expected table name in SHOW COLUMNS FROM <table>".to_string()));
                     }

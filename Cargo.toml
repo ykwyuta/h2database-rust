@@ -8,6 +8,7 @@ members = [
     "crates/h2",
     "crates/h2-graph",
     "crates/h2-bolt",
+    "crates/h2-mcp",
     "demo/002_psql",
     "demo/003_embedded_sync",
     "demo/004_embedded_async",

@@ -7,4 +7,6 @@ license.workspace = true
 
 [dependencies]
 h2 = { path = "../h2" }
+h2-mcp = { path = "../h2-mcp" }
+tokio = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
