@@ -1,0 +1,20 @@
+[package]
+name = "h2-bolt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+h2-types = { path = "../h2-types" }
+h2-mvstore = { path = "../h2-mvstore" }
+h2-graph = { path = "../h2-graph" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.14"

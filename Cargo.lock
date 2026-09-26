@@ -631,11 +631,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "h2-bolt"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "h2-graph",
+ "h2-mvstore",
+ "h2-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "h2-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "h2",
+]
+
+[[package]]
+name = "h2-graph"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "h2-mvstore",
+ "h2-types",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
