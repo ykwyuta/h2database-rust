@@ -14,6 +14,7 @@ pub mod vectorized;
 pub use auth::{AuthManager, Privilege, UserInfo};
 pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats, VirtualGraphKind, parse_virtual_graph_table};
 pub use executor::{ExecutionResult, SQLEngine};
+pub use parser::{convert_data_type, parse_sql, parse_sql_mode};
 pub use procedural::ProceduralEngine;
 pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
 pub use memory::{ExternalSorter, MemoryConfig, MemoryGrant, MemoryGrantCoordinator, MemoryTracker};

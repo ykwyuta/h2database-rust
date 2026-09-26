@@ -22,6 +22,10 @@ use crate::expression::{
 use crate::parser::{convert_data_type, extract_create_table, parse_sql};
 use crate::row::Row;
 
+pub(crate) fn normalize_object_name(name: &sqlparser::ast::ObjectName) -> String {
+    name.0.iter().map(|ident| ident.value.clone()).collect::<Vec<_>>().join(".")
+}
+
 pub(crate) fn encode_memcomparable_value(val: &Value, buf: &mut Vec<u8>) {
     match val {
         Value::Null => {
@@ -530,6 +534,7 @@ pub struct SQLEngine {
     plan_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<Statement>>>>,
     query_stats: Arc<crate::query_stats::QueryStats>,
     procedural_engine: Arc<crate::procedural::ProceduralEngine>,
+    dialect_mode: Arc<parking_lot::RwLock<h2_types::SqlDialectMode>>,
 }
 
 impl SQLEngine {
@@ -544,6 +549,7 @@ impl SQLEngine {
         let execution_mode = Arc::new(parking_lot::RwLock::new("auto".to_string()));
         let plan_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let procedural_engine = Arc::new(crate::procedural::ProceduralEngine::new());
+        let dialect_mode = Arc::new(parking_lot::RwLock::new(h2_types::SqlDialectMode::Regular));
         Ok(Self {
             store,
             tx_store,
@@ -557,7 +563,17 @@ impl SQLEngine {
             plan_cache,
             query_stats: Arc::new(crate::query_stats::QueryStats::default()),
             procedural_engine,
+            dialect_mode,
         })
+    }
+
+    pub fn dialect_mode(&self) -> h2_types::SqlDialectMode {
+        *self.dialect_mode.read()
+    }
+
+    pub fn set_dialect_mode(&self, mode: h2_types::SqlDialectMode) {
+        *self.dialect_mode.write() = mode;
+        self.plan_cache.write().clear();
     }
 
     pub fn procedural_engine(&self) -> &Arc<crate::procedural::ProceduralEngine> {
@@ -871,23 +887,42 @@ impl SQLEngine {
 
 
 
+        if trimmed_upper == "SHOW MODE" {
+            let mode = self.dialect_mode();
+            return Ok(ExecutionResult::Query {
+                columns: vec!["MODE".to_string()],
+                rows: vec![crate::row::Row::new(vec![Value::String(mode.as_str().to_string())])],
+            });
+        }
+        if trimmed_upper.starts_with("SET MODE ") {
+            let mode_str = trimmed["SET MODE ".len()..].trim();
+            if let Some(mode) = h2_types::SqlDialectMode::parse_str(mode_str) {
+                self.set_dialect_mode(mode);
+                return Ok(ExecutionResult::Ddl);
+            } else {
+                return Err(H2Error::Execution(format!("Unsupported SQL dialect mode: '{}'", mode_str)));
+            }
+        }
+
         let mut sql_to_parse = trimmed.to_string();
         if trimmed_upper.starts_with("FETCH RELATIVE -") {
             let num_part = trimmed["FETCH RELATIVE -".len()..].trim();
             sql_to_parse = format!("FETCH BACKWARD {}", num_part);
         }
 
+        let mode = self.dialect_mode();
+        let cache_key = format!("{}:{}", mode.as_str(), sql_to_parse);
         let statements = {
-            let cached = self.plan_cache.read().get(&sql_to_parse).cloned();
+            let cached = self.plan_cache.read().get(&cache_key).cloned();
             if let Some(stmts) = cached {
                 stmts
             } else {
-                let parsed = parse_sql(&sql_to_parse)?;
+                let parsed = crate::parser::parse_sql_mode(&sql_to_parse, mode)?;
                 let mut cache = self.plan_cache.write();
                 if cache.len() >= 1024 {
                     cache.clear();
                 }
-                cache.insert(sql_to_parse.clone(), parsed.clone());
+                cache.insert(cache_key, parsed.clone());
                 parsed
             }
         };
@@ -1930,7 +1965,7 @@ impl SQLEngine {
                 if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
                     return Ok(res);
                 }
-                let table_name = name.to_string();
+                let table_name = normalize_object_name(name);
                 let table_alias = alias.as_ref().map(|a| a.name.value.clone());
 
                 if let Some(res) = self.resolve_virtual_graph_table(tx, &table_name, table_alias.clone())? {
@@ -1950,6 +1985,17 @@ impl SQLEngine {
                         || table_name.eq_ignore_ascii_case("pg_catalog.pg_proc");
                     if is_pg_proc {
                         return Ok(self.resolve_pg_proc_table(&table_name, table_alias));
+                    }
+
+                    if table_name.eq_ignore_ascii_case("dual") {
+                        let t_def = crate::catalog::TableDef::new(
+                            table_name.clone(),
+                            vec![
+                                crate::catalog::ColumnDef::new("dummy", h2_types::DataType::VarChar(Some(1)), false, false),
+                            ],
+                        );
+                        let rows = vec![Row::new(vec![Value::String("X".to_string())])];
+                        return Ok((t_def, rows, table_alias));
                     }
 
                     let is_info_tables = table_name.eq_ignore_ascii_case("information_schema.tables")
@@ -2209,6 +2255,8 @@ fn apply_join(
     ) -> H2Result<(RowContext, Vec<Row>)> {
         let (base_def, base_rows, base_alias) = self.resolve_table_factor(tx, &tbl_with_joins.relation, current_ctes)?;
         let mut ctx = RowContext::from_table_def(&base_def, base_alias.as_deref());
+        ctx.catalog = Some(Arc::clone(&self.catalog));
+        ctx.dialect_mode = Some(self.dialect_mode());
         let mut current_rows = base_rows;
 
         for join in &tbl_with_joins.joins {
@@ -2485,7 +2533,7 @@ fn apply_join(
                 Ok(ExecutionResult::Ddl)
             }
             Statement::Insert(insert) => {
-                let table_name = insert.table_name.to_string();
+                let table_name = normalize_object_name(&insert.table_name);
                 let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
                     H2Error::Catalog(format!("Table '{}' not found", table_name))
                 })?;
@@ -2536,6 +2584,7 @@ fn apply_join(
                             let eval_ctx = RowContext {
                                 columns: Vec::new(),
                                 catalog: Some(Arc::clone(&self.catalog)),
+                                dialect_mode: Some(self.dialect_mode()),
                             };
                             let dummy_row = Row::new(vec![]);
                             for row_exprs in values.rows {
@@ -2821,7 +2870,7 @@ fn apply_join(
                     sqlparser::ast::FromTable::WithoutKeyword(tables) => &tables[0],
                 };
                 let table_name = match &from_table.relation {
-                    TableFactor::Table { name, .. } => name.to_string(),
+                    TableFactor::Table { name, .. } => normalize_object_name(name),
                     _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
                 };
                 let target_alias = match &from_table.relation {
@@ -2998,7 +3047,7 @@ fn apply_join(
             }
             Statement::Update { table, assignments, from, selection, returning, .. } => {
                 let table_name = match &table.relation {
-                    TableFactor::Table { name, .. } => name.to_string(),
+                    TableFactor::Table { name, .. } => normalize_object_name(name),
                     _ => return Err(H2Error::Execution("Complex table factors in UPDATE not supported".to_string())),
                 };
                 let target_alias = match &table.relation {
@@ -3362,7 +3411,7 @@ fn apply_join(
                 match object_type {
                     sqlparser::ast::ObjectType::Table => {
                         for name in names {
-                            let table_name = name.to_string();
+                            let table_name = normalize_object_name(&name);
                             if self.catalog.get_table(&table_name).is_none() {
                                 if if_exists {
                                     continue;
@@ -5160,6 +5209,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                             index: i,
                         }).collect(),
                         catalog: Some(Arc::clone(&self.catalog)),
+                        dialect_mode: Some(self.dialect_mode()),
                     };
                     rows.sort_by(|a, b| {
                         for order_expr in &order_by.exprs {
@@ -5218,6 +5268,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                 if select.from.is_empty() {
                     let mut ctx = RowContext::new();
                     ctx.catalog = Some(Arc::clone(&self.catalog));
+                    ctx.dialect_mode = Some(self.dialect_mode());
                     let dummy_row = Row::new(vec![]);
 
                     // WHERE 句の評価（サブクエリ展開含む）
@@ -5277,10 +5328,22 @@ pub(crate) fn convert_value_bounds_to_bytes(
                         if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
                             res
                         } else {
-                            let base_table_name = name.to_string();
+                            let base_table_name = normalize_object_name(name);
                             let base_table_alias = alias.as_ref().map(|a| a.name.value.clone());
 
-                            if let Some(res) = self.resolve_virtual_graph_table(tx, &base_table_name, base_table_alias.clone())? {
+                            let is_dual = base_table_name.eq_ignore_ascii_case("dual")
+                                || base_table_name.eq_ignore_ascii_case("sysibm.sysdummy1");
+
+                            if is_dual {
+                                let t_def = crate::catalog::TableDef::new(
+                                    base_table_name.clone(),
+                                    vec![
+                                        crate::catalog::ColumnDef::new("dummy", h2_types::DataType::VarChar(Some(1)), false, false),
+                                    ],
+                                );
+                                let rows = vec![Row::new(vec![Value::String("X".to_string())])];
+                                (t_def, rows, base_table_alias)
+                            } else if let Some(res) = self.resolve_virtual_graph_table(tx, &base_table_name, base_table_alias.clone())? {
                                 res
                             } else if let Some((cte_def, cte_rows)) = current_ctes.get(&base_table_name.to_lowercase()) {
                                 let mut t_def = cte_def.clone();
@@ -5416,6 +5479,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
 
                                 let mut ctx = RowContext::from_table_def(&table_def, base_table_alias.as_deref());
                                 ctx.catalog = Some(Arc::clone(&self.catalog));
+                                ctx.dialect_mode = Some(self.dialect_mode());
 
                                 let is_simple_agg = from_table.joins.is_empty()
                                     && match &select.group_by {
@@ -5713,6 +5777,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                 let mut current_rows = current_rows;
                 let mut ctx = RowContext::from_table_def(&base_table_def, base_table_alias.as_deref());
                 ctx.catalog = Some(Arc::clone(&self.catalog));
+                ctx.dialect_mode = Some(self.dialect_mode());
 
                 // JOIN の処理
                 for join in &from_table.joins {
@@ -5868,6 +5933,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                                 index: i,
                             }).collect(),
                             catalog: Some(Arc::clone(&self.catalog)),
+                            dialect_mode: Some(self.dialect_mode()),
                         };
 
                         let work_mem = self.memory_config.work_mem();
@@ -6252,7 +6318,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                 }
             }
             Statement::Insert(insert) => {
-                let t = insert.table_name.to_string();
+                let t = normalize_object_name(&insert.table_name);
                 self.auth.check_privilege(user, &t, crate::auth::Privilege::Insert)?;
                 if let Some(ref src) = insert.source {
                     let select_tables = extract_tables_from_query(src);
@@ -6263,7 +6329,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
             }
             Statement::Update { table, .. } => {
                 let t = match &table.relation {
-                    TableFactor::Table { name, .. } => name.to_string(),
+                    TableFactor::Table { name, .. } => normalize_object_name(name),
                     _ => table.relation.to_string(),
                 };
                 self.auth.check_privilege(user, &t, crate::auth::Privilege::Update)?;
@@ -6275,7 +6341,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                 };
                 if let Some(from_tbl) = from_table {
                     let t = match &from_tbl.relation {
-                        TableFactor::Table { name, .. } => name.to_string(),
+                        TableFactor::Table { name, .. } => normalize_object_name(name),
                         _ => from_tbl.relation.to_string(),
                     };
                     self.auth.check_privilege(user, &t, crate::auth::Privilege::Delete)?;

@@ -9,7 +9,7 @@ pub use h2_mvstore::{
 pub use h2_sql::{ExecutionResult, Row, SQLEngine};
 pub use h2_types::{
     CacheInvalidationEvent, DataType, FencingToken, FromSql, H2Error, H2Result, LogOpType,
-    LogRecord, Lsn, PageId, Value,
+    LogRecord, Lsn, PageId, SqlDialectMode, Value,
 };
 
 pub mod replication;
@@ -237,6 +237,30 @@ impl Connection {
             default_query_timeout: Arc::new(parking_lot::RwLock::new(None)),
             current_user: Arc::new(parking_lot::RwLock::new(None)),
         })
+    }
+
+    /// 方言互換モードを指定してファイルベースのデータベースを開く
+    pub fn open_with_mode<P: AsRef<Path>>(path: P, mode: SqlDialectMode) -> H2Result<Self> {
+        let conn = Self::open(path)?;
+        conn.set_mode(mode);
+        Ok(conn)
+    }
+
+    /// 方言互換モードを指定してインメモリデータベースを開く
+    pub fn open_in_memory_with_mode(mode: SqlDialectMode) -> H2Result<Self> {
+        let conn = Self::open_in_memory()?;
+        conn.set_mode(mode);
+        Ok(conn)
+    }
+
+    /// SQL 方言互換モードを設定
+    pub fn set_mode(&self, mode: SqlDialectMode) {
+        self.engine.set_dialect_mode(mode);
+    }
+
+    /// 現在の SQL 方言互換モードを取得
+    pub fn get_mode(&self) -> SqlDialectMode {
+        self.engine.dialect_mode()
     }
 
     /// SQLEngine と MVStore から直接 Connection を生成

@@ -1,16 +1,52 @@
 use sqlparser::ast::{
     CharacterLength, ColumnDef as SqlColumnDef, DataType as SqlDataType, Statement, TableConstraint,
 };
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{AnsiDialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect};
 use sqlparser::parser::Parser;
 
-use h2_types::{DataType, H2Error, H2Result};
+use h2_types::{DataType, H2Error, H2Result, SqlDialectMode};
 use crate::catalog::{ColumnDef, ForeignKeyAction, ForeignKeyDef, TableDef, UniqueConstraintDef};
 
 pub fn parse_sql(sql: &str) -> H2Result<Vec<Statement>> {
-    let dialect = PostgreSqlDialect {};
-    Parser::parse_sql(&dialect, sql)
-        .map_err(|e| H2Error::SqlParse(e.to_string()))
+    parse_sql_mode(sql, SqlDialectMode::Regular)
+}
+
+pub fn parse_sql_mode(sql: &str, mode: SqlDialectMode) -> H2Result<Vec<Statement>> {
+    match mode {
+        SqlDialectMode::PostgreSql => {
+            let dialect = PostgreSqlDialect {};
+            Parser::parse_sql(&dialect, sql)
+                .map_err(|e| H2Error::SqlParse(e.to_string()))
+        }
+        SqlDialectMode::MySql => {
+            let dialect = MySqlDialect {};
+            Parser::parse_sql(&dialect, sql)
+                .map_err(|e| H2Error::SqlParse(e.to_string()))
+        }
+        SqlDialectMode::MsSqlServer => {
+            let dialect = MsSqlDialect {};
+            Parser::parse_sql(&dialect, sql)
+                .map_err(|e| H2Error::SqlParse(e.to_string()))
+        }
+        SqlDialectMode::Db2 => {
+            let dialect = AnsiDialect {};
+            Parser::parse_sql(&dialect, sql)
+                .map_err(|e| H2Error::SqlParse(e.to_string()))
+        }
+        SqlDialectMode::Regular | SqlDialectMode::Oracle => {
+            let generic = GenericDialect {};
+            if let Ok(stmts) = Parser::parse_sql(&generic, sql) {
+                return Ok(stmts);
+            }
+            let pg = PostgreSqlDialect {};
+            if let Ok(stmts) = Parser::parse_sql(&pg, sql) {
+                return Ok(stmts);
+            }
+            let mysql = MySqlDialect {};
+            Parser::parse_sql(&mysql, sql)
+                .map_err(|e| H2Error::SqlParse(e.to_string()))
+        }
+    }
 }
 
 fn char_len_to_usize(len: &Option<CharacterLength>) -> Option<usize> {
@@ -20,7 +56,7 @@ fn char_len_to_usize(len: &Option<CharacterLength>) -> Option<usize> {
     })
 }
 
-/// SQL の DataType を h2-types の DataType へ変換
+/// SQL の DataType を h2-types の DataType へ変換（多方言対応）
 pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
     match sql_type {
         SqlDataType::Boolean => Ok(DataType::Boolean),
@@ -44,11 +80,14 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
         }
         SqlDataType::Char(len) => Ok(DataType::Char(char_len_to_usize(len).unwrap_or(1))),
         SqlDataType::Varchar(len) => Ok(DataType::VarChar(char_len_to_usize(len))),
+        SqlDataType::Nvarchar(len) => Ok(DataType::VarChar(char_len_to_usize(len))),
         SqlDataType::Text => Ok(DataType::VarChar(None)),
         SqlDataType::Binary(len) => Ok(DataType::Binary(len.map(|l| l as usize))),
-        SqlDataType::Blob(_) => Ok(DataType::Blob),
+        SqlDataType::Varbinary(len) => Ok(DataType::Binary(len.map(|l| l as usize))),
+        SqlDataType::Blob(_) | SqlDataType::Clob(_) => Ok(DataType::Blob),
         SqlDataType::Date => Ok(DataType::Date),
         SqlDataType::Time(_, _) => Ok(DataType::Time),
+        SqlDataType::Datetime(_) => Ok(DataType::Timestamp),
         SqlDataType::Timestamp(_, tz) => {
             if matches!(tz, sqlparser::ast::TimezoneInfo::WithTimeZone) {
                 Ok(DataType::TimestampTz)
@@ -56,10 +95,11 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
                 Ok(DataType::Timestamp)
             }
         }
+        SqlDataType::MediumInt(_) => Ok(DataType::Integer),
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Json),
         SqlDataType::Interval => Ok(DataType::Interval),
-        SqlDataType::Custom(name, _) => {
+        SqlDataType::Custom(name, modifiers) => {
             let type_name = name.to_string().to_uppercase();
             if type_name == "TIMESTAMPTZ" {
                 Ok(DataType::TimestampTz)
@@ -69,6 +109,34 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> H2Result<DataType> {
                 Ok(DataType::Integer)
             } else if type_name == "BIGSERIAL" {
                 Ok(DataType::BigInt)
+            } else if type_name == "VARCHAR2" || type_name == "NVARCHAR2" {
+                let len = modifiers.first().and_then(|s| s.parse::<usize>().ok());
+                Ok(DataType::VarChar(len))
+            } else if type_name == "NCHAR" {
+                let len = modifiers.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                Ok(DataType::Char(len))
+            } else if type_name == "NUMBER" {
+                if let Some(p) = modifiers.first().and_then(|s| s.parse::<u8>().ok()) {
+                    let s = modifiers.get(1).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+                    Ok(DataType::Decimal(p, s))
+                } else {
+                    Ok(DataType::Decimal(10, 2))
+                }
+            } else if type_name == "RAW" {
+                let len = modifiers.first().and_then(|s| s.parse::<usize>().ok());
+                Ok(DataType::Binary(len))
+            } else if type_name == "CLOB" || type_name == "LONGTEXT" || type_name == "MEDIUMTEXT" || type_name == "TINYTEXT" || type_name == "NTEXT" {
+                Ok(DataType::VarChar(None))
+            } else if type_name == "BLOB" || type_name == "LONGBLOB" || type_name == "MEDIUMBLOB" || type_name == "TINYBLOB" || type_name == "IMAGE" {
+                Ok(DataType::Blob)
+            } else if type_name == "DATETIME" || type_name == "DATETIME2" || type_name == "SMALLDATETIME" {
+                Ok(DataType::Timestamp)
+            } else if type_name == "MONEY" || type_name == "SMALLMONEY" {
+                Ok(DataType::Decimal(19, 4))
+            } else if type_name == "BIT" {
+                Ok(DataType::Boolean)
+            } else if type_name == "UNIQUEIDENTIFIER" {
+                Ok(DataType::Uuid)
             } else {
                 Err(H2Error::TypeError(format!("Unsupported custom type: {}", type_name)))
             }
