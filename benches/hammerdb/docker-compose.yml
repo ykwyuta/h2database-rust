@@ -1,0 +1,36 @@
+services:
+  postgres18:
+    image: postgres:18-alpine
+    container_name: hammerdb-postgres18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5434:5432"
+    shm_size: 1g
+    command: >
+      postgres
+      -c shared_buffers=512MB
+      -c work_mem=64MB
+      -c maintenance_work_mem=128MB
+      -c synchronous_commit=off
+      -c max_connections=100
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  hammerdb:
+    image: tpcorg/hammerdb:latest
+    container_name: hammerdb-client
+    volumes:
+      - ./:/work
+    working_dir: /home/HammerDB-6.0
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres18:
+        condition: service_healthy
+    command: ["tail", "-f", "/dev/null"]
