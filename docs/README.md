@@ -101,3 +101,5 @@
 - [22. グラフDB × リレーショナル SQL 統合アクセス機能設計方針 (Cypher-in-SQL / Virtual Graph Tables / SQL:2023 PGQ)](./22_sql_graph_integration_design.md)
 - [23. PL/pgSQL 手続きシミュレーション層の設計方針](./23_plpgsql_procedure_simulation_design.md)
 - [24. 高速バイナリバックアップ・PITR・リードレプリカバックアップ設計方針](./24_high_performance_binary_backup_pitr_and_replica_backup_design.md)
+- [25. PostgreSQL 18 PL/pgSQL 汎用言語互換および SQL Server T-SQL 拡張設計方針](./25_plpgsql_general_language_compatibility_and_tsql_extensibility_design.md)
+

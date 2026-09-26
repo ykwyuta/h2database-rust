@@ -7,7 +7,9 @@ use chrono::Datelike;
 
 use h2_types::{H2Error, H2Result, Value, IntervalValue};
 use crate::catalog::{Catalog, TableDef};
+use crate::executor::ExecutionResult;
 use crate::fts::tokenizer::{get_tokenizer, TokenizerKind};
+use crate::procedural::{ProcInterpreter, RoutineKind};
 use crate::row::Row;
 
 #[derive(Debug, Clone)]
@@ -449,6 +451,16 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                 Ok(Value::Date(chrono::Utc::now().date_naive()))
             } else if func_name == "CURRENT_TIME" {
                 Ok(Value::Time(chrono::Utc::now().time()))
+            } else if func_name == "RANDOM" {
+                static SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(88172645463325252);
+                let mut x = SEED.load(std::sync::atomic::Ordering::Relaxed);
+                if x == 0 { x = 88172645463325252; }
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                SEED.store(x, std::sync::atomic::Ordering::Relaxed);
+                let f = ((x >> 11) as f64) / ((1u64 << 53) as f64);
+                Ok(Value::Double(f))
             // ================= 高度な数学関数 =================
             } else if func_name == "SIN" || func_name == "COS" || func_name == "TAN"
                 || func_name == "ASIN" || func_name == "ACOS" || func_name == "ATAN" {
@@ -963,6 +975,34 @@ pub fn evaluate_expr_context(expr: &SqlExpr, ctx: &RowContext, row: &Row) -> H2R
                 })?;
                 let v = catalog.setval(seq_name, val_num, is_called)?;
                 Ok(Value::BigInt(v))
+            } else if let Some(catalog) = &ctx.catalog {
+                if let Some(routine) = catalog.get_routine(&func_name) {
+                    if routine.kind == RoutineKind::Function {
+                        let mut interp = ProcInterpreter::new(
+                            Some(Arc::clone(catalog)),
+                            None,
+                            None,
+                            None,
+                        );
+                        let mut arg_vals = Vec::new();
+                        for a in args {
+                            arg_vals.push(evaluate_func_arg_context(a, ctx, row)?);
+                        }
+                        let res = interp.execute_routine(&routine, &arg_vals)?;
+                        if let ExecutionResult::Query { rows, .. } = res {
+                            if let Some(first_row) = rows.first() {
+                                if let Some(v) = first_row.values.first() {
+                                    return Ok(v.clone());
+                                }
+                            }
+                        }
+                        Ok(Value::Null)
+                    } else {
+                        Err(H2Error::Execution(format!("'{}' is a procedure, not a function", func_name)))
+                    }
+                } else {
+                    Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
+                }
             } else {
                 Err(H2Error::Execution(format!("Unsupported scalar function: {}", func_name)))
             }

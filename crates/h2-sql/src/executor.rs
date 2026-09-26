@@ -529,7 +529,7 @@ pub struct SQLEngine {
     execution_mode: Arc<parking_lot::RwLock<String>>,
     plan_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<Statement>>>>,
     query_stats: Arc<crate::query_stats::QueryStats>,
-    plpgsql_sim: Arc<crate::plpgsql_sim::PlPgSqlSimulator>,
+    procedural_engine: Arc<crate::procedural::ProceduralEngine>,
 }
 
 impl SQLEngine {
@@ -543,7 +543,7 @@ impl SQLEngine {
         let admission = crate::memory::MemoryGrantCoordinator::new(memory_config.total_query_memory());
         let execution_mode = Arc::new(parking_lot::RwLock::new("auto".to_string()));
         let plan_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-        let plpgsql_sim = Arc::new(crate::plpgsql_sim::PlPgSqlSimulator::new());
+        let procedural_engine = Arc::new(crate::procedural::ProceduralEngine::new());
         Ok(Self {
             store,
             tx_store,
@@ -556,12 +556,12 @@ impl SQLEngine {
             execution_mode,
             plan_cache,
             query_stats: Arc::new(crate::query_stats::QueryStats::default()),
-            plpgsql_sim,
+            procedural_engine,
         })
     }
 
-    pub fn plpgsql_sim(&self) -> &Arc<crate::plpgsql_sim::PlPgSqlSimulator> {
-        &self.plpgsql_sim
+    pub fn procedural_engine(&self) -> &Arc<crate::procedural::ProceduralEngine> {
+        &self.procedural_engine
     }
 
     pub fn execution_mode(&self) -> String {
@@ -842,20 +842,34 @@ impl SQLEngine {
             || trimmed_upper.starts_with("CREATE OR REPLACE FUNCTION ")
             || trimmed_upper.starts_with("CREATE FUNCTION ")
         {
-            self.plpgsql_sim.register_from_ddl(trimmed)?;
+            self.procedural_engine.register_from_ddl(&self.catalog, trimmed)?;
             return Ok(ExecutionResult::Ddl);
         }
         if trimmed_upper.starts_with("DROP PROCEDURE ") || trimmed_upper.starts_with("DROP FUNCTION ") {
+            self.procedural_engine.drop_routine(&self.catalog, trimmed)?;
             return Ok(ExecutionResult::Ddl);
         }
         if trimmed_upper.starts_with("CALL ") {
-            return self.plpgsql_sim.execute_call(tx, self, trimmed);
+            return self.procedural_engine.execute_call(&self.catalog, self, tx, user, trimmed);
         }
-        if trimmed_upper.starts_with("SELECT ") {
-            if let Some(res) = self.plpgsql_sim.execute_select(tx, self, trimmed)? {
-                return Ok(res);
-            }
+        if trimmed_upper.starts_with("DO ") || trimmed_upper.starts_with("DO$$") {
+            let body_str = crate::procedural::plpgsql::parser::extract_body_source(trimmed)?;
+            let mut lexer = crate::procedural::plpgsql::Lexer::new(&body_str);
+            let tokens = lexer.tokenize()?;
+            let mut parser = crate::procedural::plpgsql::PlPgSqlParser::new(tokens);
+            let block = parser.parse_block()?;
+            let mut interp = crate::procedural::ProcInterpreter::new(
+                Some(Arc::clone(&self.catalog)),
+                Some(self),
+                Some(tx),
+                user.map(|s| s.to_string()),
+            );
+            let mut env = crate::procedural::interpreter::ProcEnv::new();
+            interp.execute_block(&block, &mut env)?;
+            return Ok(ExecutionResult::Ddl);
         }
+
+
 
         let mut sql_to_parse = trimmed.to_string();
         if trimmed_upper.starts_with("FETCH RELATIVE -") {
@@ -1844,6 +1858,51 @@ impl SQLEngine {
         Ok(Some((table_def, rows, Some(table_alias_name))))
     }
 
+    fn resolve_pg_proc_table(
+        &self,
+        table_name: &str,
+        table_alias: Option<String>,
+    ) -> (crate::catalog::TableDef, Vec<Row>, Option<String>) {
+        let t_def = crate::catalog::TableDef::new(
+            table_name.to_string(),
+            vec![
+                crate::catalog::ColumnDef::new("oid", h2_types::DataType::BigInt, false, true),
+                crate::catalog::ColumnDef::new("proname", h2_types::DataType::VarChar(None), false, false),
+                crate::catalog::ColumnDef::new("prokind", h2_types::DataType::VarChar(None), false, false),
+                crate::catalog::ColumnDef::new("prorettype", h2_types::DataType::VarChar(None), false, false),
+                crate::catalog::ColumnDef::new("pronargs", h2_types::DataType::Integer, false, false),
+                crate::catalog::ColumnDef::new("proargnames", h2_types::DataType::VarChar(None), false, false),
+                crate::catalog::ColumnDef::new("prosrc", h2_types::DataType::VarChar(None), false, false),
+            ],
+        );
+
+        let mut rows = Vec::new();
+        let mut oid = 10001i64;
+
+        // 登録済みユーザー定義ルーチン
+        for r in self.catalog.all_routines() {
+            let kind_str = match r.kind {
+                crate::procedural::RoutineKind::Function => "f",
+                crate::procedural::RoutineKind::Procedure => "p",
+            };
+            let ret_str = r.return_type.map(|t| t.to_string().to_lowercase()).unwrap_or_else(|| "void".to_string());
+            let arg_names = r.parameters.iter().map(|p| p.name.clone()).collect::<Vec<_>>().join(",");
+
+            rows.push(Row::new(vec![
+                Value::BigInt(oid),
+                Value::String(r.name),
+                Value::String(kind_str.to_string()),
+                Value::String(ret_str),
+                Value::Integer(r.parameters.len() as i32),
+                Value::String(arg_names),
+                Value::String(r.source_sql),
+            ]));
+            oid += 1;
+        }
+
+        (t_def, rows, table_alias)
+    }
+
     fn resolve_table_factor(
         &self,
         tx: &Transaction,
@@ -1887,6 +1946,12 @@ impl SQLEngine {
                 } else if let Some(view) = self.catalog.get_view(&table_name) {
                     self.resolve_view_query(tx, &view, table_alias, current_ctes)
                 } else {
+                    let is_pg_proc = table_name.eq_ignore_ascii_case("pg_proc")
+                        || table_name.eq_ignore_ascii_case("pg_catalog.pg_proc");
+                    if is_pg_proc {
+                        return Ok(self.resolve_pg_proc_table(&table_name, table_alias));
+                    }
+
                     let is_info_tables = table_name.eq_ignore_ascii_case("information_schema.tables")
                         || table_name.eq_ignore_ascii_case("tables");
                     let is_info_columns = table_name.eq_ignore_ascii_case("information_schema.columns")
@@ -5226,6 +5291,8 @@ pub(crate) fn convert_value_bounds_to_bytes(
                         } else if let Some(view) = self.catalog.get_view(&base_table_name) {
                             self.resolve_view_query(tx, &view, base_table_alias, &current_ctes)?
                         } else {
+                            let is_pg_proc = base_table_name.eq_ignore_ascii_case("pg_proc")
+                                || base_table_name.eq_ignore_ascii_case("pg_catalog.pg_proc");
                             let is_info_tables = base_table_name.eq_ignore_ascii_case("information_schema.tables")
                                 || base_table_name.eq_ignore_ascii_case("tables");
                             let is_info_columns = base_table_name.eq_ignore_ascii_case("information_schema.columns")
@@ -5233,7 +5300,10 @@ pub(crate) fn convert_value_bounds_to_bytes(
                             let is_info_schemata = base_table_name.eq_ignore_ascii_case("information_schema.schemata")
                                 || base_table_name.eq_ignore_ascii_case("schemata");
 
-                            let (base_table_def, rows) = if is_info_tables {
+                            let (base_table_def, rows) = if is_pg_proc {
+                                let (td, r, _) = self.resolve_pg_proc_table(&base_table_name, None);
+                                (td, r)
+                            } else if is_info_tables {
                                 let t_def = crate::catalog::TableDef::new(
                                     base_table_name.clone(),
                                     vec![

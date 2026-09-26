@@ -5,6 +5,7 @@ use parking_lot::RwLock;
 
 use h2_mvstore::{MVMap, MVStore};
 use h2_types::{DataType, H2Error, H2Result};
+use crate::procedural::RoutineDef;
 
 fn default_schema() -> String {
     "public".to_string()
@@ -341,6 +342,7 @@ pub struct Catalog {
     views: Arc<RwLock<HashMap<String, ViewDef>>>,
     schemas: Arc<RwLock<HashSet<String>>>,
     sequences: Arc<RwLock<HashMap<String, SequenceDef>>>,
+    routines: Arc<RwLock<HashMap<String, RoutineDef>>>,
 }
 
 impl std::fmt::Debug for Catalog {
@@ -348,6 +350,7 @@ impl std::fmt::Debug for Catalog {
         f.debug_struct("Catalog")
             .field("tables_count", &self.tables.read().len())
             .field("sequences_count", &self.sequences.read().len())
+            .field("routines_count", &self.routines.read().len())
             .finish()
     }
 }
@@ -360,6 +363,7 @@ impl Catalog {
         let mut views = HashMap::new();
         let mut schemas = HashSet::new();
         let mut sequences = HashMap::new();
+        let mut routines = HashMap::new();
         schemas.insert("public".to_string());
 
         // 永続化されたカタログ情報をロード
@@ -387,6 +391,11 @@ impl Catalog {
                 let seq_name = &key_str[4..];
                 if let Ok(seq_def) = serde_json::from_slice::<SequenceDef>(&entry.value) {
                     sequences.insert(seq_name.to_lowercase(), seq_def);
+                }
+            } else if key_str.starts_with("proc:") {
+                let proc_name = &key_str[5..];
+                if let Ok(routine_def) = serde_json::from_slice::<RoutineDef>(&entry.value) {
+                    routines.insert(proc_name.to_lowercase(), routine_def);
                 }
             } else {
                 // 以前の形式（tbl:プレフィックスなし）との互換性
@@ -420,6 +429,7 @@ impl Catalog {
             views: Arc::new(RwLock::new(views)),
             schemas: Arc::new(RwLock::new(schemas)),
             sequences: Arc::new(RwLock::new(sequences)),
+            routines: Arc::new(RwLock::new(routines)),
         })
     }
 
@@ -429,12 +439,14 @@ impl Catalog {
         let mut views = self.views.write();
         let mut schemas = self.schemas.write();
         let mut sequences = self.sequences.write();
+        let mut routines = self.routines.write();
 
         tables.clear();
         indexes.clear();
         views.clear();
         schemas.clear();
         sequences.clear();
+        routines.clear();
         schemas.insert("public".to_string());
 
         for entry in self.catalog_map.scan_all() {
@@ -462,12 +474,18 @@ impl Catalog {
                 if let Ok(seq_def) = serde_json::from_slice::<SequenceDef>(&entry.value) {
                     sequences.insert(seq_name.to_lowercase(), seq_def);
                 }
+            } else if key_str.starts_with("proc:") {
+                let proc_name = &key_str[5..];
+                if let Ok(routine_def) = serde_json::from_slice::<RoutineDef>(&entry.value) {
+                    routines.insert(proc_name.to_lowercase(), routine_def);
+                }
             } else {
                 if let Ok(table_def) = serde_json::from_slice::<TableDef>(&entry.value) {
                     tables.insert(key_str.to_lowercase(), table_def);
                 }
             }
         }
+
 
         // 各テーブルの next_row_id を実際の tbl_{name} マップの最大キーより大きく補正
         for table_def in tables.values_mut() {
@@ -1195,6 +1213,40 @@ impl Catalog {
 
     pub fn all_views(&self) -> Vec<ViewDef> {
         self.views.read().values().cloned().collect()
+    }
+
+    pub fn create_routine(&self, routine_def: RoutineDef) -> H2Result<()> {
+        let name_key = routine_def.name.to_lowercase();
+        let serialized = serde_json::to_vec(&routine_def)
+            .map_err(|e| H2Error::Serialization(e.to_string()))?;
+        self.catalog_map.put(format!("proc:{}", name_key).into_bytes(), serialized);
+        let _ = self.store.commit();
+        self.routines.write().insert(name_key, routine_def);
+        Ok(())
+    }
+
+    pub fn drop_routine(&self, name: &str, if_exists: bool) -> H2Result<()> {
+        let name_key = name.to_lowercase();
+        let mut routines = self.routines.write();
+        if routines.remove(&name_key).is_none() {
+            if if_exists {
+                return Ok(());
+            }
+            return Err(H2Error::Catalog(format!("Routine '{}' not found", name)));
+        }
+
+        self.catalog_map.remove(format!("proc:{}", name_key).as_bytes());
+        let _ = self.store.commit();
+        Ok(())
+    }
+
+    pub fn get_routine(&self, name: &str) -> Option<RoutineDef> {
+        let name_key = name.to_lowercase();
+        self.routines.read().get(&name_key).cloned()
+    }
+
+    pub fn all_routines(&self) -> Vec<RoutineDef> {
+        self.routines.read().values().cloned().collect()
     }
 }
 
