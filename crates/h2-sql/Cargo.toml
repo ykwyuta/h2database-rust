@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 h2-types = { path = "../h2-types" }
 h2-mvstore = { path = "../h2-mvstore" }
+h2-graph = { path = "../h2-graph" }
 sqlparser = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

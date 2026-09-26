@@ -11,7 +11,7 @@ pub mod stats;
 pub mod vectorized;
 
 pub use auth::{AuthManager, Privilege, UserInfo};
-pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats};
+pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats, VirtualGraphKind, parse_virtual_graph_table};
 pub use executor::{ExecutionResult, SQLEngine};
 pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
 pub use memory::{ExternalSorter, MemoryConfig, MemoryGrant, MemoryGrantCoordinator, MemoryTracker};
@@ -215,6 +215,117 @@ mod tests {
             assert_eq!(rows[0].get(1), Some(&Value::String("Rust言語入門".to_string())));
         } else {
             panic!("Expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_sql_virtual_graph_tables() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let graph_engine = h2_graph::GraphEngine::new(store.clone(), "social").unwrap();
+
+        // 1. Populate graph via Cypher
+        graph_engine.execute("CREATE (a:Person {name: 'Alice', age: 30})").unwrap();
+        graph_engine.execute("CREATE (b:Person {name: 'Bob', age: 25})").unwrap();
+        graph_engine.execute("MATCH (a:Person {name: 'Alice'}), (b:Person {name: 'Bob'}) CREATE (a)-[:KNOWS {since: 2021}]->(b)").unwrap();
+
+        // 2. Query virtual graph nodes table from SQL
+        let sql_engine = SQLEngine::new(store.clone()).unwrap();
+        let res_nodes = sql_engine.execute("SELECT id, labels, properties FROM graph_social_nodes").unwrap();
+        if let ExecutionResult::Query { columns, rows } = res_nodes {
+            assert_eq!(columns, vec!["id", "labels", "properties"]);
+            assert_eq!(rows.len(), 2);
+        } else {
+            panic!("Expected Query result for graph_social_nodes");
+        }
+
+        // 3. Query virtual graph edges table from SQL
+        let res_edges = sql_engine.execute("SELECT id, src_id, dst_id, type, properties FROM graph_social_edges").unwrap();
+        if let ExecutionResult::Query { columns, rows } = res_edges {
+            assert_eq!(columns, vec!["id", "src_id", "dst_id", "type", "properties"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(3), Some(&Value::String("KNOWS".to_string())));
+        } else {
+            panic!("Expected Query result for graph_social_edges");
+        }
+
+        // 4. SQL JOIN between virtual nodes and edges
+        let join_sql = "SELECT e.type, src.id AS src_node, dst.id AS dst_node \
+                        FROM graph_social_edges e \
+                        JOIN graph_social_nodes src ON e.src_id = src.id \
+                        JOIN graph_social_nodes dst ON e.dst_id = dst.id";
+        let res_join = sql_engine.execute(join_sql).unwrap();
+        if let ExecutionResult::Query { rows, .. } = res_join {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&Value::String("KNOWS".to_string())));
+        } else {
+            panic!("Expected Query result for virtual graph JOIN");
+        }
+    }
+
+    #[test]
+    fn test_sql_cypher_table_function() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let graph_engine = h2_graph::GraphEngine::new(store.clone(), "company").unwrap();
+
+        graph_engine.execute("CREATE (:Employee {name: 'Carol', salary: 120000})").unwrap();
+        graph_engine.execute("CREATE (:Employee {name: 'Dave', salary: 90000})").unwrap();
+
+        let sql_engine = SQLEngine::new(store).unwrap();
+
+        // 1. Basic CYPHER() TVF in FROM clause
+        let sql = "SELECT * FROM cypher('company', 'MATCH (e:Employee) RETURN e.name AS name, e.salary AS salary ORDER BY salary DESC') AS g";
+        let res = sql_engine.execute(sql).unwrap();
+        if let ExecutionResult::Query { columns, rows } = res {
+            assert_eq!(columns, vec!["name", "salary"]);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].get(0), Some(&Value::String("Carol".to_string())));
+            assert_eq!(rows[1].get(0), Some(&Value::String("Dave".to_string())));
+        } else {
+            panic!("Expected Query result for cypher() TVF");
+        }
+
+        // 2. CYPHER() TVF with explicit column aliases and SQL WHERE
+        let sql_filter = "SELECT g.emp_name, g.emp_salary FROM cypher('company', 'MATCH (e:Employee) RETURN e.name, e.salary') AS g(emp_name, emp_salary) WHERE CAST(g.emp_salary AS BIGINT) > 100000";
+        let res_filter = sql_engine.execute(sql_filter).unwrap();
+        if let ExecutionResult::Query { columns, rows } = res_filter {
+            assert_eq!(columns, vec!["g.emp_name", "g.emp_salary"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&Value::String("Carol".to_string())));
+        } else {
+            panic!("Expected Query result for filtered cypher() TVF");
+        }
+    }
+
+    #[test]
+    fn test_sql_relational_and_graph_join() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let sql_engine = SQLEngine::new(store.clone()).unwrap();
+        let graph_engine = h2_graph::GraphEngine::new(store, "knowledge").unwrap();
+
+        // Relational table
+        sql_engine.execute("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR)").unwrap();
+        sql_engine.execute("INSERT INTO users VALUES (1, 'alice@acme.com'), (2, 'bob@acme.com')").unwrap();
+
+        // Graph nodes
+        graph_engine.execute("CREATE (:Person {user_id: 1, role: 'Architect'})").unwrap();
+        graph_engine.execute("CREATE (:Person {user_id: 2, role: 'Engineer'})").unwrap();
+
+        // Hybrid query: SQL relational table JOIN with Cypher TVF
+        let hybrid_sql = "SELECT u.id, u.email, g.role \
+                          FROM users u \
+                          JOIN cypher('knowledge', 'MATCH (p:Person) RETURN p.user_id AS uid, p.role AS role') AS g(uid, role) \
+                          ON u.id = CAST(g.uid AS INT) \
+                          WHERE u.id = 1";
+
+        let res = sql_engine.execute(hybrid_sql).unwrap();
+        if let ExecutionResult::Query { columns, rows } = res {
+            assert_eq!(columns, vec!["u.id", "u.email", "g.role"]);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].get(0), Some(&Value::Integer(1)));
+            assert_eq!(rows[0].get(1), Some(&Value::String("alice@acme.com".to_string())));
+            assert_eq!(rows[0].get(2), Some(&Value::String("Architect".to_string())));
+        } else {
+            panic!("Expected Query result for hybrid relational-graph JOIN");
         }
     }
 }

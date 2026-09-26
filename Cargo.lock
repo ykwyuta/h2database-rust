@@ -707,6 +707,7 @@ dependencies = [
  "arrow",
  "bincode",
  "chrono",
+ "h2-graph",
  "h2-mvstore",
  "h2-types",
  "parking_lot",

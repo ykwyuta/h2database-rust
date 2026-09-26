@@ -1583,6 +1583,187 @@ impl SQLEngine {
         }
     }
 
+    fn resolve_virtual_graph_table(
+        &self,
+        tx: &Transaction,
+        table_name: &str,
+        table_alias: Option<String>,
+    ) -> H2Result<Option<(TableDef, Vec<Row>, Option<String>)>> {
+        let (graph_name, kind) = match crate::catalog::parse_virtual_graph_table(table_name) {
+            Some(res) => res,
+            None => return Ok(None),
+        };
+
+        let mut table_def = match self.catalog.get_table(table_name) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        if let Some(ref a) = table_alias {
+            table_def.name = a.clone();
+        }
+
+        let rows = match kind {
+            crate::catalog::VirtualGraphKind::Nodes => {
+                let map_name = format!("_g_{}_nodes", graph_name);
+                let entries = tx.scan_visible(&map_name)?;
+                let mut rows = Vec::with_capacity(entries.len());
+                for (_k, val_bytes) in entries {
+                    if let Ok(node) = bincode::deserialize::<h2_graph::Node>(&val_bytes) {
+                        let labels_val = Value::Array(node.labels.into_iter().map(Value::String).collect());
+                        let mut prop_map = serde_json::Map::new();
+                        for (k, v) in node.properties {
+                            prop_map.insert(k, serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
+                        }
+                        let prop_val = Value::Json(serde_json::Value::Object(prop_map));
+                        rows.push(Row::new(vec![
+                            Value::BigInt(node.id as i64),
+                            labels_val,
+                            prop_val,
+                        ]));
+                    }
+                }
+                rows
+            }
+            crate::catalog::VirtualGraphKind::Edges => {
+                let map_name = format!("_g_{}_edges", graph_name);
+                let entries = tx.scan_visible(&map_name)?;
+                let mut rows = Vec::with_capacity(entries.len());
+                for (_k, val_bytes) in entries {
+                    if let Ok(edge) = bincode::deserialize::<h2_graph::Edge>(&val_bytes) {
+                        let mut prop_map = serde_json::Map::new();
+                        for (k, v) in edge.properties {
+                            prop_map.insert(k, serde_json::to_value(&v).unwrap_or(serde_json::Value::Null));
+                        }
+                        let prop_val = Value::Json(serde_json::Value::Object(prop_map));
+                        rows.push(Row::new(vec![
+                            Value::BigInt(edge.id as i64),
+                            Value::BigInt(edge.src_id as i64),
+                            Value::BigInt(edge.dst_id as i64),
+                            Value::String(edge.edge_type),
+                            prop_val,
+                        ]));
+                    }
+                }
+                rows
+            }
+        };
+
+        Ok(Some((table_def, rows, table_alias)))
+    }
+
+    fn resolve_cypher_table_function(
+        &self,
+        tx: &Transaction,
+        name: &sqlparser::ast::ObjectName,
+        alias: &Option<sqlparser::ast::TableAlias>,
+        args: &Option<sqlparser::ast::TableFunctionArgs>,
+    ) -> H2Result<Option<(TableDef, Vec<Row>, Option<String>)>> {
+        let func_name = name.to_string();
+        if !func_name.eq_ignore_ascii_case("cypher") {
+            return Ok(None);
+        }
+
+        let func_args = match args {
+            Some(fa) => &fa.args,
+            None => {
+                return Err(H2Error::Execution(
+                    "CYPHER() table function requires at least 2 arguments: graph_name and cypher_query".to_string(),
+                ))
+            }
+        };
+
+        if func_args.len() < 2 {
+            return Err(H2Error::Execution(
+                "CYPHER() table function requires at least 2 arguments: graph_name and cypher_query".to_string(),
+            ));
+        }
+
+        fn extract_str_arg(arg: &sqlparser::ast::FunctionArg) -> H2Result<String> {
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                    match expr {
+                        sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                            Ok(s.clone())
+                        }
+                        sqlparser::ast::Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+                            Ok(s.clone())
+                        }
+                        sqlparser::ast::Expr::Identifier(ident) => Ok(ident.value.clone()),
+                        _ => Err(H2Error::Execution(format!(
+                            "Expected string literal argument to CYPHER(), found {:?}",
+                            expr
+                        ))),
+                    }
+                }
+                _ => Err(H2Error::Execution(
+                    "Expected unnamed string argument to CYPHER()".to_string(),
+                )),
+            }
+        }
+
+        let graph_name = extract_str_arg(&func_args[0])?;
+        let cypher_query = extract_str_arg(&func_args[1])?;
+
+        let mut params = HashMap::new();
+        if func_args.len() >= 3 {
+            if let Ok(params_str) = extract_str_arg(&func_args[2]) {
+                if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(&params_str) {
+                    if let serde_json::Value::Object(map) = json_val {
+                        for (k, v) in map {
+                            let gv = match v {
+                                serde_json::Value::Null => h2_graph::GraphValue::Null,
+                                serde_json::Value::Bool(b) => h2_graph::GraphValue::Boolean(b),
+                                serde_json::Value::Number(n) => {
+                                    if let Some(i) = n.as_i64() {
+                                        h2_graph::GraphValue::Integer(i)
+                                    } else {
+                                        h2_graph::GraphValue::Float(n.as_f64().unwrap_or(0.0))
+                                    }
+                                }
+                                serde_json::Value::String(s) => h2_graph::GraphValue::String(s),
+                                _ => h2_graph::GraphValue::String(v.to_string()),
+                            };
+                            params.insert(k, gv);
+                        }
+                    }
+                }
+            }
+        }
+
+        let engine = h2_graph::GraphEngine::new(self.store.clone(), &graph_name)?;
+        let result = engine.execute_on_tx(tx, &cypher_query, &params)?;
+
+        let table_alias_name = alias
+            .as_ref()
+            .map(|a| a.name.value.clone())
+            .unwrap_or_else(|| "cypher".to_string());
+
+        let col_names = if let Some(ref a) = alias {
+            if !a.columns.is_empty() {
+                a.columns.iter().map(|c| c.name.value.clone()).collect()
+            } else {
+                result.columns.clone()
+            }
+        } else {
+            result.columns.clone()
+        };
+
+        let col_defs: Vec<ColumnDef> = col_names
+            .into_iter()
+            .map(|col_name| ColumnDef::new(col_name, h2_types::DataType::VarChar(None), true, false))
+            .collect();
+
+        let mut rows = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            let row_values: Vec<Value> = row.into_iter().map(|gv| gv.to_value()).collect();
+            rows.push(Row::new(row_values));
+        }
+
+        let table_def = TableDef::new(table_alias_name.clone(), col_defs);
+        Ok(Some((table_def, rows, Some(table_alias_name))))
+    }
+
     fn resolve_table_factor(
         &self,
         tx: &Transaction,
@@ -1606,9 +1787,16 @@ impl SQLEngine {
                 let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
                 Ok((t_def, rows, Some(sub_alias)))
             }
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table { name, alias, args, .. } => {
+                if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
+                    return Ok(res);
+                }
                 let table_name = name.to_string();
                 let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+
+                if let Some(res) = self.resolve_virtual_graph_table(tx, &table_name, table_alias.clone())? {
+                    return Ok(res);
+                }
 
                 if let Some((cte_def, cte_rows)) = current_ctes.get(&table_name.to_lowercase()) {
                     let mut t_def = cte_def.clone();
@@ -4940,16 +5128,21 @@ pub(crate) fn convert_value_bounds_to_bytes(
                         let t_def = crate::catalog::TableDef::new(sub_alias.clone(), col_defs);
                         (t_def, rows, Some(sub_alias))
                     }
-                    TableFactor::Table { name, alias, .. } => {
-                        let base_table_name = name.to_string();
-                        let base_table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                    TableFactor::Table { name, alias, args, .. } => {
+                        if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
+                            res
+                        } else {
+                            let base_table_name = name.to_string();
+                            let base_table_alias = alias.as_ref().map(|a| a.name.value.clone());
 
-                        if let Some((cte_def, cte_rows)) = current_ctes.get(&base_table_name.to_lowercase()) {
-                            let mut t_def = cte_def.clone();
-                            if let Some(ref a) = base_table_alias {
-                                t_def.name = a.clone();
-                            }
-                            (t_def, cte_rows.clone(), base_table_alias)
+                            if let Some(res) = self.resolve_virtual_graph_table(tx, &base_table_name, base_table_alias.clone())? {
+                                res
+                            } else if let Some((cte_def, cte_rows)) = current_ctes.get(&base_table_name.to_lowercase()) {
+                                let mut t_def = cte_def.clone();
+                                if let Some(ref a) = base_table_alias {
+                                    t_def.name = a.clone();
+                                }
+                                (t_def, cte_rows.clone(), base_table_alias)
                         } else if let Some(view) = self.catalog.get_view(&base_table_name) {
                             self.resolve_view_query(tx, &view, base_table_alias, &current_ctes)?
                         } else {
@@ -5363,6 +5556,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                             (base_table_def, rows, base_table_alias)
                         }
                     }
+                }
                     _ => return Err(H2Error::Execution("Complex table factors not supported".to_string())),
                 };
 

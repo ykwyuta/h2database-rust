@@ -275,6 +275,46 @@ impl TableDef {
     }
 }
 
+/// 仮想グラフテーブルの種類
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualGraphKind {
+    Nodes,
+    Edges,
+}
+
+/// テーブル名から仮想グラフテーブル (graph_<name>_nodes, graph_<name>_edges, graph_<name>.nodes, graph_<name>.edges) を判定
+pub fn parse_virtual_graph_table(name: &str) -> Option<(String, VirtualGraphKind)> {
+    let lower = name.to_lowercase();
+    let trimmed = lower.trim_start_matches("public.");
+    let (prefix, suffix) = if let Some(pos) = trimmed.rfind('.') {
+        (&trimmed[..pos], &trimmed[pos + 1..])
+    } else if let Some(pos) = trimmed.rfind('_') {
+        (&trimmed[..pos], &trimmed[pos + 1..])
+    } else {
+        return None;
+    };
+
+    let graph_name = if prefix.starts_with("graph_") {
+        prefix[6..].to_string()
+    } else if prefix == "graph" {
+        "default".to_string()
+    } else {
+        return None;
+    };
+
+    if graph_name.is_empty() {
+        return None;
+    }
+
+    if suffix == "nodes" {
+        Some((graph_name, VirtualGraphKind::Nodes))
+    } else if suffix == "edges" {
+        Some((graph_name, VirtualGraphKind::Edges))
+    } else {
+        None
+    }
+}
+
 /// インデックス定義
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexDef {
@@ -568,6 +608,25 @@ impl Catalog {
                 }
             }
         }
+
+        if let Some((_graph_name, kind)) = parse_virtual_graph_table(&name_key) {
+            let cols = match kind {
+                VirtualGraphKind::Nodes => vec![
+                    ColumnDef::new("id", DataType::BigInt, false, true),
+                    ColumnDef::new("labels", DataType::Array(Box::new(DataType::VarChar(None))), false, false),
+                    ColumnDef::new("properties", DataType::Json, false, false),
+                ],
+                VirtualGraphKind::Edges => vec![
+                    ColumnDef::new("id", DataType::BigInt, false, true),
+                    ColumnDef::new("src_id", DataType::BigInt, false, false),
+                    ColumnDef::new("dst_id", DataType::BigInt, false, false),
+                    ColumnDef::new("type", DataType::VarChar(None), false, false),
+                    ColumnDef::new("properties", DataType::Json, false, false),
+                ],
+            };
+            return Some(TableDef::new(name, cols));
+        }
+
         None
     }
 

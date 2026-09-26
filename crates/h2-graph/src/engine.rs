@@ -68,6 +68,19 @@ impl GraphEngine {
         }
     }
 
+    pub fn execute_on_tx(
+        &self,
+        tx: &Transaction,
+        cypher: &str,
+        params: &HashMap<String, GraphValue>,
+    ) -> H2Result<GraphResult> {
+        let query = QueryParser::parse(cypher)?;
+        let mut stats = GraphStats::default();
+        let mut res = self.execute_query(tx, &query, params, &mut stats)?;
+        res.stats = stats;
+        Ok(res)
+    }
+
     fn execute_query(
         &self,
         tx: &Transaction,
