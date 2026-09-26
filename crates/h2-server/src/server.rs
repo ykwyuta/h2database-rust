@@ -216,6 +216,95 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     out_buf.extend_from_slice(&PgMessageBuilder::command_complete("SHOW"));
                 } else if upper == "DISCARD ALL" || upper == "RESET ALL" {
                     out_buf.extend_from_slice(&PgMessageBuilder::command_complete("DISCARD"));
+                } else if upper.starts_with("COPY ") && upper.contains(" FROM STDIN") {
+                    let table_part = trimmed[5..].trim();
+                    let target_table = table_part.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("").trim();
+                    let num_cols = if let Some(start) = table_part.find('(') {
+                        if let Some(end) = table_part.find(')') {
+                            table_part[start + 1..end].split(',').count()
+                        } else {
+                            5
+                        }
+                    } else {
+                        5
+                    };
+
+                    stream.write_all(&PgMessageBuilder::copy_in_response(num_cols)).await?;
+                    stream.flush().await?;
+
+                    let mut copy_rows = Vec::new();
+                    loop {
+                        let mut c_type = [0u8; 1];
+                        stream.read_exact(&mut c_type).await?;
+                        let mut c_len_buf = [0u8; 4];
+                        stream.read_exact(&mut c_len_buf).await?;
+                        let c_len = (u32::from_be_bytes(c_len_buf) as usize).saturating_sub(4);
+                        let mut c_payload = vec![0u8; c_len];
+                        stream.read_exact(&mut c_payload).await?;
+
+                        if c_type[0] == b'c' {
+                            break; // CopyDone
+                        } else if c_type[0] == b'd' {
+                            let text = String::from_utf8_lossy(&c_payload);
+                            for line in text.lines() {
+                                let t = line.trim();
+                                if !t.is_empty() && t != "\\." {
+                                    copy_rows.push(t.to_string());
+                                }
+                            }
+                        } else if c_type[0] == b'f' {
+                            break; // CopyFail
+                        }
+                    }
+
+                    let eng = Arc::clone(&engine);
+                    let table_name = target_table.to_string();
+                    let current_tx = active_tx.take();
+                    let user_for_exec = username.clone();
+                    let rows_to_insert = copy_rows.clone();
+
+                    let (insert_res, returned_tx): (H2Result<usize>, Option<h2_mvstore::Transaction>) =
+                        tokio::task::spawn_blocking(move || {
+                            let tx_to_use = current_tx.unwrap_or_else(|| eng.tx_store().begin());
+                            let mut count = 0;
+                            for chunk in rows_to_insert.chunks(200) {
+                                let mut val_tuples = Vec::new();
+                                for r in chunk {
+                                    let fields: Vec<String> = r.split(',').map(|f| {
+                                        let tf = f.trim();
+                                        if tf.is_empty() || tf.eq_ignore_ascii_case("null") {
+                                            "NULL".to_string()
+                                        } else if tf.starts_with('"') && tf.ends_with('"') {
+                                            format!("'{}'", &tf[1..tf.len() - 1].replace('\'', "''"))
+                                        } else if tf.parse::<f64>().is_ok() {
+                                            tf.to_string()
+                                        } else {
+                                            format!("'{}'", tf.replace('\'', "''"))
+                                        }
+                                    }).collect();
+                                    val_tuples.push(format!("({})", fields.join(", ")));
+                                }
+                                if !val_tuples.is_empty() {
+                                    let sql = format!("INSERT INTO {} VALUES {}", table_name, val_tuples.join(", "));
+                                    if let Err(e) = eng.execute_with_user_and_tx(&tx_to_use, &sql, Some(&user_for_exec)) {
+                                        let _ = tx_to_use.rollback();
+                                        return (Err(e), None);
+                                    }
+                                    count += chunk.len();
+                                }
+                            }
+                            (Ok(count), Some(tx_to_use))
+                        }).await.map_err(|e| H2Error::Execution(e.to_string()))?;
+
+                    active_tx = returned_tx;
+                    match insert_res {
+                        Ok(cnt) => {
+                            out_buf.extend_from_slice(&PgMessageBuilder::command_complete(&format!("COPY {}", cnt)));
+                        }
+                        Err(e) => {
+                            out_buf.extend_from_slice(&PgMessageBuilder::error_response(&e.to_string()));
+                        }
+                    }
                 } else {
                     let eng = Arc::clone(&engine);
                     let sql_owned = trimmed.to_string();
@@ -237,7 +326,19 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                     match exec_result {
                         Ok(result) => match result {
                             ExecutionResult::Ddl => {
-                                let tag = if upper == "RESET QUERY STATS" { "RESET" } else { "CREATE TABLE" };
+                                let tag = if upper == "RESET QUERY STATS" {
+                                    "RESET"
+                                } else if upper.starts_with("CALL") {
+                                    "CALL"
+                                } else if upper.starts_with("CREATE FUNCTION") || upper.starts_with("CREATE OR REPLACE FUNCTION") {
+                                    "CREATE FUNCTION"
+                                } else if upper.starts_with("CREATE PROCEDURE") || upper.starts_with("CREATE OR REPLACE PROCEDURE") {
+                                    "CREATE PROCEDURE"
+                                } else if upper.starts_with("DROP") {
+                                    "DROP"
+                                } else {
+                                    "CREATE TABLE"
+                                };
                                 out_buf.extend_from_slice(&PgMessageBuilder::command_complete(tag));
                             }
                             ExecutionResult::Dml { affected_rows } => {
@@ -257,7 +358,11 @@ async fn handle_client(mut stream: TcpStream, client_addr: SocketAddr, engine: A
                                 for row in &rows {
                                     out_buf.extend_from_slice(&PgMessageBuilder::data_row(&row.values));
                                 }
-                                let tag = format!("SELECT {}", rows.len());
+                                let tag = if upper.starts_with("CALL") {
+                                    "CALL".to_string()
+                                } else {
+                                    format!("SELECT {}", rows.len())
+                                };
                                 out_buf.extend_from_slice(&PgMessageBuilder::command_complete(&tag));
                             }
                         },

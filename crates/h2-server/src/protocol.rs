@@ -224,4 +224,19 @@ impl PgMessageBuilder {
         buf.extend_from_slice(&payload);
         buf
     }
+
+    /// CopyInResponse ('G')
+    pub fn copy_in_response(num_columns: usize) -> Vec<u8> {
+        let len = 4 + 1 + 2 + (num_columns * 2) as u32;
+        let mut buf = Vec::with_capacity(1 + len as usize);
+        buf.push(b'G');
+        buf.extend_from_slice(&len.to_be_bytes());
+        buf.push(0); // 0 = text/csv format
+        buf.extend_from_slice(&(num_columns as u16).to_be_bytes());
+        for _ in 0..num_columns {
+            buf.extend_from_slice(&0u16.to_be_bytes()); // 0 = text format
+        }
+        buf
+    }
 }
+

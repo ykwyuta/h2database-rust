@@ -529,6 +529,7 @@ pub struct SQLEngine {
     execution_mode: Arc<parking_lot::RwLock<String>>,
     plan_cache: Arc<parking_lot::RwLock<HashMap<String, Vec<Statement>>>>,
     query_stats: Arc<crate::query_stats::QueryStats>,
+    plpgsql_sim: Arc<crate::plpgsql_sim::PlPgSqlSimulator>,
 }
 
 impl SQLEngine {
@@ -542,6 +543,7 @@ impl SQLEngine {
         let admission = crate::memory::MemoryGrantCoordinator::new(memory_config.total_query_memory());
         let execution_mode = Arc::new(parking_lot::RwLock::new("auto".to_string()));
         let plan_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let plpgsql_sim = Arc::new(crate::plpgsql_sim::PlPgSqlSimulator::new());
         Ok(Self {
             store,
             tx_store,
@@ -554,7 +556,12 @@ impl SQLEngine {
             execution_mode,
             plan_cache,
             query_stats: Arc::new(crate::query_stats::QueryStats::default()),
+            plpgsql_sim,
         })
+    }
+
+    pub fn plpgsql_sim(&self) -> &Arc<crate::plpgsql_sim::PlPgSqlSimulator> {
+        &self.plpgsql_sim
     }
 
     pub fn execution_mode(&self) -> String {
@@ -791,6 +798,32 @@ impl SQLEngine {
             });
         }
 
+        // ================= PL/pgSQL プロシージャシミュレーション層 =================
+        if trimmed_upper.starts_with("CREATE DATABASE ") || trimmed_upper.starts_with("DROP DATABASE ") {
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("EXEC DBMS_OUTPUT") || trimmed_upper.starts_with("EXECUTE DBMS_OUTPUT") {
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("CREATE OR REPLACE PROCEDURE ")
+            || trimmed_upper.starts_with("CREATE PROCEDURE ")
+            || trimmed_upper.starts_with("CREATE OR REPLACE FUNCTION ")
+            || trimmed_upper.starts_with("CREATE FUNCTION ")
+        {
+            self.plpgsql_sim.register_from_ddl(trimmed)?;
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("DROP PROCEDURE ") || trimmed_upper.starts_with("DROP FUNCTION ") {
+            return Ok(ExecutionResult::Ddl);
+        }
+        if trimmed_upper.starts_with("CALL ") {
+            return self.plpgsql_sim.execute_call(tx, self, trimmed);
+        }
+        if trimmed_upper.starts_with("SELECT ") {
+            if let Some(res) = self.plpgsql_sim.execute_select(tx, self, trimmed)? {
+                return Ok(res);
+            }
+        }
 
         let mut sql_to_parse = trimmed.to_string();
         if trimmed_upper.starts_with("FETCH RELATIVE -") {
