@@ -77,17 +77,31 @@ impl BoltSession {
         let mut agreed_version = [0u8; 4];
         for i in 0..4 {
             let v = &versions[i * 4..(i + 1) * 4];
-            if v == BOLT_V5_0 {
+            let major = v[3];
+            let minor = v[2];
+            let range = v[0];
+
+            if major == 5 {
+                // Client proposed Bolt 5.x (standard big-endian format)
+                agreed_version = [0, 0, 0, 5];
+                break;
+            } else if major == 4 && (minor == 4 || range >= minor.saturating_sub(4)) {
+                // Client proposed Bolt 4.4 (standard big-endian format)
+                agreed_version = [0, 0, 4, 4];
+                break;
+            } else if v == &BOLT_V5_0 {
+                // Internal test representation [0, 0, 5, 0]
                 agreed_version = BOLT_V5_0;
                 break;
-            } else if v == BOLT_V4_4 && agreed_version == [0, 0, 0, 0] {
+            } else if v == &BOLT_V4_4 {
                 agreed_version = BOLT_V4_4;
+                break;
             }
         }
 
-        // If no matching version, default to v5.0 if client supports >= 5.0
+        // If no matching version, default to v4.4 for broad driver compatibility
         if agreed_version == [0, 0, 0, 0] {
-            agreed_version = BOLT_V5_0;
+            agreed_version = [0, 0, 4, 4];
         }
 
         self.stream.write_all(&agreed_version).await?;
@@ -152,13 +166,14 @@ impl BoltSession {
                 let mut meta = HashMap::new();
                 meta.insert(
                     "server".to_string(),
-                    PackValue::String("h2database-rust/0.1.0".to_string()),
+                    PackValue::String("Neo4j/5.0.0".to_string()),
                 );
                 meta.insert(
                     "connection_id".to_string(),
                     PackValue::String(self.session_id.clone()),
                 );
                 meta.insert("hints".to_string(), PackValue::Map(HashMap::new()));
+                meta.insert("configuration_hints".to_string(), PackValue::Map(HashMap::new()));
                 self.send_success(meta).await?;
                 Ok(true)
             }
@@ -296,6 +311,39 @@ impl BoltSession {
             0x0F => {
                 self.last_result = None;
                 self.send_success(HashMap::new()).await?;
+                Ok(true)
+            }
+
+            // TELEMETRY (0x54)
+            0x54 => {
+                self.send_success(HashMap::new()).await?;
+                Ok(true)
+            }
+
+            // ROUTE (0x66)
+            0x66 => {
+                let mut meta = HashMap::new();
+                let mut rt = HashMap::new();
+                rt.insert("ttl".to_string(), PackValue::Integer(300));
+
+                let make_entry = |role: &str| {
+                    let mut m = HashMap::new();
+                    m.insert("role".to_string(), PackValue::String(role.to_string()));
+                    m.insert(
+                        "addresses".to_string(),
+                        PackValue::List(vec![PackValue::String("127.0.0.1:7687".to_string())]),
+                    );
+                    PackValue::Map(m)
+                };
+
+                let servers = vec![
+                    make_entry("ROUTE"),
+                    make_entry("WRITE"),
+                    make_entry("READ"),
+                ];
+                rt.insert("servers".to_string(), PackValue::List(servers));
+                meta.insert("rt".to_string(), PackValue::Map(rt));
+                self.send_success(meta).await?;
                 Ok(true)
             }
 

@@ -1,0 +1,10 @@
+[package]
+name = "demo-graph-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+h2 = { path = "../../../crates/h2", features = ["server", "bolt"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

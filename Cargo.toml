@@ -15,6 +15,7 @@ members = [
     "demo/007_mq",
     "demo/008_decoupled_aurora",
     "demo/009_spring_boot_mybatis/server",
+    "demo/016_spring_boot_graph_dual_interface/server",
 ]
 resolver = "2"
 

@@ -548,6 +548,19 @@ impl Connection {
         Ok(local_addr)
     }
 
+    #[cfg(feature = "bolt")]
+    /// バックグラウンドで Neo4j 互換 Bolt プロトコルサーバーを起動し、リッスンアドレスを返却
+    pub async fn start_bolt_server(&self, addr: std::net::SocketAddr, graph_name: &str) -> H2Result<std::net::SocketAddr> {
+        let engine = Arc::new(h2_graph::GraphEngine::new(Arc::clone(&self.store), graph_name)?);
+        let server = h2_bolt::BoltServer::bind(&addr.to_string(), engine).await?;
+        let local_addr = server.local_addr()?;
+        tokio::spawn(async move {
+            let (_shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+            let _ = server.run(shutdown_rx).await;
+        });
+        Ok(local_addr)
+    }
+
     pub fn engine(&self) -> &Arc<SQLEngine> {
         &self.engine
     }

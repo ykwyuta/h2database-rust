@@ -10,6 +10,8 @@ h2-types = { path = "../h2-types" }
 h2-mvstore = { path = "../h2-mvstore" }
 h2-sql = { path = "../h2-sql" }
 h2-server = { path = "../h2-server", optional = true }
+h2-graph = { path = "../h2-graph", optional = true }
+h2-bolt = { path = "../h2-bolt", optional = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
@@ -20,8 +22,9 @@ uuid = { workspace = true }
 
 
 [features]
-default = ["server", "async"]
+default = ["server", "bolt", "async"]
 server = ["dep:h2-server"]
+bolt = ["dep:h2-bolt", "dep:h2-graph"]
 async = []
 
 [dev-dependencies]

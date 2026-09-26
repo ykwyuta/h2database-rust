@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: demo-spring-boot-graph-dual-interface
+
+  datasource:
+    # Interface 2: PostgreSQL 互換ワイヤプロトコル (SQL / JDBC)
+    url: jdbc:postgresql://localhost:5432/company_db?preferQueryMode=simple
+    username: postgres
+    password: ""
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: HikariPool-SQL-Graph
+      maximum-pool-size: 5
+      minimum-idle: 1
+      connection-timeout: 3000
+      connection-test-query: SELECT 1
+
+h2:
+  graph:
+    # Interface 1: Neo4j 互換 Bolt プロトコル (Cypher / Bolt)
+    bolt-uri: bolt://localhost:7687
+    graph-name: company
+
+logging:
+  level:
+    root: INFO
+    com.example.graph: INFO
+    org.neo4j.driver: WARN

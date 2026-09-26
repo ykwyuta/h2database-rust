@@ -23,6 +23,7 @@
 | [**demo/013 専用CLI: トランザクショナルMQ**](./013_cli_transactional_mq/README.md) | 専用CLI・ネイティブMQ | `h2-cli`, `QUEUE TABLE`, アトミックロールバック | 専用 CLI から直接実行する `CREATE QUEUE TABLE`、アトミックコミット＆ロールバック（Outbox不要の実証）、Kafka風オフセットシーク再生、安全ガード実演デモ |
 | [**demo/014 専用CLI: ユーザー認証・アクセス元制限・テーブル権限管理**](./014_cli_auth_and_permissions/README.md) | 専用CLI・セキュリティ | `h2-cli`, DCL, 認証, ホスト制限, 権限管理 | 専用 CLI から実行する ユーザー作成（CREATE USER）、パスワード認証、ホストIP/CIDR制限、テーブル単位の権限付与・剥奪（GRANT/REVOKE SELECT/INSERT/UPDATE/DELETE）、権限昇格拒否デモ |
 | [**demo/015 Spring Boot & JMS: JmsTemplate & @JmsListener**](./015_spring_boot_jms_template_and_listener/README.md) | Spring JMS パターン集 | Spring Boot 3.4, Spring JMS, JmsTemplate, @JmsListener, @SendTo | Spring JMS の標準機能（`JmsTemplate.convertAndSend`、`receiveAndConvert`、`@JmsListener` 非同期購読、`@SendTo` による自動返信 RPC、`@Header` プロパティ注入、`@Transactional` アトミックロールバック）を網羅したデモ |
+| [**demo/016 Spring Boot グラフDB デュアルIF**](./016_spring_boot_graph_dual_interface/README.md) | グラフDB (Bolt & SQL/JDBC) | Spring Boot 3.4, `neo4j-java-driver`, `JdbcTemplate` | 公式 Neo4j Java Driver (Bolt 7687) 経由の Cypher 操作と、PostgreSQL JDBC (PGWire 5432) 経由の仮想グラフテーブル・テーブル値関数（CYPHER TVF）によるハイブリッド JOIN を実演するデモ |
 
 ---
 
@@ -76,4 +77,8 @@ cargo run -p h2-cli -- -f demo/014_cli_auth_and_permissions/script.sql
 # 15. Spring Boot & JMS (JmsTemplate & @JmsListener パターン集) デモの実行
 # (別ターミナルで cargo run -p demo-spring-boot-server を起動後)
 cd demo/015_spring_boot_jms_template_and_listener && run_demo.bat  # または mvn spring-boot:run
+
+# 16. Spring Boot グラフDB デュアルインターフェース (Bolt & SQL/JDBC) デモの実行
+# (別ターミナルで cargo run -p demo-graph-server を起動後)
+cd demo/016_spring_boot_graph_dual_interface && run_demo.bat  # または mvn spring-boot:run
 ```
