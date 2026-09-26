@@ -470,3 +470,94 @@ fn test_iceberg_v2_mor_position_deletes() {
 
     let _ = fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn test_iceberg_compaction_and_vacuum() {
+    let tmp_dir = std::env::temp_dir().join(format!("h2_iceberg_test_compact_{}", uuid::Uuid::new_v4()));
+    let loc = tmp_dir.to_string_lossy().to_string().replace('\\', "/");
+
+    let conn = Connection::open_in_memory().unwrap();
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE compact_lake (
+            id BIGINT PRIMARY KEY,
+            name VARCHAR,
+            score BIGINT
+        ) STORED AS ICEBERG
+        LOCATION '{}';",
+        loc
+    );
+    conn.execute(&ddl).unwrap();
+
+    // バッチ 1 挿入 (データファイル 1)
+    conn.execute("INSERT INTO compact_lake VALUES (1, 'Alice', 90), (2, 'Bob', 80);").unwrap();
+
+    // バッチ 2 挿入 (データファイル 2)
+    conn.execute("INSERT INTO compact_lake VALUES (3, 'Charlie', 70), (4, 'David', 60);").unwrap();
+
+    // 削除実行 (Delete ファイル 1 生成)
+    let del_cnt = conn.execute("DELETE FROM compact_lake WHERE id = 2;").unwrap();
+    assert_eq!(del_cnt, 1);
+
+    // コンパクション前のファイル状態確認 (2データファイル + 1削除ファイル = 3ファイル)
+    let files_before = conn.query("SELECT file_path, record_count FROM iceberg_files('compact_lake');").unwrap();
+    assert_eq!(files_before.len(), 3);
+
+    // MoR 読み出し確認 (id = 2 が除外されて 3件)
+    let rows_before = conn.query("SELECT id, name FROM compact_lake ORDER BY id;").unwrap();
+    assert_eq!(rows_before.len(), 3);
+    assert_eq!(rows_before[0].get(0), Some(&Value::BigInt(1)));
+    assert_eq!(rows_before[1].get(0), Some(&Value::BigInt(3)));
+    assert_eq!(rows_before[2].get(0), Some(&Value::BigInt(4)));
+
+    // 1. テーブル関数 iceberg_compact による明示的コンパクション実行
+    let compact_res = conn.query("SELECT table_name, compacted, files_before, files_after, total_records, delete_files_removed FROM iceberg_compact('compact_lake');").unwrap();
+    assert_eq!(compact_res.len(), 1);
+    assert_eq!(compact_res[0].get(0), Some(&Value::String("compact_lake".to_string())));
+    assert_eq!(compact_res[0].get(1), Some(&Value::Boolean(true)));
+    assert_eq!(compact_res[0].get(2), Some(&Value::BigInt(2))); // 2 data files before
+    assert_eq!(compact_res[0].get(3), Some(&Value::BigInt(1))); // 1 compacted data file
+    assert_eq!(compact_res[0].get(4), Some(&Value::BigInt(3))); // 3 surviving records
+    assert_eq!(compact_res[0].get(5), Some(&Value::BigInt(1))); // 1 delete file removed
+
+    // コンパクション後のスナップショット検証 (operation = 'replace')
+    let snaps = conn.query("SELECT operation, total_records FROM iceberg_snapshots('compact_lake') ORDER BY timestamp_ms;").unwrap();
+    assert_eq!(snaps.len(), 4); // append -> append -> delete -> replace
+    let latest_snap = snaps.last().unwrap();
+    assert_eq!(latest_snap.get(0), Some(&Value::String("replace".to_string())));
+    assert_eq!(latest_snap.get(1), Some(&Value::BigInt(3)));
+
+    // コンパクション後のアクティブファイル確認 (1ファイルのみ)
+    let files_after = conn.query("SELECT file_path, record_count FROM iceberg_files('compact_lake');").unwrap();
+    assert_eq!(files_after.len(), 1);
+    assert_eq!(files_after[0].get(1), Some(&Value::BigInt(3)));
+
+    // コンパクション後のクエリ検証 (3件が正常に読み出せる)
+    let rows_after = conn.query("SELECT id, name, score FROM compact_lake ORDER BY id;").unwrap();
+    assert_eq!(rows_after.len(), 3);
+    assert_eq!(rows_after[0].get(0), Some(&Value::BigInt(1)));
+    assert_eq!(rows_after[0].get(1), Some(&Value::String("Alice".to_string())));
+    assert_eq!(rows_after[1].get(0), Some(&Value::BigInt(3)));
+    assert_eq!(rows_after[2].get(0), Some(&Value::BigInt(4)));
+
+    // 2. VACUUM コマンドの検証 (既に最適化済みのためスキップ / 再コンパクション不要)
+    conn.execute("VACUUM compact_lake;").unwrap();
+    let files_after_vacuum = conn.query("SELECT file_path FROM iceberg_files('compact_lake');").unwrap();
+    assert_eq!(files_after_vacuum.len(), 1);
+
+    // 新たなデータ追加と VACUUM によるコンパクションの検証
+    conn.execute("INSERT INTO compact_lake VALUES (5, 'Eve', 95);").unwrap();
+    let files_with_new_data = conn.query("SELECT file_path FROM iceberg_files('compact_lake');").unwrap();
+    assert_eq!(files_with_new_data.len(), 2);
+
+    conn.execute("VACUUM compact_lake;").unwrap();
+    let files_after_second_vacuum = conn.query("SELECT file_path, record_count FROM iceberg_files('compact_lake');").unwrap();
+    assert_eq!(files_after_second_vacuum.len(), 1);
+    assert_eq!(files_after_second_vacuum[0].get(1), Some(&Value::BigInt(4)));
+
+    let final_rows = conn.query("SELECT COUNT(*) FROM compact_lake;").unwrap();
+    assert_eq!(final_rows[0].get(0), Some(&Value::BigInt(4)));
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+

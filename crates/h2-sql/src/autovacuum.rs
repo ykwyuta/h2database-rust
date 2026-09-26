@@ -17,6 +17,7 @@ pub struct AutoVacuumConfig {
     pub vacuum_scale_factor: f64,  // デフォルト 0.2 (20%)
     pub analyze_threshold: u64,    // デフォルト 50
     pub analyze_scale_factor: f64, // デフォルト 0.1 (10%)
+    pub iceberg_compaction_file_threshold: usize, // デフォルト 10
     pub enabled: bool,             // デフォルト true
 }
 
@@ -27,6 +28,7 @@ impl Default for AutoVacuumConfig {
             vacuum_scale_factor: 0.2,
             analyze_threshold: 50,
             analyze_scale_factor: 0.1,
+            iceberg_compaction_file_threshold: 10,
             enabled: true,
         }
     }
@@ -127,7 +129,54 @@ impl AutoVacuumCoordinator {
         modified as f64 >= threshold
     }
 
-    /// 指定テーブルに対して必要に応じ AutoVacuum / AutoAnalyze を実行
+    /// Iceberg テーブルのコンパクション要否判定
+    pub fn needs_iceberg_compaction(&self, table_def: &crate::catalog::TableDef) -> bool {
+        let cfg = self.config.read();
+        if !cfg.enabled || !table_def.is_iceberg {
+            return false;
+        }
+        let act = self.get_or_create_activity(&table_def.name);
+        let dead = act.dead_tuple_count.load(Ordering::SeqCst);
+        let current_rows = table_def.approx_row_count.max(1) as u64;
+        let dead_threshold = cfg.vacuum_threshold as f64 + (cfg.vacuum_scale_factor * current_rows as f64);
+
+        let location = match table_def.iceberg_location.as_deref() {
+            Some(loc) => loc,
+            None => return false,
+        };
+        if let Ok((_ver, meta)) = crate::iceberg::get_latest_metadata(location) {
+            if let Some(snap_id) = meta.current_snapshot_id {
+                if let Some(snap) = meta.snapshots.iter().find(|s| s.snapshot_id == snap_id) {
+                    if let Ok(m_list) = crate::iceberg::read_manifest_list(location, &snap.manifest_list) {
+                        let mut data_count = 0;
+                        let mut delete_count = 0;
+                        for me in m_list {
+                            if let Ok(entries) = crate::iceberg::read_manifest_file(location, &me.manifest_path) {
+                                for e in entries {
+                                    if e.status != 2 {
+                                        if e.data_file.content == 1 || e.data_file.content == 2 {
+                                            delete_count += 1;
+                                        } else {
+                                            data_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if data_count >= cfg.iceberg_compaction_file_threshold {
+                            return true;
+                        }
+                        if delete_count > 0 && dead as f64 >= dead_threshold {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// 指定テーブルに対して必要に応じ AutoVacuum / AutoAnalyze / Iceberg Compaction を実行
     pub fn run_maintenance_for_table(
         &self,
         tx_store: &Arc<TransactionStore>,
@@ -138,6 +187,21 @@ impl AutoVacuumCoordinator {
             Some(t) => t,
             None => return Ok((false, false)),
         };
+
+        if table_def.is_iceberg {
+            if self.needs_iceberg_compaction(&table_def) {
+                let res = crate::iceberg::compact_iceberg_table(&table_def)?;
+                let act = self.get_or_create_activity(table_name);
+                let now_millis = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                act.dead_tuple_count.store(0, Ordering::SeqCst);
+                act.last_vacuum_time.store(now_millis, Ordering::SeqCst);
+                return Ok((res.compacted, false));
+            }
+            return Ok((false, false));
+        }
 
         let current_rows = table_def
             .stats

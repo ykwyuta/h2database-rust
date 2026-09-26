@@ -504,3 +504,224 @@ pub fn write_iceberg_position_deletes(
     Ok(num_deleted)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionResult {
+    pub table_name: String,
+    pub compacted: bool,
+    pub files_before: u64,
+    pub files_after: u64,
+    pub total_records: u64,
+    pub delete_files_removed: u64,
+}
+
+/// Iceberg テーブルのコンパクション（多数の小ファイルおよび差分削除ファイルを統合）
+pub fn compact_iceberg_table(table_def: &TableDef) -> H2Result<CompactionResult> {
+    let location = table_def.iceberg_location.as_deref().ok_or_else(|| {
+        H2Error::Execution(format!("Iceberg table '{}' has no location defined", table_def.name))
+    })?;
+
+    if !Path::new(location).join("metadata").exists() {
+        return Ok(CompactionResult {
+            table_name: table_def.name.clone(),
+            compacted: false,
+            files_before: 0,
+            files_after: 0,
+            total_records: 0,
+            delete_files_removed: 0,
+        });
+    }
+
+    let (latest_ver, mut metadata) = get_latest_metadata(location)?;
+    let snapshot_id = match metadata.current_snapshot_id {
+        Some(id) => id,
+        None => {
+            return Ok(CompactionResult {
+                table_name: table_def.name.clone(),
+                compacted: false,
+                files_before: 0,
+                files_after: 0,
+                total_records: 0,
+                delete_files_removed: 0,
+            });
+        }
+    };
+
+    let snapshot = match metadata.snapshots.iter().find(|s| s.snapshot_id == snapshot_id) {
+        Some(s) => s,
+        None => {
+            return Ok(CompactionResult {
+                table_name: table_def.name.clone(),
+                compacted: false,
+                files_before: 0,
+                files_after: 0,
+                total_records: 0,
+                delete_files_removed: 0,
+            });
+        }
+    };
+
+    let manifest_list = read_manifest_list(location, &snapshot.manifest_list)?;
+    let mut old_data_files: Vec<DataFile> = Vec::new();
+    let mut old_delete_files: Vec<DataFile> = Vec::new();
+
+    for m_entry in manifest_list {
+        let manifest_entries = read_manifest_file(location, &m_entry.manifest_path)?;
+        for entry in manifest_entries {
+            if entry.status != 2 {
+                if entry.data_file.content == 1 || entry.data_file.content == 2 {
+                    old_delete_files.push(entry.data_file);
+                } else {
+                    old_data_files.push(entry.data_file);
+                }
+            }
+        }
+    }
+
+    let files_before = old_data_files.len() as u64;
+    let delete_files_count = old_delete_files.len() as u64;
+
+    // コンパクションの要否判定:
+    // 削除ファイルが存在する、またはデータファイルが2つ以上存在する場合にコンパクションを実行
+    if files_before <= 1 && delete_files_count == 0 {
+        let total_rec = old_data_files.iter().map(|d| d.record_count).sum();
+        return Ok(CompactionResult {
+            table_name: table_def.name.clone(),
+            compacted: false,
+            files_before,
+            files_after: files_before,
+            total_records: total_rec,
+            delete_files_removed: 0,
+        });
+    }
+
+    // 1. 現スナップショットの有効レコードを MoR で読み出し（削除位置・削除キー適用済み）
+    let surviving_rows = super::reader::read_iceberg_table_rows(table_def, None, Some(snapshot_id))?;
+    let total_records = surviving_rows.len() as u64;
+
+    // 2. 最適化された Parquet データファイル（単一またはパーティション別）を書き出し
+    let base_path = Path::new(location);
+    let data_dir = base_path.join("data");
+    fs::create_dir_all(&data_dir)
+        .map_err(|e| H2Error::Execution(format!("Failed to create data dir {:?}: {}", data_dir, e)))?;
+
+    let arrow_schema = crate::vectorized::create_arrow_schema(&table_def.columns);
+    let is_partitioned = !table_def.iceberg_partition_fields.is_empty();
+
+    let grouped_rows: Vec<(HashMap<String, String>, String, Vec<Row>)> = if is_partitioned {
+        let mut map: HashMap<Vec<(String, String)>, Vec<Row>> = HashMap::new();
+        for row in &surviving_rows {
+            let mut key = Vec::new();
+            for pf in &table_def.iceberg_partition_fields {
+                let col_idx = (pf.source_id - 1) as usize;
+                let val = row.get(col_idx).unwrap_or(&Value::Null);
+                let transformed = apply_partition_transform(&pf.transform, val);
+                key.push((pf.name.clone(), transformed));
+            }
+            map.entry(key).or_default().push(row.clone());
+        }
+        map.into_iter().map(|(k_vec, r_vec)| {
+            let rel_dir = k_vec.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("/");
+            let part_map: HashMap<String, String> = k_vec.into_iter().collect();
+            (part_map, rel_dir, r_vec)
+        }).collect()
+    } else {
+        vec![(HashMap::new(), String::new(), surviving_rows.clone())]
+    };
+
+    let mut new_data_files = Vec::new();
+    for (part_map, rel_dir, g_rows) in grouped_rows {
+        if !g_rows.is_empty() {
+            let df = write_parquet_data_file(&data_dir, &rel_dir, part_map, table_def, &g_rows, &arrow_schema)?;
+            new_data_files.push(df);
+        }
+    }
+
+    let files_after = new_data_files.len() as u64;
+
+    // 3. マニフェストエントリ構築
+    let now_ms = Utc::now().timestamp_millis();
+    let new_snapshot_id = now_ms * 1000 + (now_ms % 997);
+    let new_seq = metadata.last_sequence_number + 1;
+
+    let mut new_manifest_entries = Vec::new();
+    for o_df in old_data_files {
+        new_manifest_entries.push(ManifestEntry {
+            status: 2, // DELETED
+            snapshot_id: new_snapshot_id,
+            data_file: o_df,
+        });
+    }
+    for o_del in old_delete_files {
+        new_manifest_entries.push(ManifestEntry {
+            status: 2, // DELETED
+            snapshot_id: new_snapshot_id,
+            data_file: o_del,
+        });
+    }
+    for n_df in new_data_files {
+        new_manifest_entries.push(ManifestEntry {
+            status: 1, // ADDED
+            snapshot_id: new_snapshot_id,
+            data_file: n_df,
+        });
+    }
+
+    // 4. マニフェストファイル書き出し
+    let manifest_uuid = Uuid::new_v4().to_string();
+    let manifest_file_name = format!("m-compact-{}.json", manifest_uuid);
+    let manifest_rel_path = write_manifest_file(location, &manifest_file_name, &new_manifest_entries)?;
+
+    // 5. マニフェストリスト書き出し
+    let manifest_list_file_name = format!("snap-compact-{}.json", new_snapshot_id);
+    let manifest_list_entries = vec![ManifestListEntry {
+        manifest_path: manifest_rel_path,
+        manifest_length: 1024,
+        partition_spec_id: 0,
+        added_snapshot_id: new_snapshot_id,
+        added_data_files_count: files_after as u32,
+        existing_data_files_count: 0,
+        deleted_data_files_count: (files_before + delete_files_count) as u32,
+        partitions: vec![],
+    }];
+    let manifest_list_rel_path = write_manifest_list(location, &manifest_list_file_name, &manifest_list_entries)?;
+
+    // 6. Snapshot コミット (operation: "replace")
+    let mut summary = HashMap::new();
+    summary.insert("operation".to_string(), "replace".to_string());
+    summary.insert("deleted-data-files".to_string(), files_before.to_string());
+    summary.insert("removed-delete-files".to_string(), delete_files_count.to_string());
+    summary.insert("added-data-files".to_string(), files_after.to_string());
+    summary.insert("total-records".to_string(), total_records.to_string());
+
+    let new_snapshot = Snapshot {
+        snapshot_id: new_snapshot_id,
+        parent_snapshot_id: metadata.current_snapshot_id,
+        sequence_number: new_seq,
+        timestamp_ms: now_ms,
+        manifest_list: manifest_list_rel_path,
+        summary,
+    };
+
+    metadata.last_sequence_number = new_seq;
+    metadata.last_updated_ms = now_ms;
+    metadata.current_snapshot_id = Some(new_snapshot_id);
+    metadata.snapshots.push(new_snapshot);
+    metadata.snapshot_log.push(SnapshotLogEntry {
+        timestamp_ms: now_ms,
+        snapshot_id: new_snapshot_id,
+    });
+
+    let next_ver = latest_ver + 1;
+    write_table_metadata(location, next_ver, &metadata)?;
+    write_version_hint(location, next_ver)?;
+
+    Ok(CompactionResult {
+        table_name: table_def.name.clone(),
+        compacted: true,
+        files_before,
+        files_after,
+        total_records,
+        delete_files_removed: delete_files_count,
+    })
+}
+

@@ -278,10 +278,18 @@ impl SQLEngine {
             let table_name = parts[1].trim_matches(';').trim_matches('"').trim_matches('\'');
             let table_def = self.catalog.get_table(table_name)
                 .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+            if table_def.is_iceberg {
+                let _res = crate::iceberg::compact_iceberg_table(&table_def)?;
+                return Ok(ExecutionResult::Ddl);
+            }
             let map_name = table_def.map_name();
             self.tx_store.vacuum_map(&map_name)?;
         } else {
             for table in self.catalog.all_tables() {
+                if table.is_iceberg {
+                    let _ = crate::iceberg::compact_iceberg_table(&table);
+                    continue;
+                }
                 let map_name = table.map_name();
                 self.tx_store.vacuum_map(&map_name)?;
             }

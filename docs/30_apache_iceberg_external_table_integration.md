@@ -360,7 +360,51 @@ graph TD
 
 ---
 
-## 10. テスト検証方針
+## 10. コンパクション（Compaction & Copy-on-Write 化）
+
+### 10.1 概要と目的
+Iceberg の Merge-on-Read（MoR）モデルでは、データの挿入や差分削除（Position Deletes）を繰り返すにつれて、多数の小さなデータファイルや削除ファイルが蓄積します。これにより、クエリ走査時のオーバーヘッド（ファイルオープンの回数増加、削除位置の突合コスト）が増大します。
+**コンパクション（Compaction / `rewrite_data_files`）** は、これらのファイルを単一またはパーティションごとの最適化された Parquet データファイルに再編成（マージ）し、削除ファイルを完全に解消する処理です。
+
+### 10.2 コンパクションの処理フロー
+```mermaid
+graph TD
+    Trigger[コンパクション起動: 手動 VACUUM / CALL または バックグラウンド] --> ReadActive[現行スナップショットの有効行を MoR 走査]
+    ReadActive --> Rewrite[削除済み行を除外した最適化 Parquet ファイルを再書き込み]
+    
+    Rewrite --> BuildManifest[新マニフェスト生成]
+    BuildManifest --> MarkOldDeleted[旧データファイル & 旧削除ファイルを status = 2: DELETED]
+    BuildManifest --> MarkNewAdded[新コンパクションファイルを status = 1: ADDED]
+    
+    BuildManifest --> CommitSnapshot[スナップショット コミット: operation = 'replace']
+    CommitSnapshot --> AtomicUpdate[v<N+1>.metadata.json & version-hint.text をアトミック更新]
+```
+
+1. **MoR 走査**: 最新スナップショットの全データファイルと削除ファイルを突合し、生存している有効行のみを抽出。
+2. **Parquet 再生成**: パーティション構成を維持しながら、結合されたクリーンな Parquet ファイル（`00000-compacted-<uuid>.parquet`）を書き出し、列統計（Min/Max/Null Count）を再計算。
+3. **メタデータ差分コミット**:
+   - 旧データファイルおよび旧削除ファイルを `status = 2 (DELETED)` にマーク。
+   - 新規 Parquet ファイルを `status = 1 (ADDED)` にマーク。
+   - スナップショットの `operation` に Iceberg 標準の `"replace"` を記録（`deleted-data-files`, `removed-delete-files`, `added-data-files`）。
+   - 新メタデータ `v<N+1>.metadata.json` および `version-hint.text` をアトミックに更新。
+
+### 10.3 実行インターフェース
+1. **明示的テーブル関数**:
+   ```sql
+   SELECT * FROM iceberg_compact('lake_table');
+   -- 出力列: table_name, compacted, files_before, files_after, total_records, delete_files_removed
+   ```
+2. **標準 SQL コマンド**:
+   ```sql
+   VACUUM lake_table;
+   ```
+3. **バックグラウンド自律実行（Auto-Compaction）**:
+   - `AutoVacuumCoordinator` のメンテナンスタスクに統合。
+   - 削除ファイルが存在する場合、またはデータファイルが閾値（複数ファイル）を超えた場合に、自動的にバックグラウンドでコンパクションを実行。
+
+---
+
+## 11. テスト検証方針
 
 | テストケース | 対象シナリオ | 検証項目 |
 |---|---|---|
@@ -373,13 +417,15 @@ graph TD
 | `test_iceberg_join_with_relational_table` | Iceberg 外部テーブル × 内部 MVCC テーブル | レイクハウス外部データと RDB 内部トランザクションテーブルの透過的結合 |
 | `test_iceberg_partitioning_transforms_and_pruning` | パーティショニング（Identity/Year/Bucket/Truncate） | パーティション階層ディレクトリの生成、およびパーティションプルーニングの動作検証 |
 | `test_iceberg_v2_mor_position_deletes` | Iceberg v2 Position Deletes & MoR | `DELETE FROM` による差分削除ファイル生成と、SELECT 走査時の Merge-on-Read 正確性 |
+| `test_iceberg_compaction_and_vacuum` | コンパクション（`iceberg_compact` / `VACUUM`） | 複数データファイルと削除ファイルを単一 Parquet に統合し、削除ファイル解消とクエリ整合性を検証 |
 
 ---
 
-## 11. 今後の拡張性（Roadmap）
+## 12. 今後の拡張性（Roadmap）
 
 1. **リモートオブジェクトストレージ統合（AWS S3 / GCP GCS / Azure Blob）**:
    `s3://` や `gcs://` などのクラウドストレージ URI からの直接読み書き。
-2. **バックグラウンドコンパクション（Compaction）**:
-   多数の小さなデータファイルおよび Position Delete ファイルを単一の最適化 Parquet ファイルにマージ（Copy-on-Write 化）。
+2. **非同期並列コンパクション（Parallel Compaction Worker）**:
+   大規模データレイク向けに、複数パーティションを並行ワーカースレッドで同時にコンパクション。
+
 

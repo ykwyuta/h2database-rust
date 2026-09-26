@@ -409,6 +409,7 @@ mod tests {
             vacuum_scale_factor: 0.0,
             analyze_threshold: 8,
             analyze_scale_factor: 0.0,
+            iceberg_compaction_file_threshold: 10,
             enabled: true,
         });
 

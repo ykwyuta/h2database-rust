@@ -236,8 +236,9 @@ impl SQLEngine {
         let is_snapshots = func_name.eq_ignore_ascii_case("iceberg_snapshots");
         let is_files = func_name.eq_ignore_ascii_case("iceberg_files");
         let is_scan = func_name.eq_ignore_ascii_case("iceberg_scan");
+        let is_compact = func_name.eq_ignore_ascii_case("iceberg_compact");
 
-        if !is_snapshots && !is_files && !is_scan {
+        if !is_snapshots && !is_files && !is_scan && !is_compact {
             return Ok(None);
         }
 
@@ -311,8 +312,7 @@ impl SQLEngine {
             );
             let rows = crate::iceberg::get_iceberg_files(location)?;
             Ok(Some((t_def, rows, Some(table_alias_name))))
-        } else {
-            // is_scan
+        } else if is_scan {
             let mut snapshot_id = None;
             if func_args.len() >= 2 {
                 if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) = &func_args[1] {
@@ -330,6 +330,28 @@ impl SQLEngine {
             let rows = crate::iceberg::read_iceberg_table_rows(&target_def, None, snapshot_id)?;
             let mut t_def = target_def;
             t_def.name = table_alias_name.clone();
+            Ok(Some((t_def, rows, Some(table_alias_name))))
+        } else {
+            let res = crate::iceberg::compact_iceberg_table(&target_def)?;
+            let t_def = TableDef::new(
+                table_alias_name.clone(),
+                vec![
+                    ColumnDef::new("table_name", h2_types::DataType::VarChar(None), false, true),
+                    ColumnDef::new("compacted", h2_types::DataType::Boolean, false, false),
+                    ColumnDef::new("files_before", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("files_after", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("total_records", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("delete_files_removed", h2_types::DataType::BigInt, false, false),
+                ],
+            );
+            let rows = vec![Row::new(vec![
+                Value::String(res.table_name),
+                Value::Boolean(res.compacted),
+                Value::BigInt(res.files_before as i64),
+                Value::BigInt(res.files_after as i64),
+                Value::BigInt(res.total_records as i64),
+                Value::BigInt(res.delete_files_removed as i64),
+            ])];
             Ok(Some((t_def, rows, Some(table_alias_name))))
         }
     }

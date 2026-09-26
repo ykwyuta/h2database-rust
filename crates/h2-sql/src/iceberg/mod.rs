@@ -7,7 +7,7 @@ pub use metadata::{
     DataFile, ManifestEntry, ManifestListEntry, PartitionField, PartitionSpec, Snapshot, TableMetadata,
 };
 pub use reader::read_iceberg_table_rows;
-pub use writer::{write_iceberg_position_deletes, write_iceberg_table_rows};
+pub use writer::{compact_iceberg_table, write_iceberg_position_deletes, write_iceberg_table_rows, CompactionResult};
 
 use h2_types::{H2Result, Value};
 use crate::row::Row;
