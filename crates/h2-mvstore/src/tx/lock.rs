@@ -5,11 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+struct WaitState {
+    wait_for: HashMap<u64, u64>,
+    wait_cells: HashMap<u64, (usize, Arc<WaitCell>)>,
+}
+
 /// トランザクション間のロック待機関係（Wait-For Graph）およびデッドロック検出器
 pub struct LockManager {
-    /// waiter_tx_id -> holder_tx_id
-    wait_for: Mutex<HashMap<u64, u64>>,
-    wait_cells: Mutex<HashMap<u64, Arc<WaitCell>>>,
+    state: Mutex<WaitState>,
     stripes: Vec<Mutex<()>>,
 }
 
@@ -26,8 +29,10 @@ impl LockManager {
             stripes.push(Mutex::new(()));
         }
         Self {
-            wait_for: Mutex::new(HashMap::new()),
-            wait_cells: Mutex::new(HashMap::new()),
+            state: Mutex::new(WaitState {
+                wait_for: HashMap::new(),
+                wait_cells: HashMap::new(),
+            }),
             stripes,
         }
     }
@@ -54,29 +59,40 @@ impl LockManager {
 
     /// 待機エッジを追加。デッドロック（サイクル）を検知した場合は Err(H2Error::LockConflict) を返す
     pub fn register_wait(&self, waiter: u64, holder: u64) -> H2Result<()> {
-        let mut wait_for = self.wait_for.lock();
-        if Self::check_cycle(&wait_for, waiter, holder) {
+        let mut state = self.state.lock();
+        if Self::check_cycle(&state.wait_for, waiter, holder) {
             return Err(H2Error::LockConflict(format!(
                 "Deadlock detected: transaction {} waiting on transaction {}, cancelled to break cycle",
                 waiter, holder
             )));
         }
-        wait_for.insert(waiter, holder);
-        self.wait_cells.lock().entry(holder).or_insert_with(|| {
-            Arc::new(WaitCell {
-                released: Mutex::new(false),
-                condvar: Condvar::new(),
-            })
-        });
+        state.wait_for.insert(waiter, holder);
+        state
+            .wait_cells
+            .entry(holder)
+            .and_modify(|(count, _)| *count += 1)
+            .or_insert_with(|| {
+                (
+                    1,
+                    Arc::new(WaitCell {
+                        released: Mutex::new(false),
+                        condvar: Condvar::new(),
+                    }),
+                )
+            });
         Ok(())
     }
 
     /// 待機エッジを削除
     pub fn unregister_wait(&self, waiter: u64) {
-        let mut wait_for = self.wait_for.lock();
-        if let Some(holder) = wait_for.remove(&waiter) {
-            if !wait_for.values().any(|&other| other == holder) {
-                self.wait_cells.lock().remove(&holder);
+        let mut state = self.state.lock();
+        if let Some(holder) = state.wait_for.remove(&waiter) {
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = state.wait_cells.entry(holder) {
+                let (count, _) = entry.get_mut();
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    entry.remove();
+                }
             }
         }
     }
@@ -106,7 +122,11 @@ impl LockManager {
 
     /// ロック解放を待機（Condvar）
     pub fn wait_timeout(&self, holder: u64, timeout: Duration) -> bool {
-        let Some(cell) = self.wait_cells.lock().get(&holder).cloned() else {
+        let cell = {
+            let state = self.state.lock();
+            state.wait_cells.get(&holder).map(|(_, cell)| Arc::clone(cell))
+        };
+        let Some(cell) = cell else {
             return true;
         };
         let mut released = cell.released.lock();
@@ -127,7 +147,11 @@ impl LockManager {
 
     /// 指定したトランザクションを待つスレッドだけに通知する。
     pub fn notify_lock_released(&self, holder: u64) {
-        if let Some(cell) = self.wait_cells.lock().remove(&holder) {
+        let cell = {
+            let mut state = self.state.lock();
+            state.wait_cells.remove(&holder).map(|(_, cell)| cell)
+        };
+        if let Some(cell) = cell {
             *cell.released.lock() = true;
             cell.condvar.notify_all();
         }

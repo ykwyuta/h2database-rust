@@ -24,7 +24,7 @@ target/
 *~
 *.swp
 *.swo
-benchmarks/
+benchmarks/results/
 
 # OS generated files
 .DS_Store
@@ -47,3 +47,5 @@ Thumbs.db
 
 # Project specific reference data
 reference/
+
+

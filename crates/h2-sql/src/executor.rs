@@ -2693,6 +2693,64 @@ fn apply_join(
 
                 let map_name = table_def.map_name();
                 let indexes = self.catalog.get_table_indexes(&table_name);
+                let collect_returning = returning.as_ref().is_some_and(|items| !items.is_empty());
+                let has_fk = !table_def.foreign_keys.is_empty();
+                let has_referencing = !self.catalog.get_tables_referencing(&table_name).is_empty();
+
+                let mut any_idx_col_modified = false;
+                let mut parsed_assignments = Vec::with_capacity(assignments.len());
+                for assignment in &assignments {
+                    let col_name = match &assignment.target {
+                        sqlparser::ast::AssignmentTarget::ColumnName(object_name) => object_name.to_string(),
+                        _ => return Err(H2Error::Execution("Unsupported assignment target".to_string())),
+                    };
+                    let col_idx = table_def.column_index(&col_name).ok_or_else(|| {
+                        H2Error::Execution(format!("Column '{}' not found in table '{}'", col_name, table_name))
+                    })?;
+                    if indexes.iter().any(|idx| idx.columns.iter().any(|c| c.eq_ignore_ascii_case(&col_name))) {
+                        any_idx_col_modified = true;
+                    }
+                    parsed_assignments.push((col_name, col_idx, &assignment.value));
+                }
+
+                // ================= P1 Point Update Fast Path =================
+                // 単一テーブル、主キー/一意等値条件、FROM なし、RETURNING なし、
+                // 非インデックス列変更、外部キーなしの専用超高速更新経路
+                if from_data.is_none() && !collect_returning && !any_idx_col_modified && !has_fk && !has_referencing {
+                    if let Some(ref sel) = selection {
+                        if let Some((col_name, val)) = Self::extract_equality_predicate(sel) {
+                            if let Some(target_idx) = indexes.iter().find(|idx| idx.is_unique && idx.columns.len() == 1 && idx.columns[0].eq_ignore_ascii_case(&col_name)) {
+                                let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                let casted_val = if let Some(c_idx) = table_def.column_index(&col_name) {
+                                    val.cast_to(&table_def.columns[c_idx].data_type).unwrap_or(val.clone())
+                                } else {
+                                    val.clone()
+                                };
+                                let prefix = encode_index_prefix(std::slice::from_ref(&casted_val));
+                                let matched_entries = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                if let Some((k, _)) = matched_entries.first() {
+                                    if let Some((_v, r_id)) = decode_index_key(k) {
+                                        let key_bytes = r_id.to_le_bytes().to_vec();
+                                        if let Some(val_bytes) = tx.get(&map_name, &key_bytes)? {
+                                            let mut row = Row::from_bytes(&val_bytes)?;
+                                            table_def.align_row(&mut row);
+                                            let target_ctx = RowContext::from_table_def(&table_def, target_alias.as_deref());
+                                            for (_col_name, col_idx, val_expr) in &parsed_assignments {
+                                                let new_val = evaluate_expr_context(val_expr, &target_ctx, &row)?;
+                                                let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
+                                                row.values[*col_idx] = casted;
+                                            }
+                                            tx.put(&map_name, key_bytes, row.to_bytes()?)?;
+                                            return Ok(ExecutionResult::Dml { affected_rows: 1 });
+                                        }
+                                    }
+                                }
+                                return Ok(ExecutionResult::Dml { affected_rows: 0 });
+                            }
+                        }
+                    }
+                }
+
                 let entries = if from_data.is_none() {
                     let mut fast_entries = None;
                     if let Some(ref sel) = selection {
@@ -2720,6 +2778,41 @@ fn apply_join(
                                     break;
                                 }
                             }
+                        } else {
+                            // Range Scan プッシュダウン
+                            for target_idx in &indexes {
+                                if target_idx.columns.len() == 1 {
+                                    let col_name = &target_idx.columns[0];
+                                    if let Some((start_bound, end_bound)) = Self::extract_range_predicate(sel, col_name) {
+                                        let idx_map_name = format!("idx_{}_{}", table_def.name.to_lowercase(), target_idx.name.to_lowercase());
+                                        let (b_start, b_end) = Self::convert_value_bounds_to_bytes(&table_def, col_name, start_bound, end_bound);
+                                        let matched = tx.scan_range_visible(
+                                            &idx_map_name,
+                                            match &b_start {
+                                                std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_slice()),
+                                                std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_slice()),
+                                                std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                                            },
+                                            match &b_end {
+                                                std::ops::Bound::Included(b) => std::ops::Bound::Included(b.as_slice()),
+                                                std::ops::Bound::Excluded(b) => std::ops::Bound::Excluded(b.as_slice()),
+                                                std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+                                            },
+                                        )?;
+                                        let mut fetched = Vec::with_capacity(matched.len());
+                                        for (k, _) in matched {
+                                            if let Some((_v, r_id)) = decode_index_key(&k) {
+                                                let key_bytes = r_id.to_le_bytes().to_vec();
+                                                if let Some(val_bytes) = tx.get(&map_name, &key_bytes)? {
+                                                    fetched.push((key_bytes, val_bytes));
+                                                }
+                                            }
+                                        }
+                                        fast_entries = Some(fetched);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
                     if let Some(fe) = fast_entries {
@@ -2732,7 +2825,6 @@ fn apply_join(
                 };
                 let mut affected_rows = 0;
                 let mut updated_rows = Vec::new();
-                let collect_returning = returning.as_ref().is_some_and(|items| !items.is_empty());
                 let mut updated_keys = std::collections::HashSet::new();
                 let target_ctx = RowContext::from_table_def(&table_def, target_alias.as_deref());
 
@@ -2782,56 +2874,56 @@ fn apply_join(
 
                         if matched {
                             let combined_row = matched_combined.unwrap();
-                            let old_row = row.clone();
+                            let old_row = if has_referencing || any_idx_col_modified {
+                                Some(row.clone())
+                            } else {
+                                None
+                            };
 
-                            for assignment in &assignments {
-                                let col_name = match &assignment.target {
-                                    sqlparser::ast::AssignmentTarget::ColumnName(object_name) => object_name.to_string(),
-                                    _ => return Err(H2Error::Execution("Unsupported assignment target".to_string())),
-                                };
-                                let col_idx = table_def.column_index(&col_name).ok_or_else(|| {
-                                    H2Error::Execution(format!("Column '{}' not found in table '{}'", col_name, table_name))
-                                })?;
-                                let new_val = evaluate_expr_context(&assignment.value, &merged_ctx, &combined_row)?;
-                                let casted = new_val.cast_to(&table_def.columns[col_idx].data_type)?;
-                                row.values[col_idx] = casted;
+                            for (_col_name, col_idx, val_expr) in &parsed_assignments {
+                                let new_val = evaluate_expr_context(val_expr, &merged_ctx, &combined_row)?;
+                                let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
+                                row.values[*col_idx] = casted;
                             }
 
-                            // 外部キー連動チェック・処理（親行としての更新）
-                            self.handle_foreign_keys_on_update(tx, &table_name, &old_row, &row)?;
+                            if has_referencing {
+                                self.handle_foreign_keys_on_update(tx, &table_name, old_row.as_ref().unwrap(), &row)?;
+                            }
+                            if has_fk {
+                                self.validate_foreign_keys_for_row(tx, &table_def, &row)?;
+                            }
 
-                            // 外部キー整合性チェック（子行としての更新）
-                            self.validate_foreign_keys_for_row(tx, &table_def, &row)?;
+                            if any_idx_col_modified {
+                                let old_row_ref = old_row.as_ref().unwrap();
+                                for idx in &indexes {
+                                    if let (Some(old_vals), Some(new_vals)) = (
+                                        get_index_values(&table_def, idx, old_row_ref),
+                                        get_index_values(&table_def, idx, &row),
+                                    ) {
+                                        let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                        let has_null = new_vals.iter().any(|v| v.is_null());
 
-                            // インデックス更新
-                            for idx in &indexes {
-                                if let (Some(old_vals), Some(new_vals)) = (
-                                    get_index_values(&table_def, idx, &old_row),
-                                    get_index_values(&table_def, idx, &row),
-                                ) {
-                                    let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
-                                    let has_null = new_vals.iter().any(|v| v.is_null());
-
-                                    if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let prefix = encode_index_prefix(&new_vals);
-                                        let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
-                                        for (k, _) in matched {
-                                            if let Some((v, r_id)) = decode_composite_index_key(&k) {
-                                                if v == new_vals && r_id != row_id {
-                                                    return Err(H2Error::Execution(format!(
-                                                        "Unique constraint violation on index '{}': duplicate value {:?}",
-                                                        idx.name, new_vals
-                                                    )));
+                                        if idx.is_unique && !has_null && old_vals != new_vals {
+                                            let prefix = encode_index_prefix(&new_vals);
+                                            let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                            for (k, _) in matched {
+                                                if let Some((v, r_id)) = decode_composite_index_key(&k) {
+                                                    if v == new_vals && r_id != row_id {
+                                                        return Err(H2Error::Execution(format!(
+                                                            "Unique constraint violation on index '{}': duplicate value {:?}",
+                                                            idx.name, new_vals
+                                                        )));
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
 
-                                    if old_vals != new_vals {
-                                        let old_key = encode_composite_index_key(&old_vals, row_id);
-                                        tx.remove(&idx_map_name, &old_key)?;
-                                        let new_key = encode_composite_index_key(&new_vals, row_id);
-                                        tx.put(&idx_map_name, new_key, vec![])?;
+                                        if old_vals != new_vals {
+                                            let old_key = encode_composite_index_key(&old_vals, row_id);
+                                            tx.remove(&idx_map_name, &old_key)?;
+                                            let new_key = encode_composite_index_key(&new_vals, row_id);
+                                            tx.put(&idx_map_name, new_key, vec![])?;
+                                        }
                                     }
                                 }
                             }
@@ -2854,56 +2946,56 @@ fn apply_join(
                         };
 
                         if matches {
-                            let old_row = row.clone();
+                            let old_row = if has_referencing || any_idx_col_modified {
+                                Some(row.clone())
+                            } else {
+                                None
+                            };
 
-                            for assignment in &assignments {
-                                let col_name = match &assignment.target {
-                                    sqlparser::ast::AssignmentTarget::ColumnName(object_name) => object_name.to_string(),
-                                    _ => return Err(H2Error::Execution("Unsupported assignment target".to_string())),
-                                };
-                                let col_idx = table_def.column_index(&col_name).ok_or_else(|| {
-                                    H2Error::Execution(format!("Column '{}' not found in table '{}'", col_name, table_name))
-                                })?;
-                                let new_val = evaluate_expr_context(&assignment.value, &target_ctx, &row)?;
-                                let casted = new_val.cast_to(&table_def.columns[col_idx].data_type)?;
-                                row.values[col_idx] = casted;
+                            for (_col_name, col_idx, val_expr) in &parsed_assignments {
+                                let new_val = evaluate_expr_context(val_expr, &target_ctx, &row)?;
+                                let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
+                                row.values[*col_idx] = casted;
                             }
 
-                            // 外部キー連動チェック・処理（親行としての更新）
-                            self.handle_foreign_keys_on_update(tx, &table_name, &old_row, &row)?;
+                            if has_referencing {
+                                self.handle_foreign_keys_on_update(tx, &table_name, old_row.as_ref().unwrap(), &row)?;
+                            }
+                            if has_fk {
+                                self.validate_foreign_keys_for_row(tx, &table_def, &row)?;
+                            }
 
-                            // 外部キー整合性チェック（子行としての更新）
-                            self.validate_foreign_keys_for_row(tx, &table_def, &row)?;
+                            if any_idx_col_modified {
+                                let old_row_ref = old_row.as_ref().unwrap();
+                                for idx in &indexes {
+                                    if let (Some(old_vals), Some(new_vals)) = (
+                                        get_index_values(&table_def, idx, old_row_ref),
+                                        get_index_values(&table_def, idx, &row),
+                                    ) {
+                                        let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
+                                        let has_null = new_vals.iter().any(|v| v.is_null());
 
-                            // インデックス更新
-                            for idx in &indexes {
-                                if let (Some(old_vals), Some(new_vals)) = (
-                                    get_index_values(&table_def, idx, &old_row),
-                                    get_index_values(&table_def, idx, &row),
-                                ) {
-                                    let idx_map_name = format!("idx_{}_{}", table_name.to_lowercase(), idx.name.to_lowercase());
-                                    let has_null = new_vals.iter().any(|v| v.is_null());
-
-                                    if idx.is_unique && !has_null && old_vals != new_vals {
-                                        let prefix = encode_index_prefix(&new_vals);
-                                        let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
-                                        for (k, _) in matched {
-                                            if let Some((v, r_id)) = decode_composite_index_key(&k) {
-                                                if v == new_vals && r_id != row_id {
-                                                    return Err(H2Error::Execution(format!(
-                                                        "Unique constraint violation on index '{}': duplicate value {:?}",
-                                                        idx.name, new_vals
-                                                    )));
+                                        if idx.is_unique && !has_null && old_vals != new_vals {
+                                            let prefix = encode_index_prefix(&new_vals);
+                                            let matched = tx.scan_prefix_visible(&idx_map_name, &prefix)?;
+                                            for (k, _) in matched {
+                                                if let Some((v, r_id)) = decode_composite_index_key(&k) {
+                                                    if v == new_vals && r_id != row_id {
+                                                        return Err(H2Error::Execution(format!(
+                                                            "Unique constraint violation on index '{}': duplicate value {:?}",
+                                                            idx.name, new_vals
+                                                        )));
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
 
-                                    if old_vals != new_vals {
-                                        let old_key = encode_composite_index_key(&old_vals, row_id);
-                                        tx.remove(&idx_map_name, &old_key)?;
-                                        let new_key = encode_composite_index_key(&new_vals, row_id);
-                                        tx.put(&idx_map_name, new_key, vec![])?;
+                                        if old_vals != new_vals {
+                                            let old_key = encode_composite_index_key(&old_vals, row_id);
+                                            tx.remove(&idx_map_name, &old_key)?;
+                                            let new_key = encode_composite_index_key(&new_vals, row_id);
+                                            tx.put(&idx_map_name, new_key, vec![])?;
+                                        }
                                     }
                                 }
                             }

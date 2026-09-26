@@ -349,7 +349,13 @@ impl MVStore {
             if self.active_committers.load(Ordering::Relaxed) > 1
                 && self.wal_manager.read().sync_on_commit()
             {
-                std::thread::sleep(Duration::from_micros(50));
+                let spin_start = Instant::now();
+                while spin_start.elapsed() < Duration::from_micros(50) {
+                    std::hint::spin_loop();
+                    if self.active_committers.load(Ordering::Relaxed) <= 1 {
+                        break;
+                    }
+                }
             }
             let mut queue = self.lock_commit_queue();
             let pending = std::mem::take(&mut queue.pending);

@@ -13,11 +13,40 @@ use std::time::{Duration, Instant};
 use h2::{ExecutionResult, MVStore, SQLEngine, Value};
 use h2_server::PgServer;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
+struct SimpleRng(u64);
+
+impl SimpleRng {
+    fn new(seed: u64) -> Self {
+        Self(if seed == 0 { 0x853c49e6748fea9b } else { seed })
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn gen_range(&mut self, min: usize, max: usize) -> usize {
+        if min >= max {
+            return min;
+        }
+        min + (self.next_u64() as usize % (max - min + 1))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Workload {
     Select,
     HotUpdate,
     DistinctUpdate,
+    RandomUpdate,
+    SkewedUpdate,
+    RangeUpdate,
+    OltpMix,
 }
 
 impl Workload {
@@ -26,19 +55,67 @@ impl Workload {
             Self::Select => "point_select",
             Self::HotUpdate => "hot_update",
             Self::DistinctUpdate => "distinct_update",
+            Self::RandomUpdate => "random_update",
+            Self::SkewedUpdate => "skewed_update",
+            Self::RangeUpdate => "range_update",
+            Self::OltpMix => "oltp_mix",
         }
     }
 
-    fn sql(self, worker: usize) -> String {
+    fn generate_sqls(self, worker: usize, rows: usize, rng: &mut SimpleRng) -> Vec<String> {
         match self {
-            Self::Select => "SELECT abalance FROM probe_accounts WHERE aid = 1".to_string(),
+            Self::Select => vec!["SELECT abalance FROM probe_accounts WHERE aid = 1".to_string()],
             Self::HotUpdate => {
-                "UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = 1".to_string()
+                vec!["UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = 1".to_string()]
             }
-            Self::DistinctUpdate => format!(
+            Self::DistinctUpdate => vec![format!(
                 "UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = {}",
-                worker + 1
-            ),
+                (worker % rows) + 1
+            )],
+            Self::RandomUpdate => {
+                let aid = rng.gen_range(1, rows);
+                vec![format!(
+                    "UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = {}",
+                    aid
+                )]
+            }
+            Self::SkewedUpdate => {
+                // 80/20 Pareto: 80% updates hit first 20% of accounts
+                let hot_limit = (rows / 5).max(1);
+                let aid = if rng.gen_range(1, 100) <= 80 {
+                    rng.gen_range(1, hot_limit)
+                } else {
+                    rng.gen_range(hot_limit + 1, rows)
+                };
+                vec![format!(
+                    "UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = {}",
+                    aid
+                )]
+            }
+            Self::RangeUpdate => {
+                let max_start = rows.saturating_sub(10).max(1);
+                let start = rng.gen_range(1, max_start);
+                vec![format!(
+                    "UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid BETWEEN {} AND {}",
+                    start,
+                    start + 9
+                )]
+            }
+            Self::OltpMix => {
+                // 4 random point selects + 1 random point update
+                let a1 = rng.gen_range(1, rows);
+                let a2 = rng.gen_range(1, rows);
+                let a3 = rng.gen_range(1, rows);
+                let a4 = rng.gen_range(1, rows);
+                let a_upd = rng.gen_range(1, rows);
+                vec![
+                    format!("SELECT abalance FROM probe_accounts WHERE aid = {}", a1),
+                    format!("SELECT abalance FROM probe_accounts WHERE aid = {}", a2),
+                    format!("SELECT abalance FROM probe_accounts WHERE aid = {}", a3),
+                    format!("SELECT abalance FROM probe_accounts WHERE aid = {}", a4),
+                    format!("UPDATE probe_accounts SET abalance = abalance + 1 WHERE aid = {}", a_upd),
+                ]
+            }
         }
     }
 }
@@ -55,6 +132,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let sync = std::env::var("PROBE_SYNC").map_or(true, |v| v != "0");
     let pgwire = std::env::var("PROBE_PGWIRE").is_ok_and(|v| v == "1");
     let concurrent_checkpoint = std::env::var("PROBE_CHECKPOINT").is_ok_and(|v| v == "1");
+    let workloads_filter = std::env::var("PROBE_WORKLOADS").ok();
+
     if rows < 8 || iterations == 0 {
         return Err("PROBE_ROWS must be at least 8 and PROBE_ITERS must be positive".into());
     }
@@ -92,22 +171,54 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!("workload,clients,successes,errors,tps,p50_ms,p95_ms,p99_ms,mean_engine_ms,row_lock_ms,tree_lock_ms,commit_lock_ms,wal_lock_ms,wal_write_ms,wal_sync_ms,wal_durable_wait_ms,point_gets_per_call,scan_entries_per_call");
 
-    for (workload, clients) in [
+    let all_scenarios: Vec<(Workload, usize)> = vec![
         (Workload::Select, 1),
+        (Workload::Select, 8),
         (Workload::HotUpdate, 1),
         (Workload::HotUpdate, 4),
-        (Workload::DistinctUpdate, 4),
         (Workload::HotUpdate, 8),
+        (Workload::HotUpdate, 16),
+        (Workload::DistinctUpdate, 4),
         (Workload::DistinctUpdate, 8),
-    ] {
+        (Workload::DistinctUpdate, 16),
+        (Workload::RandomUpdate, 1),
+        (Workload::RandomUpdate, 4),
+        (Workload::RandomUpdate, 8),
+        (Workload::RandomUpdate, 16),
+        (Workload::SkewedUpdate, 4),
+        (Workload::SkewedUpdate, 8),
+        (Workload::SkewedUpdate, 16),
+        (Workload::RangeUpdate, 1),
+        (Workload::RangeUpdate, 4),
+        (Workload::RangeUpdate, 8),
+        (Workload::OltpMix, 1),
+        (Workload::OltpMix, 4),
+        (Workload::OltpMix, 8),
+        (Workload::OltpMix, 16),
+    ];
+
+    let scenarios: Vec<(Workload, usize)> = if let Some(ref filter) = workloads_filter {
+        let selected: Vec<&str> = filter.split(',').map(str::trim).collect();
+        all_scenarios
+            .into_iter()
+            .filter(|(w, _)| selected.contains(&w.name()) || selected.contains(&"all"))
+            .collect()
+    } else {
+        all_scenarios
+    };
+
+    for &(workload, clients) in &scenarios {
+        let mut warmup_rng = SimpleRng::new(42);
         for worker in 0..clients {
-            let sql = workload.sql(worker);
-            for _ in 0..10 {
-                engine.execute(&sql)?;
+            let sqls = workload.generate_sqls(worker, rows, &mut warmup_rng);
+            for sql in &sqls {
+                for _ in 0..3 {
+                    let _ = engine.execute(sql);
+                }
             }
         }
         engine.execute("RESET QUERY STATS")?;
-        let trial = run_trial(Arc::clone(&engine), workload, clients, iterations);
+        let trial = run_trial(Arc::clone(&engine), workload, clients, iterations, rows);
         let stats = engine.execute("SHOW QUERY STATS")?;
         print_trial(workload.name(), clients, &trial, stats);
     }
@@ -121,16 +232,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let addr = server.local_addr()?;
         runtime.spawn(server.run());
         println!("PGWIRE address={}", addr);
-        for (workload, clients) in [
-            (Workload::Select, 1),
-            (Workload::HotUpdate, 1),
-            (Workload::HotUpdate, 4),
-            (Workload::DistinctUpdate, 4),
-            (Workload::HotUpdate, 8),
-            (Workload::DistinctUpdate, 8),
-        ] {
+        for &(workload, clients) in &scenarios {
             engine.execute("RESET QUERY STATS")?;
-            let trial = run_pgwire_trial(addr, workload, clients, iterations);
+            let trial = run_pgwire_trial(addr, workload, clients, iterations, rows);
             let stats = engine.execute("SHOW QUERY STATS")?;
             print_trial(
                 &format!("pgwire_{}", workload.name()),
@@ -162,6 +266,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             Workload::HotUpdate,
             4,
             iterations.max(1000),
+            rows,
         );
         stop.store(true, Ordering::Relaxed);
         let checkpoints = checkpointer.join().expect("checkpointer panicked");
@@ -196,23 +301,31 @@ fn run_trial(
     workload: Workload,
     clients: usize,
     iterations: usize,
+    rows: usize,
 ) -> Trial {
     let barrier = Arc::new(Barrier::new(clients + 1));
     let mut handles = Vec::new();
     for worker in 0..clients {
         let engine = Arc::clone(&engine);
         let barrier = Arc::clone(&barrier);
-        let sql = workload.sql(worker);
         handles.push(thread::spawn(move || {
+            let mut rng = SimpleRng::new(1000 + worker as u64 * 7919);
             let mut latencies = Vec::with_capacity(iterations);
             let mut errors = Vec::new();
             barrier.wait();
             for _ in 0..iterations {
+                let sqls = workload.generate_sqls(worker, rows, &mut rng);
                 let started = Instant::now();
-                let result = engine.execute(&sql);
+                let mut iter_err = None;
+                for sql in &sqls {
+                    if let Err(error) = engine.execute(sql) {
+                        iter_err = Some(error.to_string());
+                        break;
+                    }
+                }
                 latencies.push(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
-                if let Err(error) = result {
-                    errors.push(error.to_string());
+                if let Some(error) = iter_err {
+                    errors.push(error);
                 }
             }
             (latencies, errors)
@@ -242,7 +355,7 @@ fn print_trial(label: &str, clients: usize, trial: &Trial, stats: ExecutionResul
         ExecutionResult::Query { columns, rows } => (columns, rows),
         _ => panic!("SHOW QUERY STATS did not return rows"),
     };
-    let prefix = if label.contains("select") {
+    let prefix = if label.contains("select") && !label.contains("oltp_mix") {
         "SELECT"
     } else {
         "UPDATE"
@@ -310,26 +423,37 @@ fn run_pgwire_trial(
     workload: Workload,
     clients: usize,
     iterations: usize,
+    rows: usize,
 ) -> Trial {
     let barrier = Arc::new(Barrier::new(clients + 1));
     let mut handles = Vec::new();
     for worker in 0..clients {
         let barrier = Arc::clone(&barrier);
-        let sql = workload.sql(worker);
         handles.push(thread::spawn(move || {
+            let mut rng = SimpleRng::new(1000 + worker as u64 * 7919);
             let mut stream = connect_pgwire(addr).expect("PGWire connection failed");
-            for _ in 0..10 {
-                pgwire_query(&mut stream, &sql).expect("PGWire warmup failed");
+            for _ in 0..5 {
+                let sqls = workload.generate_sqls(worker, rows, &mut rng);
+                for sql in &sqls {
+                    pgwire_query(&mut stream, sql).expect("PGWire warmup failed");
+                }
             }
             let mut latencies = Vec::with_capacity(iterations);
             let mut errors = Vec::new();
             barrier.wait();
             for _ in 0..iterations {
+                let sqls = workload.generate_sqls(worker, rows, &mut rng);
                 let started = Instant::now();
-                let result = pgwire_query(&mut stream, &sql);
+                let mut iter_err = None;
+                for sql in &sqls {
+                    if let Err(error) = pgwire_query(&mut stream, sql) {
+                        iter_err = Some(error.to_string());
+                        break;
+                    }
+                }
                 latencies.push(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
-                if let Err(error) = result {
-                    errors.push(error.to_string());
+                if let Some(error) = iter_err {
+                    errors.push(error);
                 }
             }
             (latencies, errors)
