@@ -89,3 +89,5 @@
 - [16. UPDATE 性能の再測定と原因評価](./16_update_performance_remeasurement.md)
 - [17. 再測定に基づく UPDATE 性能改善案](./17_update_performance_improvement_plan.md)
 - [18. UPDATE 性能改善の実装結果](./18_update_performance_implementation.md)
+- [19. PostgreSQL 18 対比 UPDATE 性能改善・検証シナリオ拡張レポート](./19_update_performance_pg18_comparison.md)
+- [20. Stateless Streamable-HTTP MCP Server 設計方針](./20_stateless_streamable_http_mcp_server_design.md)
