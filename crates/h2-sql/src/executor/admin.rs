@@ -671,7 +671,7 @@ impl SQLEngine {
     }
 
     pub(crate) fn execute_create_iceberg_table(&self, _tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
-        let (clean_sql, location) = parse_iceberg_ddl(sql)?;
+        let (clean_sql, location, raw_partitions) = parse_iceberg_ddl(sql)?;
         let parsed = parse_sql(&clean_sql)?;
         match parsed.into_iter().next() {
             Some(Statement::CreateTable(create_table)) => {
@@ -697,12 +697,36 @@ impl SQLEngine {
                     }
                 }
 
+                let mut partition_fields = Vec::new();
+                for (idx, raw) in raw_partitions.into_iter().enumerate() {
+                    let source_id = final_table_def
+                        .column_index(&raw.source_col)
+                        .map(|i| (i + 1) as i32)
+                        .unwrap_or((idx + 1) as i32);
+                    partition_fields.push(crate::iceberg::PartitionField {
+                        source_id,
+                        field_id: 1000 + idx as i32,
+                        name: raw.name,
+                        transform: raw.transform,
+                    });
+                }
+
+                if partition_fields.is_empty() {
+                    if let Ok((_ver, meta)) = crate::iceberg::get_latest_metadata(&location) {
+                        if let Some(spec) = meta.partition_specs.first() {
+                            partition_fields = spec.fields.clone();
+                        }
+                    }
+                }
+
+                final_table_def.iceberg_partition_fields = partition_fields.clone();
                 crate::iceberg::init_iceberg_table(&location, &final_table_def)?;
 
                 let iceberg_def = TableDef::new_iceberg(
                     tbl_name,
                     final_table_def.columns,
                     location,
+                    partition_fields,
                 );
 
                 if let Err(e) = self.catalog.create_table(iceberg_def) {

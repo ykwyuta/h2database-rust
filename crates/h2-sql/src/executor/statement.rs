@@ -686,6 +686,11 @@ impl SQLEngine {
                     )));
                 }
 
+                if table_def.is_iceberg {
+                    let affected = crate::iceberg::write_iceberg_position_deletes(&table_def, delete.selection.as_ref())?;
+                    return Ok(ExecutionResult::Dml { affected_rows: affected });
+                }
+
 
                 let using_data: Option<(RowContext, Vec<Row>)> = if let Some(ref using_tables) = delete.using {
                     if !using_tables.is_empty() {

@@ -170,6 +170,8 @@ pub struct TableDef {
     pub is_iceberg: bool,
     #[serde(default)]
     pub iceberg_location: Option<String>,
+    #[serde(default)]
+    pub iceberg_partition_fields: Vec<crate::iceberg::PartitionField>,
 }
 
 impl TableDef {
@@ -205,6 +207,7 @@ impl TableDef {
             is_unlogged: false,
             is_iceberg: false,
             iceberg_location: None,
+            iceberg_partition_fields: Vec::new(),
         }
     }
 
@@ -255,6 +258,7 @@ impl TableDef {
             is_unlogged: false,
             is_iceberg: false,
             iceberg_location: None,
+            iceberg_partition_fields: Vec::new(),
         }
     }
 
@@ -311,6 +315,7 @@ impl TableDef {
             is_unlogged,
             is_iceberg: false,
             iceberg_location: None,
+            iceberg_partition_fields: Vec::new(),
         }
     }
 
@@ -318,6 +323,7 @@ impl TableDef {
         name: impl Into<String>,
         mut columns: Vec<ColumnDef>,
         location: impl Into<String>,
+        partition_fields: Vec<crate::iceberg::PartitionField>,
     ) -> Self {
         for (idx, col) in columns.iter_mut().enumerate() {
             if col.physical_index.is_none() {
@@ -350,6 +356,7 @@ impl TableDef {
             is_unlogged: true,
             is_iceberg: true,
             iceberg_location: Some(location.into()),
+            iceberg_partition_fields: partition_fields,
         }
     }
 

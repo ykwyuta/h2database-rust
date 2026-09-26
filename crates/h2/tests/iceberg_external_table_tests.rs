@@ -331,3 +331,142 @@ fn test_iceberg_infer_existing_table_schema() {
 
     let _ = fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn test_iceberg_partitioning_transforms_and_pruning() {
+    let tmp_dir = std::env::temp_dir().join(format!("h2_iceberg_test_part_{}", uuid::Uuid::new_v4()));
+    let loc = tmp_dir.to_string_lossy().to_string().replace('\\', "/");
+
+    let conn = Connection::open_in_memory().unwrap();
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE partitioned_lake (
+            id BIGINT,
+            name VARCHAR,
+            category VARCHAR,
+            created_at TIMESTAMP
+        ) STORED AS ICEBERG
+        LOCATION '{}'
+        PARTITIONED BY (category, year(created_at), bucket(4, id), truncate(2, name));",
+        loc
+    );
+    conn.execute(&ddl).unwrap();
+
+    // 挿入実行
+    conn.execute(
+        "INSERT INTO partitioned_lake VALUES
+            (1, 'Apple', 'Fruit', TIMESTAMP '2024-05-10 10:00:00'),
+            (2, 'Banana', 'Fruit', TIMESTAMP '2024-06-15 12:00:00'),
+            (3, 'Carrot', 'Vegetable', TIMESTAMP '2025-01-20 09:30:00');"
+    ).unwrap();
+
+    // パーティションディレクトリ構造の検証
+    let data_dir = tmp_dir.join("data");
+    assert!(data_dir.exists());
+
+    // category=Fruit および category=Vegetable のディレクトリが存在することを確認
+    let fruit_dir = data_dir.join("category=Fruit");
+    let veg_dir = data_dir.join("category=Vegetable");
+    assert!(fruit_dir.exists());
+    assert!(veg_dir.exists());
+
+    // SELECT クエリ（全件）
+    let all_rows = conn.query("SELECT id, name, category FROM partitioned_lake ORDER BY id;").unwrap();
+    assert_eq!(all_rows.len(), 3);
+    assert_eq!(all_rows[0].get(1), Some(&Value::String("Apple".to_string())));
+    assert_eq!(all_rows[1].get(1), Some(&Value::String("Banana".to_string())));
+    assert_eq!(all_rows[2].get(1), Some(&Value::String("Carrot".to_string())));
+
+    // パーティションプルーニングを伴うクエリ
+    let fruit_rows = conn.query("SELECT id, name FROM partitioned_lake WHERE category = 'Fruit' ORDER BY id;").unwrap();
+    assert_eq!(fruit_rows.len(), 2);
+    assert_eq!(fruit_rows[0].get(0), Some(&Value::BigInt(1)));
+    assert_eq!(fruit_rows[1].get(0), Some(&Value::BigInt(2)));
+
+    let veg_rows = conn.query("SELECT id, name FROM partitioned_lake WHERE category = 'Vegetable';").unwrap();
+    assert_eq!(veg_rows.len(), 1);
+    assert_eq!(veg_rows[0].get(1), Some(&Value::String("Carrot".to_string())));
+
+    // 存在しないパーティションのプルーニング
+    let empty_rows = conn.query("SELECT id FROM partitioned_lake WHERE category = 'Dairy';").unwrap();
+    assert_eq!(empty_rows.len(), 0);
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_iceberg_v2_mor_position_deletes() {
+    let tmp_dir = std::env::temp_dir().join(format!("h2_iceberg_test_mor_{}", uuid::Uuid::new_v4()));
+    let loc = tmp_dir.to_string_lossy().to_string().replace('\\', "/");
+
+    let conn = Connection::open_in_memory().unwrap();
+
+    let ddl = format!(
+        "CREATE EXTERNAL TABLE mor_lake (
+            id BIGINT PRIMARY KEY,
+            title VARCHAR,
+            views BIGINT
+        ) STORED AS ICEBERG
+        LOCATION '{}';",
+        loc
+    );
+    conn.execute(&ddl).unwrap();
+
+    // 4件挿入
+    conn.execute(
+        "INSERT INTO mor_lake VALUES
+            (1, 'Post 1', 100),
+            (2, 'Post 2', 200),
+            (3, 'Post 3', 300),
+            (4, 'Post 4', 400);"
+    ).unwrap();
+
+    let initial_rows = conn.query("SELECT id, title FROM mor_lake ORDER BY id;").unwrap();
+    assert_eq!(initial_rows.len(), 4);
+
+    // スナップショット履歴取得（初期スナップショットIDを記録）
+    let snap_rows_before = conn.query("SELECT snapshot_id FROM iceberg_snapshots('mor_lake');").unwrap();
+    assert_eq!(snap_rows_before.len(), 1);
+    let snap_id_before = match snap_rows_before[0].get(0).unwrap() {
+        Value::BigInt(v) => *v,
+        _ => panic!("Expected BigInt snapshot_id"),
+    };
+
+    // 1行削除実行 (DELETE FROM ... WHERE id = 2)
+    let deleted_count = conn.execute("DELETE FROM mor_lake WHERE id = 2;").unwrap();
+    assert_eq!(deleted_count, 1);
+
+    // 差分削除ファイル（Position Delete）が生成されたか検証
+    let deletes_dir = tmp_dir.join("data").join("deletes");
+    assert!(deletes_dir.exists());
+    let delete_files: Vec<_> = fs::read_dir(&deletes_dir).unwrap().collect();
+    assert_eq!(delete_files.len(), 1);
+
+    // スナップショット履歴を検証（operation = 'delete'）
+    let snap_rows_after = conn.query("SELECT snapshot_id, operation, added_records FROM iceberg_snapshots('mor_lake') ORDER BY timestamp_ms;").unwrap();
+    assert_eq!(snap_rows_after.len(), 2);
+    assert_eq!(snap_rows_after[1].get(1), Some(&Value::String("delete".to_string())));
+
+    // Merge-on-Read の検証: id = 2 がスキップされて 1, 3, 4 のみが返る
+    let mor_rows = conn.query("SELECT id, title FROM mor_lake ORDER BY id;").unwrap();
+    assert_eq!(mor_rows.len(), 3);
+    assert_eq!(mor_rows[0].get(0), Some(&Value::BigInt(1)));
+    assert_eq!(mor_rows[1].get(0), Some(&Value::BigInt(3)));
+    assert_eq!(mor_rows[2].get(0), Some(&Value::BigInt(4)));
+
+    // もう1行削除 (DELETE FROM ... WHERE id = 4)
+    let deleted_count2 = conn.execute("DELETE FROM mor_lake WHERE id = 4;").unwrap();
+    assert_eq!(deleted_count2, 1);
+
+    let mor_rows2 = conn.query("SELECT id FROM mor_lake ORDER BY id;").unwrap();
+    assert_eq!(mor_rows2.len(), 2);
+    assert_eq!(mor_rows2[0].get(0), Some(&Value::BigInt(1)));
+    assert_eq!(mor_rows2[1].get(0), Some(&Value::BigInt(3)));
+
+    // タイムトラベルの検証: 削除前の過去のスナップショットでは4件すべて参照可能
+    let time_travel_sql = format!("SELECT id FROM iceberg_scan('mor_lake', {}) ORDER BY id;", snap_id_before);
+    let tt_rows = conn.query(&time_travel_sql).unwrap();
+    assert_eq!(tt_rows.len(), 4);
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+}

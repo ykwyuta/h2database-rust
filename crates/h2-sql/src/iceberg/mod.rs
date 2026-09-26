@@ -4,10 +4,10 @@ pub mod writer;
 
 pub use metadata::{
     get_latest_metadata, init_iceberg_table, read_manifest_file, read_manifest_list,
-    DataFile, ManifestEntry, ManifestListEntry, Snapshot, TableMetadata,
+    DataFile, ManifestEntry, ManifestListEntry, PartitionField, PartitionSpec, Snapshot, TableMetadata,
 };
 pub use reader::read_iceberg_table_rows;
-pub use writer::write_iceberg_table_rows;
+pub use writer::{write_iceberg_position_deletes, write_iceberg_table_rows};
 
 use h2_types::{H2Result, Value};
 use crate::row::Row;

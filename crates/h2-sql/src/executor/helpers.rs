@@ -345,8 +345,130 @@ pub(crate) fn extract_tables_from_table_factor(tf: &sqlparser::ast::TableFactor,
     }
 }
 
-pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
+#[derive(Debug, Clone)]
+pub(crate) struct RawPartitionSpec {
+    pub name: String,
+    pub source_col: String,
+    pub transform: String,
+}
+
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '(' | '[' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' | ']' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                current.push(c);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        parts.push(trimmed);
+    }
+    parts
+}
+
+fn parse_single_partition_expr(raw_expr: &str) -> RawPartitionSpec {
+    let s = raw_expr.trim();
+    let s_lower = s.to_lowercase();
+
+    if s_lower.starts_with("year(") && s.ends_with(')') {
+        let col = s[5..s.len() - 1].trim().trim_matches('`').trim_matches('"');
+        return RawPartitionSpec {
+            name: format!("{}_year", col),
+            source_col: col.to_string(),
+            transform: "year".to_string(),
+        };
+    }
+    if s_lower.starts_with("month(") && s.ends_with(')') {
+        let col = s[6..s.len() - 1].trim().trim_matches('`').trim_matches('"');
+        return RawPartitionSpec {
+            name: format!("{}_month", col),
+            source_col: col.to_string(),
+            transform: "month".to_string(),
+        };
+    }
+    if s_lower.starts_with("day(") && s.ends_with(')') {
+        let col = s[4..s.len() - 1].trim().trim_matches('`').trim_matches('"');
+        return RawPartitionSpec {
+            name: format!("{}_day", col),
+            source_col: col.to_string(),
+            transform: "day".to_string(),
+        };
+    }
+    if (s_lower.starts_with("bucket(") || s_lower.starts_with("bucket[")) && (s.ends_with(')') || s.ends_with(']')) {
+        let inner = &s[7..s.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() == 2 {
+            let (num, col) = if let Ok(n) = parts[0].parse::<u32>() {
+                (n, parts[1].trim().trim_matches('`').trim_matches('"'))
+            } else if let Ok(n) = parts[1].parse::<u32>() {
+                (n, parts[0].trim().trim_matches('`').trim_matches('"'))
+            } else {
+                (16, parts[0].trim().trim_matches('`').trim_matches('"'))
+            };
+            return RawPartitionSpec {
+                name: format!("{}_bucket", col),
+                source_col: col.to_string(),
+                transform: format!("bucket[{}]", num),
+            };
+        }
+    }
+    if (s_lower.starts_with("truncate(") || s_lower.starts_with("truncate[")) && (s.ends_with(')') || s.ends_with(']')) {
+        let inner = &s[9..s.len() - 1];
+        let parts = split_top_level_commas(inner);
+        if parts.len() == 2 {
+            let (w, col) = if let Ok(n) = parts[0].parse::<usize>() {
+                (n, parts[1].trim().trim_matches('`').trim_matches('"'))
+            } else if let Ok(n) = parts[1].parse::<usize>() {
+                (n, parts[0].trim().trim_matches('`').trim_matches('"'))
+            } else {
+                (1, parts[0].trim().trim_matches('`').trim_matches('"'))
+            };
+            return RawPartitionSpec {
+                name: format!("{}_trunc", col),
+                source_col: col.to_string(),
+                transform: format!("truncate[{}]", w),
+            };
+        }
+    }
+    if s_lower.starts_with("identity(") && s.ends_with(')') {
+        let col = s[9..s.len() - 1].trim().trim_matches('`').trim_matches('"');
+        return RawPartitionSpec {
+            name: col.to_string(),
+            source_col: col.to_string(),
+            transform: "identity".to_string(),
+        };
+    }
+
+    let col = s.trim_matches('`').trim_matches('"');
+    RawPartitionSpec {
+        name: col.to_string(),
+        source_col: col.to_string(),
+        transform: "identity".to_string(),
+    }
+}
+
+pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String, Vec<RawPartitionSpec>)> {
     let mut location = None;
+    let mut partition_specs = Vec::new();
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
@@ -362,6 +484,10 @@ pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
                     let v = p[eq_idx + 1..].trim().trim_matches('\'').trim_matches('"').trim();
                     if k == "LOCATION" {
                         location = Some(v.to_string());
+                    } else if k == "PARTITION_BY" || k == "PARTITIONED_BY" {
+                        for item in split_top_level_commas(v) {
+                            partition_specs.push(parse_single_partition_expr(&item));
+                        }
                     }
                 }
             }
@@ -381,6 +507,32 @@ pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
             } else {
                 let token = after_loc.split_whitespace().next().unwrap_or(after_loc);
                 location = Some(token.trim_end_matches(';').to_string());
+            }
+        }
+    }
+
+    // 3. Check PARTITIONED BY ( ... )
+    if let Some(pos) = upper.find("PARTITIONED BY") {
+        let after_p = &trimmed[pos + "PARTITIONED BY".len()..].trim();
+        if after_p.starts_with('(') {
+            let mut depth = 0;
+            let mut end_idx = None;
+            for (i, c) in after_p.char_indices() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(end_i) = end_idx {
+                let inner = &after_p[1..end_i];
+                for item in split_top_level_commas(inner) {
+                    partition_specs.push(parse_single_partition_expr(&item));
+                }
             }
         }
     }
@@ -406,6 +558,32 @@ pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
         clean = format!("{}{}", &clean[..pos], &clean[pos + "STORED AS PARQUET".len()..]);
     }
 
+    // Remove PARTITIONED BY (...)
+    if let Some(pos) = clean.to_uppercase().find("PARTITIONED BY") {
+        let after = &clean[pos + "PARTITIONED BY".len()..];
+        let trimmed_after = after.trim_start();
+        let leading_spaces = after.len() - trimmed_after.len();
+        if trimmed_after.starts_with('(') {
+            let mut depth = 0;
+            let mut end_idx = None;
+            for (i, c) in trimmed_after.char_indices() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end_idx = Some(i);
+                        break;
+                    }
+                }
+            }
+            if let Some(end_i) = end_idx {
+                let full_end = pos + "PARTITIONED BY".len() + leading_spaces + end_i + 1;
+                clean = format!("{}{}", &clean[..pos], &clean[full_end..]);
+            }
+        }
+    }
+
     // Remove WITH (...) if it was at the end (before stripping standalone LOCATION)
     if let Some(pos) = clean.to_uppercase().rfind("WITH") {
         let after = clean[pos + 4..].trim().trim_end_matches(';').trim();
@@ -420,5 +598,5 @@ pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
     }
 
     clean = format!("{};", clean.trim().trim_end_matches(';').trim());
-    Ok((clean, loc))
+    Ok((clean, loc, partition_specs))
 }

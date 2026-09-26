@@ -287,7 +287,80 @@ SELECT * FROM iceberg_files('lake_products');
 
 ---
 
-## 8. テスト検証方針
+---
+
+## 8. パーティショニング（Partitioning & Pruning）
+
+### 8.1 パーティション変換仕様（Transforms）
+Iceberg テーブルのパーティショニングは、ソース列の値を論理変換（Transform）してディレクトリ階層およびメタデータ上のパーティション値に射影します。
+
+| 変換種別 | 構文例 | 変換ロジック | ディレクトリ例 |
+|---|---|---|---|
+| **Identity** | `identity(col)` または `col` | 値をそのまま文字列化 | `category=Books/` |
+| **Year** | `year(ts)` | 日付・タイムスタンプから年（YYYY）を抽出 | `ts_year=2024/` |
+| **Month** | `month(ts)` | 日付・タイムスタンプから年月（YYYY-MM）を抽出 | `ts_month=2024-09/` |
+| **Day** | `day(ts)` | 日付・タイムスタンプから年月日（YYYY-MM-DD）を抽出 | `ts_day=2024-09-26/` |
+| **Bucket** | `bucket(N, col)` | ハッシュ値 modulo N を計算（`0` 〜 `N-1`） | `id_bucket=3/` |
+| **Truncate** | `truncate(W, col)` | 文字列先頭 W 文字、または整数 `v - (v % W)` | `name_trunc=A/` |
+
+### 8.2 DDL による定義
+```sql
+CREATE EXTERNAL TABLE partitioned_lake (
+    id BIGINT,
+    name VARCHAR(64),
+    category VARCHAR(32),
+    created_at TIMESTAMP
+) STORED AS ICEBERG
+LOCATION '/data/lake/partitioned_lake'
+PARTITIONED BY (category, year(created_at), bucket(4, id));
+```
+
+### 8.3 ディレクトリ配置とパーティションプルーニング
+- **書き込み時**: 行の各パーティション変換値を計算し、`<location>/data/<field1>=<val1>/<field2>=<val2>/00000-<uuid>.parquet` にグループ化して配置。`DataFile` メタデータの `partition` フィールドに `{ "category": "Books", ... }` を記録。
+- **読み込み時（Pruning）**: クエリの `WHERE` 句の述語（等値・範囲条件など）を解析し、`DataFile.partition` の値と照合。不一致のデータファイルは Parquet ファイルを一切オープンせずに枝刈り（スキップ）し、IO を最小化。
+
+---
+
+## 9. Iceberg v2 Delete Files & Merge-on-Read (MoR)
+
+### 9.1 削除ファイル形式（Delete Files）
+Iceberg v2 仕様に基づき、実データファイルを再書き込みすることなく差分のみを記録する削除ファイル（Delete Files）をサポート：
+
+1. **Position Deletes (`content = 1`)**:
+   - 特定のデータファイル名と、そのファイル内での 0-indexed 行インデックス（`pos: Int64`）を記録する Parquet ファイル（`data/deletes/delete-pos-<uuid>.parquet`）。
+   - スキーマ: `file_path: Utf8, pos: Int64`。
+2. **Equality Deletes (`content = 2`)**:
+   - 削除対象キーの値を記録する Parquet ファイル。
+
+### 9.2 `DELETE FROM` による Position Deletes 生成フロー
+1. クライアントが `DELETE FROM <iceberg_table> WHERE ...` を発行。
+2. エンジンが対象 Iceberg テーブルの現行スナップショットの全データファイルをスキャンし、`WHERE` 条件に合致する行の `(file_path, pos)` を特定。
+3. 抽出された削除位置リストを Arrow RecordBatch として Parquet ファイルに書き出し。
+4. `content = 1` を持つ `DataFile` エントリを作成し、マニフェストに追加。
+5. `operation = "delete"` の新スナップショットを生成し、`v<N+1>.metadata.json` および `version-hint.text` をアトミックに更新。
+
+### 9.3 Merge-on-Read (MoR) スキャンパイプライン
+```mermaid
+graph TD
+    Query[SELECT クエリ] --> ManifestScan[マニフェスト走査]
+    ManifestScan --> SplitFiles[データファイル & 削除ファイルの分離]
+    
+    SplitFiles --> LoadDeletes[削除ファイル走査: Position / Equality Deletes]
+    LoadDeletes --> DeleteFilter[削除位置インデックス作成: HashMap<FilePath, HashSet<pos>>]
+    
+    SplitFiles --> DataFiles[データファイル走査: content = 0]
+    DataFiles --> PartPrune[パーティションプルーニング & Min/Max スキップ]
+    PartPrune --> ReadParquet[Parquet RecordBatch 読み込み]
+    
+    ReadParquet --> MoRMerge{行位置 pos は削除対象か？}
+    DeleteFilter -.-> MoRMerge
+    MoRMerge -- Yes --> SkipRow[行をスキップ]
+    MoRMerge -- No --> EmitRow[行を出力]
+```
+
+---
+
+## 10. テスト検証方針
 
 | テストケース | 対象シナリオ | 検証項目 |
 |---|---|---|
@@ -298,14 +371,15 @@ SELECT * FROM iceberg_files('lake_products');
 | `test_iceberg_time_travel` | `FOR SYSTEM_VERSION AS OF` | 過去のスナップショットを指定した正確な過去時点データの取得 |
 | `test_iceberg_metadata_inspection_functions` | `iceberg_snapshots`, `iceberg_files` | スナップショット一覧および Parquet ファイル一覧のメタデータ取得 |
 | `test_iceberg_join_with_relational_table` | Iceberg 外部テーブル × 内部 MVCC テーブル | レイクハウス外部データと RDB 内部トランザクションテーブルの透過的結合 |
+| `test_iceberg_partitioning_transforms_and_pruning` | パーティショニング（Identity/Year/Bucket/Truncate） | パーティション階層ディレクトリの生成、およびパーティションプルーニングの動作検証 |
+| `test_iceberg_v2_mor_position_deletes` | Iceberg v2 Position Deletes & MoR | `DELETE FROM` による差分削除ファイル生成と、SELECT 走査時の Merge-on-Read 正確性 |
 
 ---
 
-## 9. 今後の拡張性（Roadmap）
+## 11. 今後の拡張性（Roadmap）
 
-1. **パーティショニング（Identity / Year / Month / Day / Bucket / Truncate）**:
-   ディレクトリ階層（例: `category=Books/`）によるパーティションプルーニング。
-2. **v2 Position Deletes / Equality Deletes**:
-   差分削除ファイル（Delete Files）を用いたマージ・オン・リード（Merge-on-Read）の完全対応。
-3. **リモートオブジェクトストレージ統合（AWS S3 / GCP GCS / Azure Blob）**:
+1. **リモートオブジェクトストレージ統合（AWS S3 / GCP GCS / Azure Blob）**:
    `s3://` や `gcs://` などのクラウドストレージ URI からの直接読み書き。
+2. **バックグラウンドコンパクション（Compaction）**:
+   多数の小さなデータファイルおよび Position Delete ファイルを単一の最適化 Parquet ファイルにマージ（Copy-on-Write 化）。
+

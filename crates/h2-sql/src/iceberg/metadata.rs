@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use h2_types::{DataType as H2DataType, H2Error, H2Result};
+use h2_types::{DataType as H2DataType, H2Error, H2Result, Value};
 use crate::catalog::{ColumnDef, TableDef};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,10 +27,21 @@ pub struct IcebergSchema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionField {
+    #[serde(rename = "source-id")]
+    pub source_id: i32,
+    #[serde(rename = "field-id")]
+    pub field_id: i32,
+    pub name: String,
+    pub transform: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionSpec {
     #[serde(rename = "spec-id")]
     pub spec_id: i32,
-    pub fields: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub fields: Vec<PartitionField>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +111,12 @@ pub struct ManifestListEntry {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataFile {
+    #[serde(default)]
+    pub content: i32, // 0: DATA, 1: POSITION_DELETES, 2: EQUALITY_DELETES
     pub file_path: String,
     pub file_format: String,
+    #[serde(default)]
+    pub partition: HashMap<String, String>,
     pub record_count: u64,
     pub file_size_in_bytes: u64,
     #[serde(default)]
@@ -114,6 +129,8 @@ pub struct DataFile {
     pub lower_bounds: HashMap<String, String>,
     #[serde(default)]
     pub upper_bounds: HashMap<String, String>,
+    #[serde(default)]
+    pub equality_ids: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,9 +368,13 @@ pub fn init_iceberg_table(location: &str, table_def: &TableDef) -> H2Result<()> 
         default_spec_id: 0,
         partition_specs: vec![PartitionSpec {
             spec_id: 0,
-            fields: vec![],
+            fields: table_def.iceberg_partition_fields.clone(),
         }],
-        last_partition_id: 0,
+        last_partition_id: if table_def.iceberg_partition_fields.is_empty() {
+            0
+        } else {
+            table_def.iceberg_partition_fields.iter().map(|f| f.field_id).max().unwrap_or(0)
+        },
         current_snapshot_id: None,
         snapshots: vec![],
         snapshot_log: vec![],
@@ -364,3 +385,97 @@ pub fn init_iceberg_table(location: &str, table_def: &TableDef) -> H2Result<()> 
 
     Ok(())
 }
+
+pub fn apply_partition_transform(transform: &str, val: &Value) -> String {
+    let t_lower = transform.to_lowercase();
+    if t_lower == "identity" {
+        return match val {
+            Value::Null => "null".to_string(),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+    }
+    if t_lower == "year" {
+        return match val {
+            Value::Date(d) => format!("{:04}", d.year()),
+            Value::Timestamp(ts) => format!("{:04}", ts.year()),
+            Value::String(s) if s.len() >= 4 => s[..4].to_string(),
+            _ => "null".to_string(),
+        };
+    }
+    if t_lower == "month" {
+        return match val {
+            Value::Date(d) => format!("{:04}-{:02}", d.year(), d.month()),
+            Value::Timestamp(ts) => format!("{:04}-{:02}", ts.year(), ts.month()),
+            Value::String(s) if s.len() >= 7 => s[..7].to_string(),
+            _ => "null".to_string(),
+        };
+    }
+    if t_lower == "day" {
+        return match val {
+            Value::Date(d) => format!("{:04}-{:02}-{:02}", d.year(), d.month(), d.day()),
+            Value::Timestamp(ts) => format!("{:04}-{:02}-{:02}", ts.year(), ts.month(), ts.day()),
+            Value::String(s) if s.len() >= 10 => s[..10].to_string(),
+            _ => "null".to_string(),
+        };
+    }
+    if t_lower.starts_with("bucket[") || t_lower.starts_with("bucket(") {
+        let num_str = t_lower
+            .trim_start_matches("bucket[")
+            .trim_start_matches("bucket(")
+            .trim_end_matches(']')
+            .trim_end_matches(')');
+        let num: u64 = num_str.parse().unwrap_or(16);
+        let hash = compute_hash(val);
+        let bucket = if num > 0 { hash % num } else { 0 };
+        return bucket.to_string();
+    }
+    if t_lower.starts_with("truncate[") || t_lower.starts_with("truncate(") {
+        let width_str = t_lower
+            .trim_start_matches("truncate[")
+            .trim_start_matches("truncate(")
+            .trim_end_matches(']')
+            .trim_end_matches(')');
+        let width: usize = width_str.parse().unwrap_or(1);
+        return match val {
+            Value::String(s) => s.chars().take(width).collect(),
+            Value::Integer(i) => {
+                let w = width as i32;
+                if w > 0 {
+                    (i - (i % w)).to_string()
+                } else {
+                    i.to_string()
+                }
+            }
+            Value::BigInt(i) => {
+                let w = width as i64;
+                if w > 0 {
+                    (i - (i % w)).to_string()
+                } else {
+                    i.to_string()
+                }
+            }
+            other => other.to_string(),
+        };
+    }
+    match val {
+        Value::Null => "null".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn compute_hash(val: &Value) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut s = std::collections::hash_map::DefaultHasher::new();
+    match val {
+        Value::String(v) => v.hash(&mut s),
+        Value::Integer(v) => v.hash(&mut s),
+        Value::BigInt(v) => v.hash(&mut s),
+        Value::Double(v) => v.to_bits().hash(&mut s),
+        Value::Boolean(v) => v.hash(&mut s),
+        other => other.to_string().hash(&mut s),
+    }
+    s.finish()
+}
+
