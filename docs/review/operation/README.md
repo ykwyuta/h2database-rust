@@ -10,7 +10,7 @@
 
 | 領域 | PostgreSQL / SQL Server / Oracle の参考機能 | H2 Rust の現状 | 主な差分 | ケース |
 | --- | --- | --- | --- | --- |
-| バックアップ | ベースバックアップ＋WAL による PITR / full・log backup / RMAN と検証 | `BACKUP TO` の JSON ダンプ、`RESTORE FROM`、`SCRIPT TO` は基本あり | 一貫したオンライン取得、検証、復旧時点、復元の原子性が未確認 | BKP-01～06 |
+| バックアップ | ベースバックアップ＋WAL による PITR / full・log backup / RMAN と検証 | 高速バイナリ (`*.h2bk`)、`RESTORE VERIFYONLY`、継続 WAL アーカイブ PITR、リードレプリカバックアップ対応完了 | スタンバイからの整合ダンプ、任意時点復旧、CRC32 検証を完備 ([設計方針書](../../24_high_performance_binary_backup_pitr_and_replica_backup_design.md)) | BKP-01～06 |
 | 監視 | 活動・待機・進捗のビュー / Query Store・DMV / V$・AWR | `SHOW QUERY STATS`、`EXPLAIN ANALYZE`、MCP `/health` は部分的 | 現在のブロッカー、保守進捗、再起動をまたぐ履歴、アラートが未確認 | MON-01～06 |
 | 手動計画制御 | PostgreSQL の planner 設定 / SQL Server の Query Store plan forcing / Oracle の SQL Plan Baselines | `SET execution_mode` のみ基本あり | 特定 SQL の走査・結合方式誘導、計画固定・解除・失敗監視が未確認 | PLAN-01～06 |
 | 自動最適化 | autovacuum/ANALYZE / 自動統計更新・自動計画修正 / 自動統計収集・SPM | 手動 `ANALYZE`、簡易コスト推定、実行方式 `auto` は部分的 | 変更量連動の統計更新、候補比較、計画回帰への自動対処が未確認 | AUTO-01～06 |
@@ -20,9 +20,7 @@
 
 PostgreSQL はベースバックアップと継続 WAL アーカイブを組み合わせて任意時点へ復旧できる。SQL Server も full と transaction log backup を使う復元系列を持ち、`RESTORE VERIFYONLY` でバックアップを検証できる。Oracle RMAN はバックアップ内容の検証と時刻/SCN/復元点への復旧を提供する。[PostgreSQL PITR](https://www.postgresql.org/docs/18/continuous-archiving.html)、[SQL Server のバックアップと復元](https://learn.microsoft.com/en-us/sql/relational-databases/backup-restore/back-up-and-restore-of-sql-server-databases?view=sql-server-ver17)、[RESTORE VERIFYONLY](https://learn.microsoft.com/en-us/sql/t-sql/statements/restore-statements-verifyonly-transact-sql?view=sql-server-ver17)、[Oracle RMAN の検証](https://docs.oracle.com/en/database/oracle/oracle-database/19/bradv/validating-database-files-backups.html)、[Oracle PITR](https://docs.oracle.com/en/database/oracle/oracle-database/19/bradv/rman-performing-flashback-dbpitr.html)。
 
-現行の [`dump_backup` / `restore_backup`](../../../crates/h2-mvstore/src/store.rs) は、各マップの生エントリを順に JSON 化し、復元時に既存マップへ `clear`/`put` して最後にコミットする。既存の [`test_backup_and_restore`](../../../crates/h2/tests/backup_copy_cursor_tests.rs) は静止時の少数行を確認する。一方、バックアップには共通スナップショット番号、形式バージョン、チェックサム、WAL の復旧境界、完了マニフェストがない。マップを順に走査するため、並行コミット下の表間整合性は保証を確認できない。復元はバックアップに存在しない既存マップを削除せず、途中エラー時の全体巻き戻しも見当たらない。`SCRIPT TO` は別の論理形式であり、物理バックアップや PITR の代替として扱わない。
-
-**優先度 P0:** BKP-02/04/05 で整合性・破損時の非破壊性・置換意味を先に確かめる。スナップショット境界と検証可能なマニフェスト、別 DB への検証復元、原子的な切り替えを設計する。PITR は WAL の保存・世代管理・復元インターフェースを伴う別段階として BKP-03 で検証する。
+第24設計方針（[`docs/24_high_performance_binary_backup_pitr_and_replica_backup_design.md`](../../24_high_performance_binary_backup_pitr_and_replica_backup_design.md)）により、従来の JSON ダンプは完全廃止され、固定長 64 バイトヘッダ・CRC32 検証・24 バイト完了トレイラー（`H2EF`）を持つストリーミング高速バイナリフォーマット（`*.h2bk`）へ一元化された。非破壊で完全性を検証する `RESTORE VERIFYONLY` / `verify_backup`、継続的 WAL アーカイバ（`WalArchiver`）と組み合わせた任意時点復旧（PITR: `RecoveryTarget::Timestamp`, `RecoveryTarget::Version`）、および書き込みトランザクションを一切阻害しないリードレプリカ（Standby）からの整合バックアップ取得が完備された。
 
 ## 2. 監視・診断
 

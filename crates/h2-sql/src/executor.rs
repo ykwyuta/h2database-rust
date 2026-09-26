@@ -735,14 +735,46 @@ impl SQLEngine {
             return self.execute_show_grants(u);
         }
 
+        if trimmed_upper.starts_with("RESTORE VERIFYONLY FROM ") {
+            let path = extract_file_path(&trimmed["RESTORE VERIFYONLY FROM ".len()..]);
+            let meta = self.verify_backup(&path)?;
+            return Ok(ExecutionResult::Query {
+                columns: vec![
+                    "backup_id".to_string(),
+                    "snapshot_version".to_string(),
+                    "total_maps".to_string(),
+                    "total_records".to_string(),
+                    "total_bytes".to_string(),
+                    "is_replica".to_string(),
+                    "status".to_string(),
+                ],
+                rows: vec![crate::row::Row::new(vec![
+                    Value::String(meta.backup_id),
+                    Value::BigInt(meta.snapshot_version as i64),
+                    Value::BigInt(meta.total_maps as i64),
+                    Value::BigInt(meta.total_records as i64),
+                    Value::BigInt(meta.total_bytes as i64),
+                    Value::Boolean(meta.is_replica),
+                    Value::String("VERIFIED".to_string()),
+                ])],
+            });
+        }
         if trimmed_upper.starts_with("BACKUP TO ") {
             let path = extract_file_path(&trimmed[10..]);
             self.backup_to(&path)?;
             return Ok(ExecutionResult::Ddl);
         }
         if trimmed_upper.starts_with("RESTORE FROM ") {
-            let path = extract_file_path(&trimmed[13..]);
-            self.restore_from(&path)?;
+            let rest = trimmed[13..].trim().trim_end_matches(';').trim();
+            if let Some(with_idx) = rest.to_uppercase().find(" WITH ") {
+                let path = extract_file_path(&rest[..with_idx]);
+                let opts_str = &rest[with_idx + 6..];
+                let (wal_archive, target) = parse_restore_pitr_options(opts_str)?;
+                self.restore_pitr(&path, wal_archive.as_deref(), &target)?;
+            } else {
+                let path = extract_file_path(rest);
+                self.restore_from(&path)?;
+            }
             return Ok(ExecutionResult::Ddl);
         }
         if trimmed_upper.starts_with("SCRIPT TO ") {
@@ -929,14 +961,29 @@ impl SQLEngine {
         }
     }
 
-    pub fn backup_to(&self, path: &str) -> H2Result<()> {
+    pub fn backup_to(&self, path: &str) -> H2Result<h2_mvstore::BackupMetadata> {
         self.store.dump_backup(path)
+    }
+
+    pub fn verify_backup(&self, path: &str) -> H2Result<h2_mvstore::BackupMetadata> {
+        self.store.verify_backup(path)
     }
 
     pub fn restore_from(&self, path: &str) -> H2Result<()> {
         self.store.restore_backup(path)?;
         self.catalog.reload()?;
         Ok(())
+    }
+
+    pub fn restore_pitr<P: AsRef<std::path::Path>, A: AsRef<std::path::Path>>(
+        &self,
+        backup_path: P,
+        archive_dir: Option<A>,
+        target: &h2_mvstore::RecoveryTarget,
+    ) -> H2Result<h2_mvstore::RestoreReport> {
+        let report = self.store.restore_pitr(backup_path, archive_dir, target)?;
+        self.catalog.reload()?;
+        Ok(report)
     }
 
     pub fn script_to(&self, tx: &Transaction, path: &str) -> H2Result<()> {
@@ -6757,6 +6804,45 @@ fn compute_window_functions(
 fn extract_file_path(param: &str) -> String {
     let p = param.trim().trim_end_matches(';').trim();
     p.trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string()
+}
+
+fn parse_restore_pitr_options(opts: &str) -> H2Result<(Option<String>, h2_mvstore::RecoveryTarget)> {
+    let mut wal_archive = None;
+    let mut target = h2_mvstore::RecoveryTarget::Latest;
+
+    let parts = opts.split(',').collect::<Vec<_>>();
+    for part in parts {
+        let trimmed = part.trim();
+        if let Some(eq_idx) = trimmed.find('=') {
+            let key = trimmed[..eq_idx].trim().to_uppercase();
+            let val = trimmed[eq_idx + 1..].trim().trim_matches('\'').trim_matches('"');
+            match key.as_str() {
+                "WAL_ARCHIVE" => wal_archive = Some(val.to_string()),
+                "RECOVERY_TARGET_VERSION" => {
+                    let v: u64 = val.parse().map_err(|e| H2Error::Execution(format!("Invalid version: {}", e)))?;
+                    target = h2_mvstore::RecoveryTarget::Version(v);
+                }
+                "RECOVERY_TARGET_TX" => {
+                    let tx: u64 = val.parse().map_err(|e| H2Error::Execution(format!("Invalid tx id: {}", e)))?;
+                    target = h2_mvstore::RecoveryTarget::TransactionId(tx);
+                }
+                "RECOVERY_TARGET_TIME" => {
+                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(val, "%Y-%m-%d %H:%M:%S") {
+                        let nanos = dt.and_utc().timestamp_nanos_opt().unwrap_or(0);
+                        target = h2_mvstore::RecoveryTarget::TimestampNanos(nanos);
+                    } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(val) {
+                        let nanos = dt.timestamp_nanos_opt().unwrap_or(0);
+                        target = h2_mvstore::RecoveryTarget::TimestampNanos(nanos);
+                    } else if let Ok(nanos) = val.parse::<i64>() {
+                        target = h2_mvstore::RecoveryTarget::TimestampNanos(nanos);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok((wal_archive, target))
 }
 
 fn split_sql_script(content: &str) -> Vec<String> {

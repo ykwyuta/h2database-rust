@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod buffer_pool;
 pub mod chunk;
 pub mod delta;
@@ -11,6 +12,10 @@ pub mod tree;
 pub mod tx;
 pub mod wal;
 
+pub use backup::{
+    is_binary_backup_file, is_binary_backup_file_stream, read_and_verify_binary_backup,
+    verify_binary_backup, write_binary_backup, BackupMetadata,
+};
 pub use buffer_pool::{BufferPoolManager, ClockReplacer, DiskManager, PageFrame, SlottedPage, PAGE_SIZE};
 pub use chunk::{ChunkMeta, ChunkPayload};
 pub use file_store::FileStore;
@@ -21,7 +26,9 @@ pub use storage_engine::{LocalMVStoreEngine, StorageEngine};
 pub use store::MVStore;
 pub use tree::MVTree;
 pub use tx::{Transaction, TransactionStatus, TransactionStore, VersionedValue};
-pub use wal::{WalChange, WalManager, WalRecord};
+pub use wal::{
+    RecoveryTarget, RestoreReport, WalArchiveMeta, WalArchiver, WalChange, WalManager, WalRecord,
+};
 
 #[cfg(test)]
 mod tests {
@@ -264,6 +271,7 @@ mod tests {
             changes: vec![WalChange {
                 map_name: "items".to_string(), key: vec![version as u8], value: Some(vec![version as u8]),
             }],
+            timestamp_nanos: 0,
         };
         {
             let mut wal = WalManager::open(&path, true).unwrap();

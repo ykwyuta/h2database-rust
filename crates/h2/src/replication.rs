@@ -393,6 +393,17 @@ impl Instance {
         self.actual_listen_addr
     }
 
+    /// 高速バイナリ形式でインスタンスから整合バックアップを取得（Primary / Standby 双方に対応）
+    pub fn backup<P: AsRef<Path>>(&self, path: P) -> H2Result<h2_mvstore::BackupMetadata> {
+        let is_replica = self.is_read_only();
+        self.store.dump_backup_with_role(path, is_replica)
+    }
+
+    /// バックアップファイルの整合性を検証（データ書き換えなし）
+    pub fn verify_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<h2_mvstore::BackupMetadata> {
+        self.store.verify_backup(path)
+    }
+
     pub fn close(mut self) {
         if let Some(shut) = self.shutdown_trigger.take() {
             let _ = shut.send(());

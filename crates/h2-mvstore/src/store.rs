@@ -53,6 +53,7 @@ impl Drop for ActiveCommit<'_> {
 pub struct MVStore {
     file_store: Arc<RwLock<FileStore>>,
     wal_manager: Arc<RwLock<crate::wal::WalManager>>,
+    wal_archiver: Arc<RwLock<Option<crate::wal::WalArchiver>>>,
     maps: Arc<RwLock<HashMap<String, MVMap>>>,
     version: Arc<RwLock<u64>>,
     chunk_id_counter: Arc<RwLock<u32>>,
@@ -205,6 +206,7 @@ impl MVStore {
         Ok(Self {
             file_store: Arc::new(RwLock::new(file_store)),
             wal_manager: Arc::new(RwLock::new(wal_manager)),
+            wal_archiver: Arc::new(RwLock::new(None)),
             maps: Arc::new(RwLock::new(maps)),
             version: Arc::new(RwLock::new(max_version)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
@@ -225,6 +227,7 @@ impl MVStore {
         Self {
             file_store: Arc::new(RwLock::new(FileStore::open_in_memory())),
             wal_manager: Arc::new(RwLock::new(crate::wal::WalManager::open_in_memory())),
+            wal_archiver: Arc::new(RwLock::new(None)),
             maps: Arc::new(RwLock::new(HashMap::new())),
             version: Arc::new(RwLock::new(0)),
             chunk_id_counter: Arc::new(RwLock::new(1)),
@@ -316,10 +319,15 @@ impl MVStore {
 
         let commit_version = self.next_commit_version.fetch_add(1, Ordering::Relaxed) + 1;
         let changes = prepare(commit_version)?;
+        let timestamp_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
         let record = crate::wal::WalRecord {
             tx_id,
             commit_version,
             changes,
+            timestamp_nanos,
         };
         {
             let mut wal = self.wal_manager.write();
@@ -381,6 +389,11 @@ impl MVStore {
                 }
                 if let Some(last) = pending.last() {
                     *self.version.write() = last.record.commit_version;
+                }
+                if let Some(ref mut archiver) = *self.wal_archiver.write() {
+                    for item in &pending {
+                        let _ = archiver.archive_record(&item.record);
+                    }
                 }
                 if let Some(ref sink) = *self.change_sink.read() {
                     let _ = sink.drain_changes();
@@ -748,12 +761,38 @@ impl MVStore {
         Ok(())
     }
 
+    /// WAL アーカイバを有効化
+    pub fn enable_wal_archiver<P: AsRef<Path>>(&self, archive_dir: P) -> H2Result<()> {
+        let archiver = crate::wal::WalArchiver::new(archive_dir)?;
+        *self.wal_archiver.write() = Some(archiver);
+        Ok(())
+    }
+
+    /// WAL アーカイバを無効化
+    pub fn disable_wal_archiver(&self) {
+        *self.wal_archiver.write() = None;
+    }
+
+    /// WAL アーカイバへの参照を取得
+    pub fn wal_archiver(&self) -> Arc<RwLock<Option<crate::wal::WalArchiver>>> {
+        Arc::clone(&self.wal_archiver)
+    }
+
     pub fn get_map_names(&self) -> Vec<String> {
         self.maps.read().keys().cloned().collect()
     }
 
-    /// 全マップのデータをファイルへバックアップ
-    pub fn dump_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<()> {
+    /// 全マップのデータを高速バイナリファイルへバックアップ
+    pub fn dump_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<crate::backup::BackupMetadata> {
+        self.dump_backup_with_role(path, false)
+    }
+
+    /// ロール（Primary または Read Replica）を指定してバックアップを出力
+    pub fn dump_backup_with_role<P: AsRef<Path>>(
+        &self,
+        path: P,
+        is_replica: bool,
+    ) -> H2Result<crate::backup::BackupMetadata> {
         let maps = self.maps.read();
         let mut backup_data: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> = HashMap::new();
         for (name, map) in maps.iter() {
@@ -764,18 +803,21 @@ impl MVStore {
                 .collect();
             backup_data.insert(name.clone(), entries);
         }
-        let serialized = serde_json::to_vec_pretty(&backup_data)
-            .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
-        std::fs::write(path, serialized).map_err(|e| h2_types::H2Error::Storage(e.to_string()))?;
-        Ok(())
+        let current_ver = *self.version.read();
+        let mut file = std::fs::File::create(path)?;
+        crate::backup::write_binary_backup(&mut file, current_ver, is_replica, &backup_data)
     }
 
-    /// バックアップファイルから全マップを復元
+    /// バックアップファイルの整合性を検証（データ書き換えなし: VERIFYONLY 相当）
+    pub fn verify_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<crate::backup::BackupMetadata> {
+        let mut file = std::fs::File::open(path)?;
+        crate::backup::verify_binary_backup(&mut file)
+    }
+
+    /// 高速バイナリバックアップファイルから全マップを復元
     pub fn restore_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<()> {
-        let data = std::fs::read(path).map_err(|e| h2_types::H2Error::Storage(e.to_string()))?;
-        let backup_data: HashMap<String, Vec<(Vec<u8>, Vec<u8>)>> =
-            serde_json::from_slice(&data)
-                .map_err(|e| h2_types::H2Error::Serialization(e.to_string()))?;
+        let mut file = std::fs::File::open(path)?;
+        let (meta, backup_data) = crate::backup::read_and_verify_binary_backup(&mut file)?;
 
         for (name, entries) in backup_data {
             let map = self.open_map(&name);
@@ -784,7 +826,78 @@ impl MVStore {
                 map.put(k, v);
             }
         }
+        if meta.snapshot_version > 0 {
+            self.set_version(meta.snapshot_version);
+        }
         self.commit()?;
         Ok(())
+    }
+
+    /// ベースバックアップと継続 WAL アーカイブを組み合わせた任意時点復旧 (PITR)
+    pub fn restore_pitr<P: AsRef<Path>, A: AsRef<Path>>(
+        &self,
+        backup_path: P,
+        archive_dir: Option<A>,
+        target: &crate::wal::RecoveryTarget,
+    ) -> H2Result<crate::wal::RestoreReport> {
+        let mut file = std::fs::File::open(backup_path)?;
+        let (meta, backup_data) = crate::backup::read_and_verify_binary_backup(&mut file)?;
+        let base_snapshot_version = meta.snapshot_version;
+        let is_replica_backup = meta.is_replica;
+
+        // 1. ベースバックアップの復元
+        for (name, entries) in backup_data {
+            let map = self.open_map(&name);
+            map.clear();
+            for (k, v) in entries {
+                map.put(k, v);
+            }
+        }
+        self.set_version(base_snapshot_version);
+
+        let mut final_recovered_version = base_snapshot_version;
+        let mut records_replayed = 0;
+        let mut target_reached = true;
+
+        // 2. WAL アーカイブからのロールフォワード
+        if let Some(archive_path) = archive_dir {
+            let records = crate::wal::WalArchiver::read_archive_records(archive_path, base_snapshot_version)?;
+            for record in records {
+                let should_apply = match target {
+                    crate::wal::RecoveryTarget::Version(v) => record.commit_version <= *v,
+                    crate::wal::RecoveryTarget::TimestampNanos(t) => record.timestamp_nanos <= *t,
+                    crate::wal::RecoveryTarget::TransactionId(tx) => record.tx_id <= *tx,
+                    crate::wal::RecoveryTarget::Latest => true,
+                };
+
+                if !should_apply {
+                    target_reached = true;
+                    break;
+                }
+
+                for change in record.changes {
+                    let map = self.open_map(&change.map_name);
+                    if let Some(val) = change.value {
+                        map.put(change.key, val);
+                    } else {
+                        map.remove(&change.key);
+                    }
+                }
+
+                final_recovered_version = record.commit_version;
+                records_replayed += 1;
+            }
+        }
+
+        self.set_version(final_recovered_version);
+        self.commit()?;
+
+        Ok(crate::wal::RestoreReport {
+            base_snapshot_version,
+            final_recovered_version,
+            records_replayed,
+            target_reached,
+            is_replica_backup,
+        })
     }
 }

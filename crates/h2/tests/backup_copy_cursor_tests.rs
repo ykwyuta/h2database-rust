@@ -6,7 +6,7 @@ use h2_types::Value;
 #[test]
 fn test_backup_and_restore() {
     let temp_dir = std::env::temp_dir();
-    let backup_path = temp_dir.join("h2_test_backup.json");
+    let backup_path = temp_dir.join("h2_test_backup.h2bk");
     let backup_file = backup_path.to_str().unwrap().replace('\\', "/");
 
     let store = Arc::new(MVStore::open_in_memory());

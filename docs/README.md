@@ -7,6 +7,9 @@
 - 🔒 **[セキュリティテストケース](./testcases/security/README.md)**: 認証・権限、PGWire、MCP、永続化・資源制限の攻撃入力と合格基準。
 - 🧰 **[運用性テストケース](./testcases/operation/README.md)**: バックアップ、監視、計画制御、自動最適化、VACUUM・断片化の手動検証。
 - 📋 **[運用性レビュー](./review/operation/README.md)**: PostgreSQL・SQL Server・Oracle と現行実装の差分、優先順位。
+- 📋 **[PostgreSQL 18 PL/pgSQL 互換性対応表](./review/plpgsql/README.md)**: 公式仕様と手続きシミュレーション層の対応範囲・差分。
+- 🌐 **[PostgreSQL 18 ICU 照合順序の調査報告](./reports/postgresql_18_icu_collation_control.md)**: 指定方法、非決定的比較、性能・運用上の注意点。
+- 🌐 **[SQL Server 照合順序の調査報告](./reports/sql_server_collation_control.md)**: 指定範囲、感度オプション、優先順位、一時表・移行時の注意点。
 - 📖 **[利用者向け公式ガイド (USER_GUIDE.md)](./USER_GUIDE.md)**:
   PostgreSQL 公式ドキュメントの構成をベースに体系化した、データベース利用者向けの実践的総合マニュアル。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順などを網羅。
 - 🛠️ **[開発者・メンテナー向けガイド (DEVELOPER_GUIDE.md)](./DEVELOPER_GUIDE.md)**:
@@ -96,3 +99,5 @@
 - [20. Stateless Streamable-HTTP MCP Server 設計方針](./20_stateless_streamable_http_mcp_server_design.md)
 - [21. Neo4j 互換グラフデータベース（OpenCypher / Bolt）エンジン設計方針](./21_neo4j_compatible_graph_engine_design.md)
 - [22. グラフDB × リレーショナル SQL 統合アクセス機能設計方針 (Cypher-in-SQL / Virtual Graph Tables / SQL:2023 PGQ)](./22_sql_graph_integration_design.md)
+- [23. PL/pgSQL 手続きシミュレーション層の設計方針](./23_plpgsql_procedure_simulation_design.md)
+- [24. 高速バイナリバックアップ・PITR・リードレプリカバックアップ設計方針](./24_high_performance_binary_backup_pitr_and_replica_backup_design.md)

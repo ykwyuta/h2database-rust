@@ -2,7 +2,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
-pub use h2_mvstore::{LocalMVStoreEngine, MVStore, StorageEngine, TransactionStatus};
+pub use h2_mvstore::{
+    BackupMetadata, LocalMVStoreEngine, MVStore, RecoveryTarget, RestoreReport, StorageEngine,
+    TransactionStatus, WalArchiveMeta, WalArchiver,
+};
 pub use h2_sql::{ExecutionResult, Row, SQLEngine};
 pub use h2_types::{
     CacheInvalidationEvent, DataType, FencingToken, FromSql, H2Error, H2Result, LogOpType,
@@ -304,6 +307,46 @@ impl Connection {
     /// 現在設定されているデフォルトクエリタイムアウトを取得
     pub fn query_timeout_duration(&self) -> Option<Duration> {
         *self.default_query_timeout.read()
+    }
+
+    /// 高速バイナリ形式でデータベースをバックアップ
+    pub fn backup<P: AsRef<Path>>(&self, path: P) -> H2Result<BackupMetadata> {
+        let is_replica = self.is_read_only();
+        self.store.dump_backup_with_role(path, is_replica)
+    }
+
+    /// バックアップファイルの整合性を検証（データ書き換えなし: VERIFYONLY 相当）
+    pub fn verify_backup<P: AsRef<Path>>(&self, path: P) -> H2Result<BackupMetadata> {
+        self.store.verify_backup(path)
+    }
+
+    /// バックアップファイルから全マップを復元
+    pub fn restore_from<P: AsRef<Path>>(&self, path: P) -> H2Result<()> {
+        self.store.restore_backup(path)?;
+        self.engine.catalog().reload()?;
+        Ok(())
+    }
+
+    /// ベースバックアップと継続 WAL アーカイブを用いた任意時点復旧 (PITR)
+    pub fn restore_pitr<P: AsRef<Path>, A: AsRef<Path>>(
+        &self,
+        backup_path: P,
+        archive_dir: Option<A>,
+        target: &RecoveryTarget,
+    ) -> H2Result<RestoreReport> {
+        let report = self.store.restore_pitr(backup_path, archive_dir, target)?;
+        self.engine.catalog().reload()?;
+        Ok(report)
+    }
+
+    /// 継続的 WAL アーカイブを有効化
+    pub fn enable_wal_archiver<P: AsRef<Path>>(&self, archive_dir: P) -> H2Result<()> {
+        self.store.enable_wal_archiver(archive_dir)
+    }
+
+    /// 継続的 WAL アーカイブを無効化
+    pub fn disable_wal_archiver(&self) {
+        self.store.disable_wal_archiver();
     }
 
     fn setup_timeout_guard(&self) -> Option<h2_types::TimeoutGuard> {

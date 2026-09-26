@@ -906,6 +906,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "byteorder",
+ "chrono",
  "crc32fast",
  "h2-types",
  "parking_lot",
