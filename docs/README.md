@@ -4,6 +4,7 @@
 
 ## ドキュメント一覧
 
+- 🔒 **[セキュリティテストケース](./testcases/security/README.md)**: 認証・権限、PGWire、MCP、永続化・資源制限の攻撃入力と合格基準。
 - 📖 **[利用者向け公式ガイド (USER_GUIDE.md)](./USER_GUIDE.md)**:
   PostgreSQL 公式ドキュメントの構成をベースに体系化した、データベース利用者向けの実践的総合マニュアル。データ型、SQL構文、トランザクション、日本語全文検索、非同期API、DBeaver接続手順などを網羅。
 - 🛠️ **[開発者・メンテナー向けガイド (DEVELOPER_GUIDE.md)](./DEVELOPER_GUIDE.md)**:
