@@ -1,7 +1,6 @@
 pub mod ast;
 pub mod interpreter;
 pub mod plpgsql;
-pub mod tsql;
 
 use std::sync::Arc;
 use h2_mvstore::Transaction;

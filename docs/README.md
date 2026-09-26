@@ -104,4 +104,6 @@
 - [25. PostgreSQL 18 PL/pgSQL 汎用言語互換および SQL Server T-SQL 拡張設計方針](./25_plpgsql_general_language_compatibility_and_tsql_extensibility_design.md)
 - [26. 多方言 SQL 互換モード (PostgreSQL, MySQL, Oracle, MSSQLServer, DB2, Regular) 設計方針](./26_multi_dialect_compatibility_modes_design.md)
 - [27. 統計サンプリング更新・AutoVacuum・デッドタプルページ再利用の設計方針](./27_sampling_statistics_auto_vacuum_and_dead_tuple_page_reuse_design.md)
+- [28. ソース規模適正化・後方互換コード削除・モジュール分割リファクタリング方針](./28_codebase_refactoring_modularization_and_backward_compatibility_cleanup.md)
+
 
