@@ -92,3 +92,4 @@
 - [19. PostgreSQL 18 対比 UPDATE 性能改善・検証シナリオ拡張レポート](./19_update_performance_pg18_comparison.md)
 - [20. Stateless Streamable-HTTP MCP Server 設計方針](./20_stateless_streamable_http_mcp_server_design.md)
 - [21. Neo4j 互換グラフデータベース（OpenCypher / Bolt）エンジン設計方針](./21_neo4j_compatible_graph_engine_design.md)
+- [22. グラフDB × リレーショナル SQL 統合アクセス機能設計方針 (Cypher-in-SQL / Virtual Graph Tables / SQL:2023 PGQ)](./22_sql_graph_integration_design.md)
