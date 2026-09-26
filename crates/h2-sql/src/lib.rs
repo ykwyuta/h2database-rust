@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod autovacuum;
 pub mod catalog;
 pub mod executor;
 pub mod expression;
@@ -12,6 +13,7 @@ pub mod stats;
 pub mod vectorized;
 
 pub use auth::{AuthManager, Privilege, UserInfo};
+pub use autovacuum::{AutoVacuumConfig, AutoVacuumCoordinator, TableActivity};
 pub use catalog::{Catalog, ColumnDef, ColumnStats, IndexDef, TableDef, TableStats, VirtualGraphKind, parse_virtual_graph_table};
 pub use executor::{ExecutionResult, SQLEngine};
 pub use parser::{convert_data_type, parse_sql, parse_sql_mode};
@@ -19,7 +21,7 @@ pub use procedural::ProceduralEngine;
 pub use fts::{FtsIndex, MorphTokenizer, NGramTokenizer, Tokenizer, TokenizerKind};
 pub use memory::{ExternalSorter, MemoryConfig, MemoryGrant, MemoryGrantCoordinator, MemoryTracker};
 pub use row::Row;
-pub use stats::{analyze_table, estimate_scan_cost, estimate_selectivity};
+pub use stats::{analyze_table, analyze_table_with_sample, estimate_scan_cost, estimate_selectivity, SampleSpec};
 pub use vectorized::{
     create_arrow_schema, scan_slotted_page_to_batch, ExecutionMode, MemoryBatchOperator,
     MemoryRowOperator, PhysicalOperator, RowToVectorAdapter, VectorAggregateOp, VectorChunk,
@@ -331,4 +333,134 @@ mod tests {
             panic!("Expected Query result for hybrid relational-graph JOIN");
         }
     }
+
+    #[test]
+    fn test_sampling_analyze_and_show_stats() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+
+        engine.execute("CREATE TABLE sample_test (id INT PRIMARY KEY, category VARCHAR, val INT)").unwrap();
+
+        // 100 行挿入（category: 'A' 60回, 'B' 30回, 'C' 10回）
+        for i in 1..=100 {
+            let cat = if i <= 60 { "A" } else if i <= 90 { "B" } else { "C" };
+            engine.execute(&format!("INSERT INTO sample_test VALUES ({}, '{}', {})", i, cat, i * 10)).unwrap();
+        }
+
+        // 1. SAMPLE ROWS による ANALYZE
+        engine.execute("ANALYZE sample_test WITH SAMPLE 40 ROWS").unwrap();
+
+        let stats_res = engine.execute("SHOW STATS FOR sample_test").unwrap();
+        if let ExecutionResult::Query { columns, rows } = stats_res {
+            assert_eq!(columns[0], "COLUMN_NAME");
+            // category 列の統計を検証
+            let cat_row = rows.iter().find(|r| r.values[0] == Value::String("category".to_string())).unwrap();
+            let ndv = match cat_row.values[2] {
+                Value::BigInt(n) => n,
+                _ => panic!("Expected BigInt NDV"),
+            };
+            assert!(ndv >= 2 && ndv <= 3);
+            let mcv_str = match &cat_row.values[5] {
+                Value::String(s) => s.clone(),
+                _ => panic!("Expected String MCV"),
+            };
+            assert!(mcv_str.contains("\"A\""));
+        } else {
+            panic!("Expected SHOW STATS Query result");
+        }
+
+        // テーブル全体の SHOW STATS で sample_ratio が 0.4 になっていることを検証
+        let all_stats = engine.execute("SHOW STATS").unwrap();
+        if let ExecutionResult::Query { rows, .. } = all_stats {
+            let t_row = rows.iter().find(|r| r.values[0] == Value::String("sample_test".to_string())).unwrap();
+            let sample_ratio = match t_row.values[3] {
+                Value::Double(d) => d,
+                _ => panic!("Expected Double sample_ratio"),
+            };
+            assert!((sample_ratio - 0.4).abs() < 0.05);
+        } else {
+            panic!("Expected SHOW STATS Query result");
+        }
+
+        // 2. SAMPLE PERCENT による ANALYZE
+        engine.execute("ANALYZE sample_test WITH SAMPLE 50 PERCENT").unwrap();
+        let all_stats50 = engine.execute("SHOW STATS").unwrap();
+        if let ExecutionResult::Query { rows, .. } = all_stats50 {
+            let t_row = rows.iter().find(|r| r.values[0] == Value::String("sample_test".to_string())).unwrap();
+            let sample_ratio = match t_row.values[3] {
+                Value::Double(d) => d,
+                _ => panic!("Expected Double sample_ratio"),
+            };
+            assert!((sample_ratio - 0.5).abs() < 0.05);
+        } else {
+            panic!("Expected SHOW STATS Query result");
+        }
+    }
+
+    #[test]
+    fn test_autovacuum_thresholds_and_dead_tuple_pruning() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+
+        // 閾値を小さく設定
+        engine.autovacuum().set_config(AutoVacuumConfig {
+            vacuum_threshold: 4,
+            vacuum_scale_factor: 0.0,
+            analyze_threshold: 8,
+            analyze_scale_factor: 0.0,
+            enabled: true,
+        });
+
+        engine.execute("CREATE TABLE auto_test (id INT PRIMARY KEY, val INT)").unwrap();
+
+        // 10 行一括挿入 -> mod_count = 10 (閾値 8 超え) -> 自動 ANALYZE が発火
+        let values_str = (1..=10).map(|i| format!("({}, {})", i, i)).collect::<Vec<_>>().join(", ");
+        engine.execute(&format!("INSERT INTO auto_test VALUES {}", values_str)).unwrap();
+
+        let act = engine.autovacuum().get_or_create_activity("auto_test");
+        assert_eq!(act.mod_count.load(std::sync::atomic::Ordering::SeqCst), 0); // 自動ANALYZEによりリセットされた
+        assert!(act.last_analyze_time.load(std::sync::atomic::Ordering::SeqCst) > 0);
+
+        // 5 行一括更新 -> dead_tuple_count = 5 (閾値 4 超え) -> 自動 VACUUM が発火
+        engine.execute("UPDATE auto_test SET val = val + 100 WHERE id <= 5").unwrap();
+
+        assert_eq!(act.dead_tuple_count.load(std::sync::atomic::Ordering::SeqCst), 0); // 自動VACUUMによりリセットされた
+        assert!(act.last_vacuum_time.load(std::sync::atomic::Ordering::SeqCst) > 0);
+
+        // データ整合性の確認
+        let res = engine.execute("SELECT val FROM auto_test WHERE id = 1").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res {
+            assert_eq!(rows[0].values[0], Value::Integer(101));
+        } else {
+            panic!("Expected Query result");
+        }
+    }
+
+    #[test]
+    fn test_vacuum_vs_vacuum_full_statements() {
+        let store = Arc::new(MVStore::open_in_memory());
+        let engine = SQLEngine::new(store).unwrap();
+
+        engine.execute("CREATE TABLE vac_test (id INT PRIMARY KEY, info VARCHAR)").unwrap();
+        engine.execute("INSERT INTO vac_test VALUES (1, 'old'), (2, 'stay')").unwrap();
+        engine.execute("DELETE FROM vac_test WHERE id = 1").unwrap();
+
+        // 通常 VACUUM（オンラインデッドタプル回収）
+        let vac_res = engine.execute("VACUUM vac_test").unwrap();
+        assert!(matches!(vac_res, ExecutionResult::Ddl));
+
+        // VACUUM FULL（ファイル再構築物理コンパクション）
+        let full_res = engine.execute("VACUUM FULL").unwrap();
+        assert!(matches!(full_res, ExecutionResult::Ddl));
+
+        // 生存レコードが正しく参照できること
+        let res = engine.execute("SELECT info FROM vac_test WHERE id = 2").unwrap();
+        if let ExecutionResult::Query { rows, .. } = res {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].values[0], Value::String("stay".to_string()));
+        } else {
+            panic!("Expected Query result");
+        }
+    }
 }
+

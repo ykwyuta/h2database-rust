@@ -1,4 +1,4 @@
-﻿use byteorder::{BigEndian, ByteOrder};
+use byteorder::{BigEndian, ByteOrder};
 use crc32fast::Hasher;
 
 pub const PAGE_SIZE: usize = 8192;
@@ -141,6 +141,32 @@ impl SlottedPage {
         BigEndian::write_u16(&mut buf[slot_offset..slot_offset + 2], 0);
         BigEndian::write_u16(&mut buf[slot_offset + 2..slot_offset + 4], 0);
         true
+    }
+
+    /// 有効（生存）タプル数を取得
+    pub fn live_tuple_count(buf: &[u8; PAGE_SIZE]) -> usize {
+        let tuple_count = Self::get_tuple_count(buf);
+        let mut live = 0;
+        for slot_id in 0..tuple_count {
+            let slot_offset = PAGE_HEADER_SIZE + (slot_id as usize) * SLOT_SIZE;
+            let offset = BigEndian::read_u16(&buf[slot_offset..slot_offset + 2]) as usize;
+            let len = BigEndian::read_u16(&buf[slot_offset + 2..slot_offset + 4]) as usize;
+            if offset != 0 && len != 0 && offset + len <= PAGE_SIZE {
+                live += 1;
+            }
+        }
+        live
+    }
+
+    /// ページ内のすべてのタプルが削除（デッド）されているか確認
+    pub fn is_all_dead(buf: &[u8; PAGE_SIZE]) -> bool {
+        Self::live_tuple_count(buf) == 0
+    }
+
+    /// ページを空きページ（Free Page, page_type = 2）としてマーク・初期化
+    pub fn mark_as_free(buf: &mut [u8; PAGE_SIZE]) {
+        let page_id = Self::get_page_id(buf);
+        Self::init(buf, page_id, 2);
     }
 
     /// 削除されたタプル領域を回収（デフラグメンテーション）

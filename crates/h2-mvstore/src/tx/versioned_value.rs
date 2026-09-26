@@ -97,6 +97,43 @@ impl VersionedValue {
         self.uncommitted = None;
     }
 
+    /// 指定世代（horizon_version）以下のトランザクションにおいて完全にデッドタプル（削除済み）か判定
+    pub fn is_dead(&self, horizon_version: u64) -> bool {
+        if self.uncommitted.is_some() {
+            return false;
+        }
+        if self.committed_history.is_empty() {
+            return true;
+        }
+        if let Some(first) = self.committed_history.first() {
+            if first.commit_version <= horizon_version && first.value.is_none() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// horizon_version より古い余分な履歴バージョンを刈り込む。変更があった場合 true を返す
+    pub fn prune_old_versions(&mut self, horizon_version: u64) -> bool {
+        if self.committed_history.len() <= 1 {
+            return false;
+        }
+        let mut cutoff = None;
+        for (i, rec) in self.committed_history.iter().enumerate() {
+            if rec.commit_version <= horizon_version {
+                cutoff = Some(i + 1);
+                break;
+            }
+        }
+        if let Some(cutoff_idx) = cutoff {
+            if cutoff_idx < self.committed_history.len() {
+                self.committed_history.truncate(cutoff_idx);
+                return true;
+            }
+        }
+        false
+    }
+
     /// 高速ゼロコピー可視性判定（単一コミット世代の典型パターンをゼロアロケーションで判定）
     #[inline(always)]
     pub fn read_visible_raw(bytes: &[u8], _reader_tx_id: u64, snapshot_version: u64) -> Option<&[u8]> {

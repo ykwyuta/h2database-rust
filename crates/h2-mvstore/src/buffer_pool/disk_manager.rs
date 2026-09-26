@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -12,6 +12,7 @@ pub struct DiskManager {
     file: Mutex<Option<File>>,
     memory_pages: Mutex<HashMap<u32, [u8; PAGE_SIZE]>>,
     num_pages: AtomicU32,
+    free_pages: Mutex<Vec<u32>>,
 }
 
 impl DiskManager {
@@ -21,6 +22,7 @@ impl DiskManager {
             file: Mutex::new(None),
             memory_pages: Mutex::new(HashMap::new()),
             num_pages: AtomicU32::new(0),
+            free_pages: Mutex::new(Vec::new()),
         }
     }
 
@@ -40,6 +42,7 @@ impl DiskManager {
             file: Mutex::new(Some(file)),
             memory_pages: Mutex::new(HashMap::new()),
             num_pages: AtomicU32::new(num_pages),
+            free_pages: Mutex::new(Vec::new()),
         })
     }
 
@@ -82,9 +85,26 @@ impl DiskManager {
         Ok(())
     }
 
-    /// 新規ページIDを発行
+    /// 新規ページIDを発行（空きページがあれば優先再利用）
     pub fn allocate_page(&self) -> u32 {
+        let mut free_guard = self.free_pages.lock();
+        if let Some(reused_page_id) = free_guard.pop() {
+            return reused_page_id;
+        }
         self.num_pages.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// デッドタプル回収などで不要になったページを再利用可能リストに返却
+    pub fn deallocate_page(&self, page_id: u32) {
+        let mut free_guard = self.free_pages.lock();
+        if !free_guard.contains(&page_id) {
+            free_guard.push(page_id);
+        }
+    }
+
+    /// 現在再利用可能な空きページ数を取得
+    pub fn free_page_count(&self) -> usize {
+        self.free_pages.lock().len()
     }
 
     pub fn num_pages(&self) -> u32 {

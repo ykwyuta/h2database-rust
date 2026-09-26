@@ -1,4 +1,4 @@
-﻿pub mod clock_replacer;
+pub mod clock_replacer;
 pub mod disk_manager;
 pub mod slotted_page;
 
@@ -202,6 +202,53 @@ impl BufferPoolManager {
         &self.frames[frame_id]
     }
 
+    /// ページを解放し、空きページ再利用リストへ登録
+    pub fn free_page(&self, page_id: u32) -> H2Result<()> {
+        let frame_id = self.fetch_page(page_id)?;
+        {
+            let mut frame = self.frames[frame_id].write();
+            SlottedPage::mark_as_free(&mut frame.data);
+            frame.is_dirty.store(true, Ordering::SeqCst);
+        }
+        self.unpin_page(page_id, true)?;
+        self.disk_manager.deallocate_page(page_id);
+        Ok(())
+    }
+
+    /// ページのバキューム（全タプルがデッドの場合は空きページ化して再利用リストへ登録、生存タプルがある場合はデフラグ）
+    /// ページが解放された場合は Ok(true)、生存タプルがありデフラグされた場合は Ok(false) を返す
+    pub fn vacuum_page(&self, page_id: u32) -> H2Result<bool> {
+        let frame_id = self.fetch_page(page_id)?;
+        let is_dead = {
+            let frame = self.frames[frame_id].read();
+            SlottedPage::is_all_dead(&frame.data)
+        };
+
+        if is_dead {
+            {
+                let mut frame = self.frames[frame_id].write();
+                SlottedPage::mark_as_free(&mut frame.data);
+                frame.is_dirty.store(true, Ordering::SeqCst);
+            }
+            self.unpin_page(page_id, true)?;
+            self.disk_manager.deallocate_page(page_id);
+            Ok(true)
+        } else {
+            {
+                let mut frame = self.frames[frame_id].write();
+                SlottedPage::defragment(&mut frame.data);
+                frame.is_dirty.store(true, Ordering::SeqCst);
+            }
+            self.unpin_page(page_id, true)?;
+            Ok(false)
+        }
+    }
+
+    /// 現在再利用可能な空きページ数を取得
+    pub fn free_page_count(&self) -> usize {
+        self.disk_manager.free_page_count()
+    }
+
     pub fn pool_size(&self) -> usize {
         self.pool_size
     }
@@ -244,5 +291,42 @@ mod tests {
             assert_eq!(SlottedPage::get_tuple(&f.data, 0), Some(&b"buffered record"[..]));
         }
         bpm.unpin_page(page0, false).unwrap();
+    }
+
+    #[test]
+    fn test_dead_tuple_page_vacuum_and_reuse() {
+        let disk = Arc::new(DiskManager::new_in_memory());
+        let bpm = BufferPoolManager::new(disk, 4);
+
+        // ページ0作成 & タプル挿入
+        let (page0, frame0) = bpm.new_page(0).unwrap();
+        assert_eq!(page0, 0);
+        {
+            let mut f = bpm.get_frame(frame0).write();
+            let s0 = SlottedPage::insert_tuple(&mut f.data, b"dead tuple").unwrap();
+            assert_eq!(s0, 0);
+        }
+        bpm.unpin_page(page0, true).unwrap();
+
+        // タプルを論理削除
+        {
+            let frame0 = bpm.fetch_page(page0).unwrap();
+            {
+                let mut f = bpm.get_frame(frame0).write();
+                SlottedPage::delete_tuple(&mut f.data, 0);
+                assert!(SlottedPage::is_all_dead(&f.data));
+            }
+            bpm.unpin_page(page0, true).unwrap();
+        }
+
+        // vacuum_page を実行 -> 全タプルが死んでいるためページが解放（Free Page Listへ）
+        let reclaimed = bpm.vacuum_page(page0).unwrap();
+        assert!(reclaimed);
+        assert_eq!(bpm.free_page_count(), 1);
+
+        // 次の new_page の割り当てで、解放された page0 が再利用される！
+        let (reused_page, _) = bpm.new_page(0).unwrap();
+        assert_eq!(reused_page, 0);
+        assert_eq!(bpm.free_page_count(), 0);
     }
 }

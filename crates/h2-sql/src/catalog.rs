@@ -21,6 +21,10 @@ pub struct ColumnStats {
     pub most_common_freqs: Vec<f64>,
 }
 
+fn default_sample_ratio() -> f64 {
+    1.0
+}
+
 /// テーブル統計情報
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableStats {
@@ -28,6 +32,8 @@ pub struct TableStats {
     pub dead_row_count: u64,
     pub last_analyzed: Option<u64>,
     pub total_pages: u64,
+    #[serde(default = "default_sample_ratio")]
+    pub sample_ratio: f64,
 }
 
 /// カラム定義
@@ -753,6 +759,7 @@ impl Catalog {
     ) -> H2Result<()> {
         let mut table = self.get_table(table_name)
             .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+        table.approx_row_count = stats.row_count as i64;
         table.stats = Some(stats);
         for col in &mut table.columns {
             if let Some(cs) = column_stats.get(&col.name.to_lowercase()) {
@@ -768,6 +775,9 @@ impl Catalog {
             None => return Ok(()),
         };
         table.approx_row_count = (table.approx_row_count + delta).max(0);
+        if let Some(ref mut s) = table.stats {
+            s.row_count = table.approx_row_count as u64;
+        }
         self.update_table(table)
     }
 
@@ -777,6 +787,9 @@ impl Catalog {
             None => return Ok(()),
         };
         table.approx_row_count = count.max(0);
+        if let Some(ref mut s) = table.stats {
+            s.row_count = table.approx_row_count as u64;
+        }
         self.update_table(table)
     }
 

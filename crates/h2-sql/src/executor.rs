@@ -535,6 +535,7 @@ pub struct SQLEngine {
     query_stats: Arc<crate::query_stats::QueryStats>,
     procedural_engine: Arc<crate::procedural::ProceduralEngine>,
     dialect_mode: Arc<parking_lot::RwLock<h2_types::SqlDialectMode>>,
+    autovacuum: Arc<crate::autovacuum::AutoVacuumCoordinator>,
 }
 
 impl SQLEngine {
@@ -550,6 +551,9 @@ impl SQLEngine {
         let plan_cache = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let procedural_engine = Arc::new(crate::procedural::ProceduralEngine::new());
         let dialect_mode = Arc::new(parking_lot::RwLock::new(h2_types::SqlDialectMode::Regular));
+        let autovacuum = Arc::new(crate::autovacuum::AutoVacuumCoordinator::new(
+            crate::autovacuum::AutoVacuumConfig::default(),
+        ));
         Ok(Self {
             store,
             tx_store,
@@ -564,7 +568,16 @@ impl SQLEngine {
             query_stats: Arc::new(crate::query_stats::QueryStats::default()),
             procedural_engine,
             dialect_mode,
+            autovacuum,
         })
+    }
+
+    pub fn autovacuum(&self) -> &Arc<crate::autovacuum::AutoVacuumCoordinator> {
+        &self.autovacuum
+    }
+
+    pub fn run_autovacuum_if_needed(&self) -> H2Result<Vec<(String, bool, bool)>> {
+        self.autovacuum.run_all_maintenance(&self.tx_store, &self.catalog)
     }
 
     pub fn dialect_mode(&self) -> h2_types::SqlDialectMode {
@@ -638,13 +651,22 @@ impl SQLEngine {
         let started = Instant::now();
         let metrics = QueryMetricsGuard::start();
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        let result = if trimmed.eq_ignore_ascii_case("VACUUM") {
+        let trimmed_upper = trimmed.to_uppercase();
+        let result = if trimmed_upper == "VACUUM FULL" {
             self.store.compact().map(|_| ExecutionResult::Ddl)
+        } else if trimmed_upper == "VACUUM" || trimmed_upper.starts_with("VACUUM ") {
+            self.execute_vacuum(trimmed)
         } else {
             let tx = self.tx_store.begin();
             let result = self.execute_with_user_and_tx_inner(&tx, sql, user);
             match result {
-                Ok(value) => tx.commit().map(|_| value),
+                Ok(value) => {
+                    let commit_res = tx.commit();
+                    if commit_res.is_ok() && matches!(value, ExecutionResult::Dml { .. }) {
+                        let _ = self.autovacuum.run_all_maintenance(&self.tx_store, &self.catalog);
+                    }
+                    commit_res.map(|_| value)
+                }
                 Err(error) => {
                     let _ = tx.rollback();
                     Err(error)
@@ -706,7 +728,9 @@ impl SQLEngine {
         }
 
         if self.is_read_only() {
-            if trimmed.eq_ignore_ascii_case("VACUUM")
+            if trimmed_upper == "VACUUM"
+                || trimmed_upper.starts_with("VACUUM ")
+                || trimmed_upper == "VACUUM FULL"
                 || trimmed_upper.starts_with("RESTORE FROM ")
                 || trimmed_upper.starts_with("RUNSCRIPT FROM ")
                 || trimmed_upper.starts_with("ALTER SEQUENCE")
@@ -722,9 +746,30 @@ impl SQLEngine {
             }
         }
 
-        if trimmed.eq_ignore_ascii_case("VACUUM") {
+        if trimmed_upper == "VACUUM FULL" {
             self.store.compact()?;
             return Ok(ExecutionResult::Ddl);
+        }
+
+        if trimmed_upper == "VACUUM" || trimmed_upper.starts_with("VACUUM ") {
+            return self.execute_vacuum(trimmed);
+        }
+
+        if trimmed_upper == "AUTOVACUUM" || trimmed_upper == "AUTOVACUUM RUN" || trimmed_upper == "MAINTENANCE" {
+            let res = self.autovacuum.run_all_maintenance(&self.tx_store, &self.catalog)?;
+            let columns = vec!["table_name".to_string(), "vacuumed".to_string(), "analyzed".to_string()];
+            let rows = res.into_iter().map(|(tbl, vac, ana)| {
+                crate::row::Row::new(vec![
+                    Value::String(tbl),
+                    Value::Boolean(vac),
+                    Value::Boolean(ana),
+                ])
+            }).collect();
+            return Ok(ExecutionResult::Query { columns, rows });
+        }
+
+        if trimmed_upper == "SHOW STATS" || trimmed_upper.starts_with("SHOW STATS ") {
+            return self.execute_show_stats(trimmed);
         }
 
         // ================= DCL コマンド (ユーザー・権限管理) =================
@@ -1268,25 +1313,173 @@ impl SQLEngine {
         }
     }
 
-    fn execute_analyze(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+    fn execute_vacuum(&self, sql: &str) -> H2Result<ExecutionResult> {
         let parts: Vec<&str> = sql.split_whitespace().collect();
-        if parts.len() == 1 {
-            // 全テーブルを ANALYZE
-            let tables = self.catalog.all_tables();
-            for table_def in tables {
-                let (stats, col_stats) = crate::stats::analyze_table(tx, &table_def)?;
-                self.catalog.update_table_stats(&table_def.name, stats, col_stats)?;
-            }
-        } else {
-            // 指定テーブルを ANALYZE
+        if parts.len() >= 2 && parts[1].eq_ignore_ascii_case("FULL") {
+            self.store.compact()?;
+            return Ok(ExecutionResult::Ddl);
+        }
+
+        if parts.len() >= 2 && !parts[1].eq_ignore_ascii_case("FULL") {
             let table_name = parts[1].trim_matches(';').trim_matches('"').trim_matches('\'');
             let table_def = self.catalog.get_table(table_name)
                 .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
-            let (stats, col_stats) = crate::stats::analyze_table(tx, &table_def)?;
+            let map_name = table_def.map_name();
+            self.tx_store.vacuum_map(&map_name)?;
+        } else {
+            for table in self.catalog.all_tables() {
+                let map_name = table.map_name();
+                self.tx_store.vacuum_map(&map_name)?;
+            }
+        }
+        Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_analyze(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let mut sample_spec = crate::stats::SampleSpec::Default;
+        let mut table_name_opt = None;
+
+        let mut i = 1;
+        while i < parts.len() {
+            let part_upper = parts[i].to_uppercase();
+            let clean_part = parts[i].trim_matches(';').trim_matches('"').trim_matches('\'');
+            if part_upper == "WITH" {
+                i += 1;
+                continue;
+            }
+            if part_upper == "SAMPLE" {
+                i += 1;
+                if i < parts.len() {
+                    let num_str = parts[i].trim_matches(';').trim_matches('"').trim_matches('\'').trim_end_matches('%');
+                    let is_pct_sign = parts[i].ends_with('%');
+                    i += 1;
+                    let mut is_percent = is_pct_sign;
+                    if i < parts.len() {
+                        let unit = parts[i].to_uppercase();
+                        if unit.starts_with("PERCENT") {
+                            is_percent = true;
+                            i += 1;
+                        } else if unit.starts_with("ROW") {
+                            is_percent = false;
+                            i += 1;
+                        }
+                    }
+                    if is_percent {
+                        let pct = num_str.parse::<f64>().map_err(|_| {
+                            H2Error::Execution(format!("Invalid sample percent: {}", num_str))
+                        })?;
+                        sample_spec = crate::stats::SampleSpec::Percent(pct);
+                    } else {
+                        let rows = num_str.parse::<usize>().map_err(|_| {
+                            H2Error::Execution(format!("Invalid sample rows: {}", num_str))
+                        })?;
+                        sample_spec = crate::stats::SampleSpec::Rows(rows);
+                    }
+                }
+            } else if table_name_opt.is_none() {
+                table_name_opt = Some(clean_part);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        if let Some(table_name) = table_name_opt {
+            let table_def = self.catalog.get_table(table_name)
+                .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+            let (stats, col_stats) = crate::stats::analyze_table_with_sample(tx, &table_def, sample_spec)?;
             self.catalog.update_table_stats(table_name, stats, col_stats)?;
+        } else {
+            let tables = self.catalog.all_tables();
+            for table_def in tables {
+                let (stats, col_stats) = crate::stats::analyze_table_with_sample(tx, &table_def, sample_spec)?;
+                self.catalog.update_table_stats(&table_def.name, stats, col_stats)?;
+            }
         }
         self.store.commit()?;
         Ok(ExecutionResult::Ddl)
+    }
+
+    fn execute_show_stats(&self, sql: &str) -> H2Result<ExecutionResult> {
+        let parts: Vec<&str> = sql.split_whitespace().collect();
+        let table_name_opt = if parts.len() >= 4 && parts[2].eq_ignore_ascii_case("FOR") {
+            Some(parts[3].trim_matches(';').trim_matches('"').trim_matches('\''))
+        } else if parts.len() >= 3 && !parts[2].eq_ignore_ascii_case("FOR") {
+            Some(parts[2].trim_matches(';').trim_matches('"').trim_matches('\''))
+        } else {
+            None
+        };
+
+        if let Some(table_name) = table_name_opt {
+            let table_def = self.catalog.get_table(table_name)
+                .ok_or_else(|| H2Error::Catalog(format!("Table '{}' not found", table_name)))?;
+            let columns = vec![
+                "COLUMN_NAME".to_string(),
+                "DATA_TYPE".to_string(),
+                "NDV".to_string(),
+                "NULL_FRAC".to_string(),
+                "AVG_WIDTH".to_string(),
+                "MCV".to_string(),
+            ];
+            let mut rows = Vec::new();
+            for col in &table_def.columns {
+                if let Some(ref cs) = col.stats {
+                    let mcv_str = cs.most_common_vals.iter()
+                        .take(5)
+                        .map(|v| format!("{:?}", v))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    rows.push(Row::new(vec![
+                        Value::String(col.name.clone()),
+                        Value::String(col.data_type.to_string()),
+                        Value::BigInt(cs.ndv as i64),
+                        Value::Double(cs.null_frac),
+                        Value::Double(cs.avg_width),
+                        Value::String(mcv_str),
+                    ]));
+                } else {
+                    rows.push(Row::new(vec![
+                        Value::String(col.name.clone()),
+                        Value::String(col.data_type.to_string()),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                        Value::String(String::new()),
+                    ]));
+                }
+            }
+            Ok(ExecutionResult::Query { columns, rows })
+        } else {
+            let columns = vec![
+                "TABLE_NAME".to_string(),
+                "ROW_COUNT".to_string(),
+                "TOTAL_PAGES".to_string(),
+                "SAMPLE_RATIO".to_string(),
+                "LAST_ANALYZED".to_string(),
+            ];
+            let mut rows = Vec::new();
+            for table in self.catalog.all_tables() {
+                if let Some(ref s) = table.stats {
+                    rows.push(Row::new(vec![
+                        Value::String(table.name.clone()),
+                        Value::BigInt(s.row_count as i64),
+                        Value::BigInt(s.total_pages as i64),
+                        Value::Double(s.sample_ratio),
+                        s.last_analyzed.map(|ms| Value::BigInt(ms as i64)).unwrap_or(Value::Null),
+                    ]));
+                } else {
+                    rows.push(Row::new(vec![
+                        Value::String(table.name.clone()),
+                        Value::BigInt(table.approx_row_count as i64),
+                        Value::Null,
+                        Value::Null,
+                        Value::Null,
+                    ]));
+                }
+            }
+            Ok(ExecutionResult::Query { columns, rows })
+        }
     }
 
     fn execute_set_max_materialized_rows(&self, sql: &str) -> H2Result<ExecutionResult> {
@@ -2861,6 +3054,7 @@ fn apply_join(
                 }
 
                 let _ = self.catalog.update_approx_row_count(&table_name, affected_rows as i64);
+                self.autovacuum.record_insert(&table_name, affected_rows);
 
                 Ok(ExecutionResult::Dml { affected_rows })
             }
@@ -3042,6 +3236,7 @@ fn apply_join(
                 }
 
                 let _ = self.catalog.update_approx_row_count(&table_name, -(affected_rows as i64));
+                self.autovacuum.record_delete(&table_name, affected_rows);
 
                 Ok(ExecutionResult::Dml { affected_rows })
             }
@@ -3398,6 +3593,8 @@ fn apply_join(
                         return Ok(ExecutionResult::Query { columns: cols, rows: r_rows });
                     }
                 }
+
+                self.autovacuum.record_update(&table_name, affected_rows);
 
                 Ok(ExecutionResult::Dml { affected_rows })
             }
@@ -5393,7 +5590,7 @@ pub(crate) fn convert_value_bounds_to_bytes(
                                 let tables = self.catalog.all_tables();
                                 let mut rows = Vec::new();
                                 for t in tables {
-                                    let row_cnt = t.stats.as_ref().map(|s| s.row_count as i64).unwrap_or(t.approx_row_count);
+                                    let row_cnt = t.approx_row_count;
                                     rows.push(Row::new(vec![
                                         Value::String(t.name.clone()),
                                         Value::Integer(t.columns.len() as i32),
