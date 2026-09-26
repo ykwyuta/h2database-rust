@@ -1150,6 +1150,8 @@ impl SQLEngine {
                     TableFactor::Table { name, alias, args, .. } => {
                         if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
                             res
+                        } else if let Some(res) = self.resolve_iceberg_table_function(name, alias, args)? {
+                            res
                         } else {
                             let base_table_name = normalize_object_name(name);
                             let base_table_alias = alias.as_ref().map(|a| a.name.value.clone());
@@ -1310,7 +1312,7 @@ impl SQLEngine {
                                         _ => true,
                                     }
                                     && select.having.is_none();
-                                let pushdown_ops = if is_simple_agg && !table_def.is_cache {
+                                let pushdown_ops = if is_simple_agg && !table_def.is_cache && !table_def.is_iceberg {
                                     Self::parse_aggregate_ops(&select.projection, &ctx)
                                 } else {
                                     None
@@ -1374,7 +1376,7 @@ impl SQLEngine {
 
                                 // IndexScan の最適化 (等値 Point Lookup & Range Scan 対応)
                                 let mut index_scanned: Option<Vec<Row>> = None;
-                                if from_table.joins.is_empty() {
+                                if from_table.joins.is_empty() && !table_def.is_iceberg {
                                     if let Some(ref sel) = select.selection {
                                         let indexes = self.catalog.get_table_indexes(&base_table_name);
 
@@ -1602,6 +1604,8 @@ impl SQLEngine {
 
                                 let rows = if let Some(r) = index_scanned {
                                     r
+                                } else if table_def.is_iceberg {
+                                    crate::iceberg::read_iceberg_table_rows(&table_def, select.selection.as_ref(), None)?
                                 } else {
                                     let entries = tx.scan_visible(&map_name)?;
                                     let mut current_rows = Vec::with_capacity(entries.len());

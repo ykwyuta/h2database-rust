@@ -166,6 +166,10 @@ pub struct TableDef {
     pub write_back_mode: Option<String>,
     #[serde(default)]
     pub is_unlogged: bool,
+    #[serde(default)]
+    pub is_iceberg: bool,
+    #[serde(default)]
+    pub iceberg_location: Option<String>,
 }
 
 impl TableDef {
@@ -199,6 +203,8 @@ impl TableDef {
             write_back_interval_ms: None,
             write_back_mode: None,
             is_unlogged: false,
+            is_iceberg: false,
+            iceberg_location: None,
         }
     }
 
@@ -247,6 +253,8 @@ impl TableDef {
             write_back_interval_ms: None,
             write_back_mode: None,
             is_unlogged: false,
+            is_iceberg: false,
+            iceberg_location: None,
         }
     }
 
@@ -301,7 +309,52 @@ impl TableDef {
             write_back_interval_ms,
             write_back_mode,
             is_unlogged,
+            is_iceberg: false,
+            iceberg_location: None,
         }
+    }
+
+    pub fn new_iceberg(
+        name: impl Into<String>,
+        mut columns: Vec<ColumnDef>,
+        location: impl Into<String>,
+    ) -> Self {
+        for (idx, col) in columns.iter_mut().enumerate() {
+            if col.physical_index.is_none() {
+                col.physical_index = Some(idx);
+            }
+        }
+        let pk_cols: Vec<String> = columns
+            .iter()
+            .filter(|c| c.is_primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        Self {
+            name: name.into(),
+            schema: default_schema(),
+            columns,
+            next_row_id: 1,
+            foreign_keys: Vec::new(),
+            primary_key: pk_cols,
+            unique_constraints: Vec::new(),
+            is_queue: false,
+            retention_duration_ms: None,
+            max_bytes: None,
+            stats: None,
+            approx_row_count: 0,
+            is_cache: false,
+            cache_ttl_ms: None,
+            write_back_table: None,
+            write_back_interval_ms: None,
+            write_back_mode: None,
+            is_unlogged: true,
+            is_iceberg: true,
+            iceberg_location: Some(location.into()),
+        }
+    }
+
+    pub fn is_iceberg_table(&self) -> bool {
+        self.is_iceberg
     }
 
     pub fn full_name(&self) -> String {

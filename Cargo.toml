@@ -44,3 +44,4 @@ tracing-subscriber = "0.3"
 sqlparser = "0.53"
 regex = "1.11"
 arrow = { version = "53" }
+parquet = { version = "53", default-features = false, features = ["arrow"] }

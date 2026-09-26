@@ -226,6 +226,114 @@ impl SQLEngine {
         Ok(Some((table_def, rows, Some(table_alias_name))))
     }
 
+    pub(crate) fn resolve_iceberg_table_function(
+        &self,
+        name: &sqlparser::ast::ObjectName,
+        alias: &Option<sqlparser::ast::TableAlias>,
+        args: &Option<sqlparser::ast::TableFunctionArgs>,
+    ) -> H2Result<Option<(TableDef, Vec<Row>, Option<String>)>> {
+        let func_name = name.to_string();
+        let is_snapshots = func_name.eq_ignore_ascii_case("iceberg_snapshots");
+        let is_files = func_name.eq_ignore_ascii_case("iceberg_files");
+        let is_scan = func_name.eq_ignore_ascii_case("iceberg_scan");
+
+        if !is_snapshots && !is_files && !is_scan {
+            return Ok(None);
+        }
+
+        let func_args = match args {
+            Some(fa) => &fa.args,
+            None => {
+                return Err(H2Error::Execution(format!(
+                    "{}() requires a table name argument",
+                    func_name
+                )))
+            }
+        };
+
+        if func_args.is_empty() {
+            return Err(H2Error::Execution(format!(
+                "{}() requires a table name argument",
+                func_name
+            )));
+        }
+
+        let target_table_name = match &func_args[0] {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
+                match expr {
+                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s))
+                    | sqlparser::ast::Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => s.clone(),
+                    sqlparser::ast::Expr::Identifier(ident) => ident.value.clone(),
+                    _ => return Err(H2Error::Execution("Expected table name string argument".to_string())),
+                }
+            }
+            _ => return Err(H2Error::Execution("Expected unnamed table name argument".to_string())),
+        };
+
+        let target_def = self.catalog.get_table(&target_table_name).ok_or_else(|| {
+            H2Error::Catalog(format!("Table '{}' not found", target_table_name))
+        })?;
+
+        if !target_def.is_iceberg {
+            return Err(H2Error::Execution(format!("Table '{}' is not an Iceberg table", target_table_name)));
+        }
+
+        let location = target_def.iceberg_location.as_deref().unwrap_or("");
+        let table_alias_name = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| func_name.clone());
+
+        if is_snapshots {
+            let t_def = TableDef::new(
+                table_alias_name.clone(),
+                vec![
+                    ColumnDef::new("snapshot_id", h2_types::DataType::BigInt, false, true),
+                    ColumnDef::new("parent_snapshot_id", h2_types::DataType::BigInt, true, false),
+                    ColumnDef::new("timestamp_ms", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("operation", h2_types::DataType::VarChar(None), false, false),
+                    ColumnDef::new("added_records", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("total_records", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("manifest_list", h2_types::DataType::VarChar(None), false, false),
+                ],
+            );
+            let rows = crate::iceberg::get_iceberg_snapshots(location)?;
+            Ok(Some((t_def, rows, Some(table_alias_name))))
+        } else if is_files {
+            let t_def = TableDef::new(
+                table_alias_name.clone(),
+                vec![
+                    ColumnDef::new("snapshot_id", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("file_path", h2_types::DataType::VarChar(None), false, true),
+                    ColumnDef::new("file_format", h2_types::DataType::VarChar(None), false, false),
+                    ColumnDef::new("record_count", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("file_size_in_bytes", h2_types::DataType::BigInt, false, false),
+                    ColumnDef::new("lower_bounds", h2_types::DataType::VarChar(None), true, false),
+                    ColumnDef::new("upper_bounds", h2_types::DataType::VarChar(None), true, false),
+                ],
+            );
+            let rows = crate::iceberg::get_iceberg_files(location)?;
+            Ok(Some((t_def, rows, Some(table_alias_name))))
+        } else {
+            // is_scan
+            let mut snapshot_id = None;
+            if func_args.len() >= 2 {
+                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) = &func_args[1] {
+                    match expr {
+                        sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                            snapshot_id = n.parse::<i64>().ok();
+                        }
+                        sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                            snapshot_id = s.parse::<i64>().ok();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let rows = crate::iceberg::read_iceberg_table_rows(&target_def, None, snapshot_id)?;
+            let mut t_def = target_def;
+            t_def.name = table_alias_name.clone();
+            Ok(Some((t_def, rows, Some(table_alias_name))))
+        }
+    }
+
     pub(crate) fn resolve_pg_proc_table(
         &self,
         table_name: &str,
@@ -296,6 +404,9 @@ impl SQLEngine {
             }
             TableFactor::Table { name, alias, args, .. } => {
                 if let Some(res) = self.resolve_cypher_table_function(tx, name, alias, args)? {
+                    return Ok(res);
+                }
+                if let Some(res) = self.resolve_iceberg_table_function(name, alias, args)? {
                     return Ok(res);
                 }
                 let table_name = normalize_object_name(name);
@@ -390,6 +501,10 @@ impl SQLEngine {
                         let table_def = self.catalog.get_table(&table_name).ok_or_else(|| {
                             H2Error::Catalog(format!("Table '{}' not found", table_name))
                         })?;
+                        if table_def.is_iceberg {
+                            let rows = crate::iceberg::read_iceberg_table_rows(&table_def, None, None)?;
+                            return Ok((table_def, rows, table_alias));
+                        }
                         let map_name = table_def.map_name();
                         let entries = tx.scan_visible(&map_name)?;
                         let mut rows = Vec::with_capacity(entries.len());

@@ -553,6 +553,17 @@ impl SQLEngine {
             return self.execute_create_queue_table(tx, trimmed);
         }
 
+        if trimmed_upper.starts_with("CREATE EXTERNAL TABLE")
+            || trimmed_upper.starts_with("CREATE ICEBERG TABLE")
+            || (trimmed_upper.starts_with("CREATE TABLE")
+                && (trimmed_upper.contains("STORED AS ICEBERG")
+                    || trimmed_upper.contains("STORED AS PARQUET")
+                    || trimmed_upper.contains("TYPE = 'ICEBERG'")
+                    || trimmed_upper.contains("TYPE='ICEBERG'")))
+        {
+            return self.execute_create_iceberg_table(tx, trimmed);
+        }
+
         if trimmed_upper.starts_with("CREATE CACHE TABLE")
             || trimmed_upper.starts_with("CREATE MEMORY TABLE")
             || (trimmed_upper.starts_with("CREATE TABLE")

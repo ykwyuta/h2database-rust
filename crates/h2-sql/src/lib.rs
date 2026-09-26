@@ -11,6 +11,7 @@ pub mod query_stats;
 pub mod row;
 pub mod stats;
 pub mod vectorized;
+pub mod iceberg;
 
 pub use auth::{AuthManager, Privilege, UserInfo};
 pub use autovacuum::{AutoVacuumConfig, AutoVacuumCoordinator, TableActivity};

@@ -344,3 +344,81 @@ pub(crate) fn extract_tables_from_table_factor(tf: &sqlparser::ast::TableFactor,
         _ => {}
     }
 }
+
+pub(crate) fn parse_iceberg_ddl(sql: &str) -> H2Result<(String, String)> {
+    let mut location = None;
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+
+    // 1. Check WITH ( ... )
+    if let Some(with_idx) = upper.rfind("WITH") {
+        let with_body = trimmed[with_idx + 4..].trim();
+        if with_body.starts_with('(') && with_body.ends_with(')') {
+            let inner = &with_body[1..with_body.len() - 1];
+            for part in inner.split(',') {
+                let p = part.trim();
+                if let Some(eq_idx) = p.find('=') {
+                    let k = p[..eq_idx].trim().to_uppercase();
+                    let v = p[eq_idx + 1..].trim().trim_matches('\'').trim_matches('"').trim();
+                    if k == "LOCATION" {
+                        location = Some(v.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check LOCATION '...' keyword
+    if location.is_none() {
+        if let Some(loc_idx) = upper.rfind("LOCATION") {
+            let after_loc = trimmed[loc_idx + 8..].trim();
+            let after_loc = after_loc.strip_prefix('=').unwrap_or(after_loc).trim();
+            if after_loc.starts_with('\'') || after_loc.starts_with('"') {
+                let quote = after_loc.chars().next().unwrap();
+                if let Some(end_q) = after_loc[1..].find(quote) {
+                    location = Some(after_loc[1..=end_q].to_string());
+                }
+            } else {
+                let token = after_loc.split_whitespace().next().unwrap_or(after_loc);
+                location = Some(token.trim_end_matches(';').to_string());
+            }
+        }
+    }
+
+    let loc = location.ok_or_else(|| {
+        H2Error::Execution("Iceberg table requires a LOCATION clause (e.g. LOCATION '/path/to/table')".to_string())
+    })?;
+
+    // Clean SQL to standard CREATE TABLE
+    let mut clean = trimmed.to_string();
+    let clean_upper = clean.to_uppercase();
+    if clean_upper.starts_with("CREATE EXTERNAL TABLE") {
+        clean = format!("CREATE TABLE{}", &clean["CREATE EXTERNAL TABLE".len()..]);
+    } else if clean_upper.starts_with("CREATE ICEBERG TABLE") {
+        clean = format!("CREATE TABLE{}", &clean["CREATE ICEBERG TABLE".len()..]);
+    }
+
+    // Remove STORED AS ICEBERG / PARQUET
+    if let Some(pos) = clean.to_uppercase().find("STORED AS ICEBERG") {
+        clean = format!("{}{}", &clean[..pos], &clean[pos + "STORED AS ICEBERG".len()..]);
+    }
+    if let Some(pos) = clean.to_uppercase().find("STORED AS PARQUET") {
+        clean = format!("{}{}", &clean[..pos], &clean[pos + "STORED AS PARQUET".len()..]);
+    }
+
+    // Remove WITH (...) if it was at the end (before stripping standalone LOCATION)
+    if let Some(pos) = clean.to_uppercase().rfind("WITH") {
+        let after = clean[pos + 4..].trim().trim_end_matches(';').trim();
+        if after.starts_with('(') && after.ends_with(')') {
+            clean = clean[..pos].trim().to_string();
+        }
+    }
+
+    // Remove standalone LOCATION '...' if present
+    if let Some(pos) = clean.to_uppercase().rfind("LOCATION") {
+        clean = clean[..pos].trim().to_string();
+    }
+
+    clean = format!("{};", clean.trim().trim_end_matches(';').trim());
+    Ok((clean, loc))
+}

@@ -670,6 +670,55 @@ impl SQLEngine {
         }
     }
 
+    pub(crate) fn execute_create_iceberg_table(&self, _tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let (clean_sql, location) = parse_iceberg_ddl(sql)?;
+        let parsed = parse_sql(&clean_sql)?;
+        match parsed.into_iter().next() {
+            Some(Statement::CreateTable(create_table)) => {
+                let table_def = extract_create_table(
+                    &create_table.name,
+                    &create_table.columns,
+                    &create_table.constraints,
+                )?;
+                let tbl_name = table_def.name.clone();
+                let mut final_table_def = table_def;
+                if final_table_def.columns.is_empty() {
+                    if let Ok((_ver, meta)) = crate::iceberg::get_latest_metadata(&location) {
+                        if let Some(schema) = meta.schemas.iter().find(|s| s.schema_id == meta.current_schema_id) {
+                            for f in &schema.fields {
+                                final_table_def.columns.push(crate::catalog::ColumnDef::new(
+                                    f.name.clone(),
+                                    crate::iceberg::metadata::iceberg_type_to_h2_type(&f.type_name),
+                                    !f.required,
+                                    false,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                crate::iceberg::init_iceberg_table(&location, &final_table_def)?;
+
+                let iceberg_def = TableDef::new_iceberg(
+                    tbl_name,
+                    final_table_def.columns,
+                    location,
+                );
+
+                if let Err(e) = self.catalog.create_table(iceberg_def) {
+                    if create_table.if_not_exists && e.to_string().contains("already exists") {
+                        return Ok(ExecutionResult::Ddl);
+                    }
+                    return Err(e);
+                }
+
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            _ => Err(H2Error::Execution("Expected CREATE TABLE statement for Iceberg".to_string())),
+        }
+    }
+
     pub(crate) fn execute_touch(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
         let trimmed = sql.trim().trim_end_matches(';').trim();
         let upper = trimmed.to_uppercase();

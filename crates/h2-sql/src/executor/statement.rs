@@ -373,6 +373,36 @@ impl SQLEngine {
                     Vec::new()
                 };
 
+                if table_def.is_iceberg {
+                    let mut iceberg_rows = Vec::with_capacity(rows_to_insert.len());
+                    for raw_values in rows_to_insert {
+                        if raw_values.len() != target_indices.len() {
+                            return Err(H2Error::Execution(format!(
+                                "Column count mismatch: expected {}, got {}",
+                                target_indices.len(),
+                                raw_values.len()
+                            )));
+                        }
+                        let mut full_row_values = vec![Value::Null; table_def.columns.len()];
+                        for (i, val) in raw_values.into_iter().enumerate() {
+                            let col_idx = target_indices[i];
+                            if !val.is_null() {
+                                let casted = val.cast_to(&table_def.columns[col_idx].data_type)?;
+                                full_row_values[col_idx] = casted;
+                            }
+                        }
+                        iceberg_rows.push(Row::new(full_row_values));
+                    }
+                    let count = crate::iceberg::write_iceberg_table_rows(&table_def, &iceberg_rows)?;
+                    if let Some(ref returning) = insert.returning {
+                        if !returning.is_empty() {
+                            let (cols, res_rows) = project_returning(&table_def, &iceberg_rows, returning)?;
+                            return Ok(ExecutionResult::Query { columns: cols, rows: res_rows });
+                        }
+                    }
+                    return Ok(ExecutionResult::Dml { affected_rows: count });
+                }
+
                 let mut affected_rows = 0;
                 let mut returning_rows = Vec::new();
                 for raw_values in rows_to_insert {
