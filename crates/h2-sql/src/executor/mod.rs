@@ -553,6 +553,32 @@ impl SQLEngine {
             return self.execute_create_queue_table(tx, trimmed);
         }
 
+        if trimmed_upper.starts_with("CREATE CACHE TABLE")
+            || trimmed_upper.starts_with("CREATE MEMORY TABLE")
+            || (trimmed_upper.starts_with("CREATE TABLE")
+                && (trimmed_upper.contains("TYPE = 'CACHE'")
+                    || trimmed_upper.contains("TYPE='CACHE'")
+                    || trimmed_upper.contains("TYPE = 'MEMORY'")
+                    || trimmed_upper.contains("TYPE='MEMORY'")))
+        {
+            return self.execute_create_cache_table(tx, trimmed);
+        }
+
+        if trimmed_upper.starts_with("TOUCH ") || trimmed_upper.starts_with("TOUCH TABLE ") {
+            return self.execute_touch(tx, trimmed);
+        }
+
+        if trimmed_upper.starts_with("FLUSH WRITE_BACK")
+            || trimmed_upper.starts_with("FLUSH CACHE")
+            || trimmed_upper.starts_with("FLUSH WRITE_BEHIND")
+        {
+            return self.execute_flush_write_back(tx, trimmed);
+        }
+
+        if trimmed_upper.starts_with("PURGE EXPIRED") {
+            return self.execute_purge_expired(tx, trimmed);
+        }
+
         // ================= 統計情報 & メモリ管理コマンド =================
         if trimmed_upper == "ANALYZE" || trimmed_upper.starts_with("ANALYZE ") {
             return self.execute_analyze(tx, trimmed);

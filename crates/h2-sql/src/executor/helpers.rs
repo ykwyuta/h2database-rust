@@ -208,6 +208,61 @@ pub(crate) fn parse_queue_with_clause(sql: &str) -> H2Result<(String, Option<u64
     Ok((sql.to_string(), None, None))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CacheTableOptions {
+    pub ttl_ms: Option<u64>,
+    pub write_back_table: Option<String>,
+    pub write_back_interval_ms: Option<u64>,
+    pub write_back_mode: Option<String>,
+    pub is_unlogged: bool,
+}
+
+pub(crate) fn parse_cache_with_clause(sql: &str) -> H2Result<(String, CacheTableOptions)> {
+    let upper = sql.to_uppercase();
+    let mut opts = CacheTableOptions {
+        ttl_ms: None,
+        write_back_table: None,
+        write_back_interval_ms: Some(1000),
+        write_back_mode: Some("UPSERT".to_string()),
+        is_unlogged: true,
+    };
+
+    if let Some(pos) = upper.rfind("WITH") {
+        let before = sql[..pos].trim();
+        let after = sql[pos + 4..].trim();
+        if after.starts_with('(') && after.ends_with(')') {
+            let inner = after[1..after.len() - 1].trim();
+            for item in inner.split(',') {
+                let kv: Vec<&str> = item.splitn(2, '=').collect();
+                if kv.len() == 2 {
+                    let key = kv[0].trim().to_ascii_uppercase();
+                    let val = kv[1].trim().trim_matches('\'').trim_matches('"').trim();
+                    match key.as_str() {
+                        "TTL" | "RETENTION_TIME" => {
+                            opts.ttl_ms = Some(parse_duration_to_ms(val)?);
+                        }
+                        "WRITE_BACK_TABLE" | "WRITE_BEHIND_TABLE" => {
+                            opts.write_back_table = Some(val.to_string());
+                        }
+                        "WRITE_BACK_INTERVAL" | "WRITE_BEHIND_INTERVAL" | "FLUSH_INTERVAL" => {
+                            opts.write_back_interval_ms = Some(parse_duration_to_ms(val)?);
+                        }
+                        "WRITE_BACK_MODE" | "WRITE_BEHIND_MODE" => {
+                            opts.write_back_mode = Some(val.to_ascii_uppercase());
+                        }
+                        "UNLOGGED" => {
+                            opts.is_unlogged = val.eq_ignore_ascii_case("TRUE") || val == "1";
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return Ok((before.to_string(), opts));
+        }
+    }
+    Ok((sql.to_string(), opts))
+}
+
 pub(crate) fn validate_queue_where_clause(expr: &sqlparser::ast::Expr) -> H2Result<()> {
     match expr {
         sqlparser::ast::Expr::Identifier(ident) => {

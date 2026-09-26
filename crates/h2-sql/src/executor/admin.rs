@@ -1,9 +1,11 @@
-use sqlparser::ast::Statement;
+use sqlparser::ast::{SetExpr, Statement};
 use h2_mvstore::Transaction;
 use h2_types::{H2Error, H2Result, Value};
 use crate::catalog::{IndexDef, TableDef};
+use crate::expression::{evaluate_expr_context, RowContext};
 use crate::parser::{extract_create_table, parse_sql};
 use crate::row::Row;
+use super::encoding::*;
 use super::*;
 
 impl SQLEngine {
@@ -609,4 +611,404 @@ impl SQLEngine {
         Ok(purged_count)
     }
 
+    pub(crate) fn execute_create_cache_table(&self, _tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        if self.is_read_only() {
+            return Err(H2Error::ReadOnly(
+                "Cannot execute data-modifying or DDL statements on a read-only instance".to_string(),
+            ));
+        }
+
+        let (cleaned_sql, cache_opts) = parse_cache_with_clause(sql)?;
+
+        let regex_cct = regex::Regex::new(r"(?i)^CREATE\s+(CACHE|MEMORY)\s+TABLE").unwrap();
+        let create_table_sql = regex_cct.replace(&cleaned_sql, "CREATE TABLE").to_string();
+
+        let statements = parse_sql(&create_table_sql)?;
+        let stmt = statements.into_iter().next().ok_or_else(|| {
+            H2Error::Execution("Failed to parse CREATE CACHE TABLE".to_string())
+        })?;
+
+        match stmt {
+            Statement::CreateTable(create_table) => {
+                let table_def = extract_create_table(
+                    &create_table.name,
+                    &create_table.columns,
+                    &create_table.constraints,
+                )?;
+                let tbl_name = table_def.name.clone();
+                let cache_def = TableDef::new_cache(
+                    tbl_name.clone(),
+                    table_def.columns,
+                    cache_opts.ttl_ms,
+                    cache_opts.write_back_table,
+                    cache_opts.write_back_interval_ms,
+                    cache_opts.write_back_mode,
+                    cache_opts.is_unlogged,
+                );
+
+                if let Err(e) = self.catalog.create_table(cache_def) {
+                    if create_table.if_not_exists && e.to_string().contains("already exists") {
+                        return Ok(ExecutionResult::Ddl);
+                    }
+                    return Err(e);
+                }
+
+                if !table_def.primary_key.is_empty() {
+                    let pk_index_name = format!("pk_{}", tbl_name.to_lowercase());
+                    let _ = self.catalog.create_index(IndexDef {
+                        name: pk_index_name,
+                        table_name: tbl_name.clone(),
+                        columns: table_def.primary_key.clone(),
+                        is_unique: true,
+                    });
+                }
+
+                self.store.commit()?;
+                Ok(ExecutionResult::Ddl)
+            }
+            _ => Err(H2Error::Execution("Expected CREATE TABLE statement".to_string())),
+        }
+    }
+
+    pub(crate) fn execute_touch(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_uppercase();
+        let after_touch = if upper.starts_with("TOUCH TABLE ") {
+            trimmed[12..].trim()
+        } else if upper.starts_with("TOUCH ") {
+            trimmed[6..].trim()
+        } else {
+            return Err(H2Error::Execution("Invalid TOUCH syntax".to_string()));
+        };
+
+        let upper_after = after_touch.to_uppercase();
+        let where_pos = upper_after.find("WHERE").ok_or_else(|| {
+            H2Error::Execution("TOUCH requires a WHERE clause".to_string())
+        })?;
+
+        let tbl_name = after_touch[..where_pos].trim().trim_matches('"').trim_matches('\'');
+        let mut where_and_extend = after_touch[where_pos + 5..].trim();
+
+        let upper_we = where_and_extend.to_uppercase();
+        let mut extend_ms = None;
+        if let Some(ext_pos) = upper_we.rfind("EXTEND") {
+            let dur_str = where_and_extend[ext_pos + 6..].trim();
+            extend_ms = Some(parse_duration_to_ms(dur_str)?);
+            where_and_extend = where_and_extend[..ext_pos].trim();
+        }
+
+        let table_def = self.catalog.get_table(tbl_name).ok_or_else(|| {
+            H2Error::Catalog(format!("Table '{}' not found", tbl_name))
+        })?;
+
+        if !table_def.is_cache {
+            return Err(H2Error::Execution(format!("Table '{}' is not a cache table", tbl_name)));
+        }
+
+        let extend_duration = extend_ms.or(table_def.cache_ttl_ms).unwrap_or(3600_000);
+
+        let dummy_query = format!("SELECT * FROM dummy WHERE {}", where_and_extend);
+        let parsed = parse_sql(&dummy_query)?;
+        let where_expr = match parsed.into_iter().next() {
+            Some(Statement::Query(q)) => match *q.body {
+                SetExpr::Select(s) => s.selection.ok_or_else(|| H2Error::Execution("Empty WHERE clause".to_string()))?,
+                _ => return Err(H2Error::Execution("Invalid WHERE condition".to_string())),
+            },
+            _ => return Err(H2Error::Execution("Invalid WHERE condition".to_string())),
+        };
+
+        let ctx = RowContext::from_table_def(&table_def, None);
+        let map_name = table_def.map_name();
+        let entries = tx.scan_visible(&map_name)?;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut affected = 0;
+
+        for (k, val_bytes) in entries {
+            let mut row = Row::from_bytes(&val_bytes)?;
+            table_def.align_row(&mut row);
+
+            let old_exp = match row.values.get(0) {
+                Some(Value::BigInt(e)) => *e,
+                _ => continue,
+            };
+            if old_exp <= now_ms {
+                continue;
+            }
+
+            let is_match = match evaluate_expr_context(&where_expr, &ctx, &row)? {
+                Value::Boolean(b) => b,
+                _ => false,
+            };
+
+            if is_match {
+                let base = if old_exp > now_ms { old_exp } else { now_ms };
+                row.values[0] = Value::BigInt(base + extend_duration as i64);
+                row.values[2] = Value::Boolean(true);
+                tx.put(&map_name, k, row.to_bytes()?)?;
+                affected += 1;
+            }
+        }
+
+        Ok(ExecutionResult::Dml { affected_rows: affected })
+    }
+
+    pub(crate) fn execute_flush_write_back(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let parts: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(H2Error::Execution("Expected FLUSH WRITE_BACK <table_name>".to_string()));
+        }
+        let tbl_name = parts.last().unwrap().trim_matches('"').trim_matches('\'');
+        let count = self.flush_cache_write_back(tx, tbl_name)?;
+        Ok(ExecutionResult::Dml { affected_rows: count as u64 })
+    }
+
+    pub(crate) fn execute_purge_expired(&self, tx: &Transaction, sql: &str) -> H2Result<ExecutionResult> {
+        let parts: Vec<&str> = sql.trim().trim_end_matches(';').split_whitespace().collect();
+        if parts.len() < 2 {
+            return Err(H2Error::Execution("Expected PURGE EXPIRED FROM <table_name>".to_string()));
+        }
+        let tbl_name = parts.last().unwrap().trim_matches('"').trim_matches('\'');
+        let count = self.purge_cache_expired(tx, tbl_name)?;
+        Ok(ExecutionResult::Dml { affected_rows: count as u64 })
+    }
+
+    pub fn flush_cache_write_back(&self, tx: &Transaction, table_name: &str) -> H2Result<usize> {
+        let table_def = self.catalog.get_table(table_name).ok_or_else(|| {
+            H2Error::Catalog(format!("Table '{}' not found", table_name))
+        })?;
+
+        if !table_def.is_cache {
+            return Err(H2Error::Execution(format!("Table '{}' is not a cache table", table_name)));
+        }
+
+        let target_tbl_name = match &table_def.write_back_table {
+            Some(t) => t.clone(),
+            None => return Ok(0),
+        };
+
+        let target_table_def = self.catalog.get_table(&target_tbl_name).ok_or_else(|| {
+            H2Error::Catalog(format!("Write-back target table '{}' not found", target_tbl_name))
+        })?;
+
+        let mode = table_def.write_back_mode.as_deref().unwrap_or("UPSERT");
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let map_name = table_def.map_name();
+        let entries = tx.scan_visible(&map_name)?;
+        let mut count = 0;
+
+        let mut col_map = Vec::new();
+        for (cache_idx, col) in table_def.columns.iter().enumerate().skip(3) {
+            if let Some(target_idx) = target_table_def.column_index(&col.name) {
+                col_map.push((cache_idx, target_idx));
+            }
+        }
+
+        let pk_cols = &target_table_def.primary_key;
+
+        for (k, val_bytes) in entries {
+            let mut row = Row::from_bytes(&val_bytes)?;
+            table_def.align_row(&mut row);
+
+            let expires_at = match row.values.get(0) {
+                Some(Value::BigInt(e)) => *e,
+                _ => i64::MAX,
+            };
+            let is_expired = expires_at <= now_ms;
+            let is_dirty = match row.values.get(2) {
+                Some(Value::Boolean(b)) => *b,
+                _ => false,
+            };
+
+            if is_expired {
+                if mode.eq_ignore_ascii_case("DELETE") || mode.eq_ignore_ascii_case("BOTH") {
+                    self.delete_matching_target_row(tx, &target_table_def, &table_def, &row)?;
+                }
+                tx.remove(&map_name, &k)?;
+                count += 1;
+            } else if is_dirty {
+                self.upsert_into_target_table(tx, &target_table_def, &table_def, &row, &col_map, pk_cols)?;
+                row.values[2] = Value::Boolean(false);
+                tx.put(&map_name, k, row.to_bytes()?)?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
+    }
+
+    pub fn purge_cache_expired(&self, tx: &Transaction, table_name: &str) -> H2Result<usize> {
+        let table_def = self.catalog.get_table(table_name).ok_or_else(|| {
+            H2Error::Catalog(format!("Table '{}' not found", table_name))
+        })?;
+
+        if !table_def.is_cache {
+            return Err(H2Error::Execution(format!("Table '{}' is not a cache table", table_name)));
+        }
+
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let map_name = table_def.map_name();
+        let entries = tx.scan_visible(&map_name)?;
+        let mut purged = 0;
+
+        let target_tbl = table_def.write_back_table.as_ref().and_then(|t| self.catalog.get_table(t));
+        let mode = table_def.write_back_mode.as_deref().unwrap_or("UPSERT");
+        let should_delete_backing = mode.eq_ignore_ascii_case("DELETE") || mode.eq_ignore_ascii_case("BOTH");
+
+        for (k, val_bytes) in entries {
+            let mut row = Row::from_bytes(&val_bytes)?;
+            table_def.align_row(&mut row);
+
+            let expires_at = match row.values.get(0) {
+                Some(Value::BigInt(e)) => *e,
+                _ => continue,
+            };
+            if expires_at <= now_ms {
+                if should_delete_backing {
+                    if let Some(ref target_def) = target_tbl {
+                        let _ = self.delete_matching_target_row(tx, target_def, &table_def, &row);
+                    }
+                }
+                tx.remove(&map_name, &k)?;
+                purged += 1;
+            }
+        }
+
+        Ok(purged)
+    }
+
+    fn delete_matching_target_row(
+        &self,
+        tx: &Transaction,
+        target_def: &TableDef,
+        cache_def: &TableDef,
+        cache_row: &Row,
+    ) -> H2Result<bool> {
+        let pk_cols = &target_def.primary_key;
+        if pk_cols.is_empty() {
+            return Ok(false);
+        }
+        let target_map_name = target_def.map_name();
+        let target_entries = tx.scan_visible(&target_map_name)?;
+        let mut target_rid = None;
+        let mut matched_target_row = None;
+
+        for (tk, t_bytes) in target_entries {
+            let mut t_row = Row::from_bytes(&t_bytes)?;
+            target_def.align_row(&mut t_row);
+            let matches_pk = pk_cols.iter().all(|pk| {
+                if let (Some(ci), Some(ti)) = (cache_def.column_index(pk), target_def.column_index(pk)) {
+                    cache_row.get(ci) == t_row.get(ti)
+                } else {
+                    false
+                }
+            });
+            if matches_pk {
+                if tk.len() == 8 {
+                    let rid = u64::from_le_bytes(tk.as_slice().try_into().unwrap());
+                    target_rid = Some(rid);
+                    matched_target_row = Some(t_row);
+                    break;
+                }
+            }
+        }
+
+        if let (Some(rid), Some(t_row)) = (target_rid, matched_target_row) {
+            let indexes = self.catalog.get_table_indexes(&target_def.name);
+            for idx in &indexes {
+                if let Some(vals) = get_index_values(target_def, idx, &t_row) {
+                    let idx_map = format!("idx_{}_{}", target_def.name.to_lowercase(), idx.name.to_lowercase());
+                    let idx_k = encode_composite_index_key(&vals, rid);
+                    let _ = tx.remove(&idx_map, &idx_k);
+                }
+            }
+            tx.remove(&target_map_name, &rid.to_le_bytes())?;
+            let _ = self.catalog.update_approx_row_count(&target_def.name, -1);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn upsert_into_target_table(
+        &self,
+        tx: &Transaction,
+        target_def: &TableDef,
+        cache_def: &TableDef,
+        cache_row: &Row,
+        col_map: &[(usize, usize)],
+        pk_cols: &[String],
+    ) -> H2Result<()> {
+        let target_map_name = target_def.map_name();
+        let target_entries = tx.scan_visible(&target_map_name)?;
+        let mut target_rid = None;
+        let mut existing_target_row = None;
+
+        if !pk_cols.is_empty() {
+            for (tk, t_bytes) in target_entries {
+                let mut t_row = Row::from_bytes(&t_bytes)?;
+                target_def.align_row(&mut t_row);
+                let matches_pk = pk_cols.iter().all(|pk| {
+                    if let (Some(ci), Some(ti)) = (cache_def.column_index(pk), target_def.column_index(pk)) {
+                        cache_row.get(ci) == t_row.get(ti)
+                    } else {
+                        false
+                    }
+                });
+                if matches_pk {
+                    if tk.len() == 8 {
+                        let rid = u64::from_le_bytes(tk.as_slice().try_into().unwrap());
+                        target_rid = Some(rid);
+                        existing_target_row = Some(t_row);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let indexes = self.catalog.get_table_indexes(&target_def.name);
+
+        if let (Some(rid), Some(mut old_target_row)) = (target_rid, existing_target_row) {
+            let old_row_copy = old_target_row.clone();
+            for &(ci, ti) in col_map {
+                if let Some(val) = cache_row.get(ci) {
+                    old_target_row.values[ti] = val.clone();
+                }
+            }
+
+            for idx in &indexes {
+                if let (Some(old_vals), Some(new_vals)) = (
+                    get_index_values(target_def, idx, &old_row_copy),
+                    get_index_values(target_def, idx, &old_target_row),
+                ) {
+                    if old_vals != new_vals {
+                        let idx_map = format!("idx_{}_{}", target_def.name.to_lowercase(), idx.name.to_lowercase());
+                        let old_k = encode_composite_index_key(&old_vals, rid);
+                        let _ = tx.remove(&idx_map, &old_k);
+                        let new_k = encode_composite_index_key(&new_vals, rid);
+                        tx.put(&idx_map, new_k, vec![])?;
+                    }
+                }
+            }
+            tx.put(&target_map_name, rid.to_le_bytes().to_vec(), old_target_row.to_bytes()?)?;
+        } else {
+            let new_rid = self.catalog.allocate_row_id(&target_def.name)?;
+            let mut new_vals = vec![Value::Null; target_def.columns.len()];
+            for &(ci, ti) in col_map {
+                if let Some(val) = cache_row.get(ci) {
+                    new_vals[ti] = val.clone();
+                }
+            }
+            let new_row = Row::new(new_vals);
+            for idx in &indexes {
+                if let Some(vals) = get_index_values(target_def, idx, &new_row) {
+                    let idx_map = format!("idx_{}_{}", target_def.name.to_lowercase(), idx.name.to_lowercase());
+                    let new_k = encode_composite_index_key(&vals, new_rid);
+                    tx.put(&idx_map, new_k, vec![])?;
+                }
+            }
+            tx.put(&target_map_name, new_rid.to_le_bytes().to_vec(), new_row.to_bytes()?)?;
+            let _ = self.catalog.update_approx_row_count(&target_def.name, 1);
+        }
+
+        Ok(())
+    }
 }

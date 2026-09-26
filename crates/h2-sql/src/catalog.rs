@@ -154,6 +154,18 @@ pub struct TableDef {
     pub stats: Option<TableStats>,
     #[serde(default)]
     pub approx_row_count: i64,
+    #[serde(default)]
+    pub is_cache: bool,
+    #[serde(default)]
+    pub cache_ttl_ms: Option<u64>,
+    #[serde(default)]
+    pub write_back_table: Option<String>,
+    #[serde(default)]
+    pub write_back_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub write_back_mode: Option<String>,
+    #[serde(default)]
+    pub is_unlogged: bool,
 }
 
 impl TableDef {
@@ -181,6 +193,12 @@ impl TableDef {
             max_bytes: None,
             stats: None,
             approx_row_count: 0,
+            is_cache: false,
+            cache_ttl_ms: None,
+            write_back_table: None,
+            write_back_interval_ms: None,
+            write_back_mode: None,
+            is_unlogged: false,
         }
     }
 
@@ -223,6 +241,66 @@ impl TableDef {
             max_bytes,
             stats: None,
             approx_row_count: 0,
+            is_cache: false,
+            cache_ttl_ms: None,
+            write_back_table: None,
+            write_back_interval_ms: None,
+            write_back_mode: None,
+            is_unlogged: false,
+        }
+    }
+
+    pub fn new_cache(
+        name: impl Into<String>,
+        user_columns: Vec<ColumnDef>,
+        ttl_ms: Option<u64>,
+        write_back_table: Option<String>,
+        write_back_interval_ms: Option<u64>,
+        write_back_mode: Option<String>,
+        is_unlogged: bool,
+    ) -> Self {
+        // システム擬似列: _expires_at, _created_at, _dirty
+        let mut columns = vec![
+            ColumnDef::new("_expires_at", DataType::BigInt, false, false),
+            ColumnDef::new("_created_at", DataType::BigInt, false, false),
+            ColumnDef::new("_dirty", DataType::Boolean, false, false),
+        ];
+
+        for (idx, col) in columns.iter_mut().enumerate() {
+            col.physical_index = Some(idx);
+        }
+
+        let base_idx = columns.len();
+        let mut pk_cols = Vec::new();
+        for (idx, mut col) in user_columns.into_iter().enumerate() {
+            if !col.name.starts_with('_') {
+                if col.is_primary_key {
+                    pk_cols.push(col.name.clone());
+                }
+                col.physical_index = Some(base_idx + idx);
+                columns.push(col);
+            }
+        }
+
+        Self {
+            name: name.into(),
+            schema: default_schema(),
+            columns,
+            next_row_id: 1,
+            foreign_keys: Vec::new(),
+            primary_key: pk_cols,
+            unique_constraints: Vec::new(),
+            is_queue: false,
+            retention_duration_ms: None,
+            max_bytes: None,
+            stats: None,
+            approx_row_count: 0,
+            is_cache: true,
+            cache_ttl_ms: ttl_ms,
+            write_back_table,
+            write_back_interval_ms,
+            write_back_mode,
+            is_unlogged,
         }
     }
 
@@ -656,6 +734,10 @@ impl Catalog {
 
     pub fn is_queue_table(&self, name: &str) -> bool {
         self.get_table(name).map(|t| t.is_queue).unwrap_or(false)
+    }
+
+    pub fn is_cache_table(&self, name: &str) -> bool {
+        self.get_table(name).map(|t| t.is_cache).unwrap_or(false)
     }
 
     pub fn all_tables(&self) -> Vec<TableDef> {

@@ -393,9 +393,17 @@ impl SQLEngine {
                         let map_name = table_def.map_name();
                         let entries = tx.scan_visible(&map_name)?;
                         let mut rows = Vec::with_capacity(entries.len());
+                        let now_ms = chrono::Utc::now().timestamp_millis();
                         for (_k, val_bytes) in entries {
                             let mut row = Row::from_bytes(&val_bytes)?;
                             table_def.align_row(&mut row);
+                            if table_def.is_cache {
+                                if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                    if *exp <= now_ms {
+                                        continue;
+                                    }
+                                }
+                            }
                             rows.push(row);
                         }
                         Ok((table_def, rows, table_alias))

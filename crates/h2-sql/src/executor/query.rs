@@ -1310,7 +1310,7 @@ impl SQLEngine {
                                         _ => true,
                                     }
                                     && select.having.is_none();
-                                let pushdown_ops = if is_simple_agg {
+                                let pushdown_ops = if is_simple_agg && !table_def.is_cache {
                                     Self::parse_aggregate_ops(&select.projection, &ctx)
                                 } else {
                                     None
@@ -1398,6 +1398,14 @@ impl SQLEngine {
                                                             if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
                                                                 let mut row = Row::from_bytes(&val_bytes)?;
                                                                 table_def.align_row(&mut row);
+                                                                if table_def.is_cache {
+                                                                    let now_ms = chrono::Utc::now().timestamp_millis();
+                                                                    if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                                                        if *exp <= now_ms {
+                                                                            continue;
+                                                                        }
+                                                                    }
+                                                                }
                                                                 fetched.push(row);
                                                             }
                                                         }
@@ -1540,6 +1548,14 @@ impl SQLEngine {
                                                                 if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
                                                                     let mut row = Row::from_bytes(&val_bytes)?;
                                                                     table_def.align_row(&mut row);
+                                                                    if table_def.is_cache {
+                                                                        let now_ms = chrono::Utc::now().timestamp_millis();
+                                                                        if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                                                            if *exp <= now_ms {
+                                                                                continue;
+                                                                            }
+                                                                        }
+                                                                    }
                                                                     fetched.push(row);
                                                                 }
                                                             }
@@ -1565,6 +1581,14 @@ impl SQLEngine {
                                                         if let Some(val_bytes) = tx.get(&map_name, &r_id.to_le_bytes())? {
                                                             let mut row = Row::from_bytes(&val_bytes)?;
                                                             table_def.align_row(&mut row);
+                                                            if table_def.is_cache {
+                                                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                                                if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                                                    if *exp <= now_ms {
+                                                                        continue;
+                                                                    }
+                                                                }
+                                                            }
                                                             fetched.push(row);
                                                         }
                                                     }
@@ -1581,9 +1605,17 @@ impl SQLEngine {
                                 } else {
                                     let entries = tx.scan_visible(&map_name)?;
                                     let mut current_rows = Vec::with_capacity(entries.len());
+                                    let now_ms = chrono::Utc::now().timestamp_millis();
                                     for (_k, val_bytes) in entries {
                                         let mut row = Row::from_bytes(&val_bytes)?;
                                         table_def.align_row(&mut row);
+                                        if table_def.is_cache {
+                                            if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                                if *exp <= now_ms {
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         current_rows.push(row);
                                     }
                                     current_rows

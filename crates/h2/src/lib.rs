@@ -21,6 +21,9 @@ pub use jms::*;
 pub mod storage;
 pub use storage::*;
 
+pub mod cache_table;
+pub use cache_table::*;
+
 #[cfg(feature = "async")]
 pub mod async_conn;
 #[cfg(feature = "async")]
@@ -634,6 +637,35 @@ impl Connection {
 
     pub fn store(&self) -> &Arc<MVStore> {
         &self.store
+    }
+
+    /// キャッシュテーブルのバックグラウンド定期 Write-Behind / 失効クリーンアップを開始
+    pub fn start_cache_write_behind(&self, interval: Duration) -> CacheWriteBehindCleaner {
+        CacheWriteBehindCleaner::start(self.clone(), interval)
+    }
+
+    /// 特定のキャッシュテーブルの未反映差分を永続化先テーブルへ即時フラッシュ
+    pub fn flush_cache(&self, table_name: &str) -> H2Result<usize> {
+        let tx = self.transaction()?;
+        if let Some(inner) = tx.inner_tx() {
+            let res = self.engine().flush_cache_write_back(inner, table_name)?;
+            tx.commit()?;
+            Ok(res)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// 特定のキャッシュテーブルの期限切れ行を即座に破棄
+    pub fn purge_cache_expired(&self, table_name: &str) -> H2Result<usize> {
+        let tx = self.transaction()?;
+        if let Some(inner) = tx.inner_tx() {
+            let res = self.engine().purge_cache_expired(inner, table_name)?;
+            tx.commit()?;
+            Ok(res)
+        } else {
+            Ok(0)
+        }
     }
 }
 

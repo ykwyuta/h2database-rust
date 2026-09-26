@@ -296,6 +296,25 @@ impl SQLEngine {
                         } else {
                             (0..table_def.columns.len()).collect()
                         }
+                    } else if table_def.is_cache {
+                        let first_len = if let Some(ref source) = insert.source {
+                            if matches!(*source.body, SetExpr::Values(ref v) if !v.rows.is_empty()) {
+                                if let SetExpr::Values(ref v) = *source.body {
+                                    v.rows[0].len()
+                                } else {
+                                    0
+                                }
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        };
+                        if first_len == table_def.columns.len().saturating_sub(3) {
+                            (3..table_def.columns.len()).collect()
+                        } else {
+                            (0..table_def.columns.len()).collect()
+                        }
                     } else {
                         (0..table_def.columns.len()).collect()
                     }
@@ -403,6 +422,18 @@ impl SQLEngine {
                             full_row_values[2] = Value::String(format!("ID:h2-mq-{}-{}", offset_val, &uid[..8]));
                         }
                         allocated_row_id = Some(r_id);
+                    }
+
+                    if table_def.is_cache {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if full_row_values[0].is_null() {
+                            let ttl = table_def.cache_ttl_ms.unwrap_or(3600_000);
+                            full_row_values[0] = Value::BigInt(now_ms + ttl as i64);
+                        }
+                        if full_row_values[1].is_null() {
+                            full_row_values[1] = Value::BigInt(now_ms);
+                        }
+                        full_row_values[2] = Value::Boolean(true);
                     }
 
                     let row = Row::new(full_row_values);
@@ -705,6 +736,15 @@ impl SQLEngine {
                     let mut row = Row::from_bytes(&val_bytes)?;
                     table_def.align_row(&mut row);
 
+                    if table_def.is_cache {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                            if *exp <= now_ms {
+                                continue;
+                            }
+                        }
+                    }
+
                     let matches = if let Some((ref u_ctx, ref u_rows)) = using_data {
                         let mut merged_ctx = target_ctx.clone();
                         for b in &u_ctx.columns {
@@ -853,12 +893,27 @@ impl SQLEngine {
                                         if let Some(val_bytes) = tx.get(&map_name, &key_bytes)? {
                                             let mut row = Row::from_bytes(&val_bytes)?;
                                             table_def.align_row(&mut row);
+
+                                            if table_def.is_cache {
+                                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                                if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                                                    if *exp <= now_ms {
+                                                        return Ok(ExecutionResult::Dml { affected_rows: 0 });
+                                                    }
+                                                }
+                                            }
+
                                             let target_ctx = RowContext::from_table_def(&table_def, target_alias.as_deref());
                                             for (_col_name, col_idx, val_expr) in &parsed_assignments {
                                                 let new_val = evaluate_expr_context(val_expr, &target_ctx, &row)?;
                                                 let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
                                                 row.values[*col_idx] = casted;
                                             }
+
+                                            if table_def.is_cache && row.values.len() > 2 {
+                                                row.values[2] = Value::Boolean(true);
+                                            }
+
                                             tx.put(&map_name, key_bytes, row.to_bytes()?)?;
                                             return Ok(ExecutionResult::Dml { affected_rows: 1 });
                                         }
@@ -954,6 +1009,15 @@ impl SQLEngine {
                     let mut row = Row::from_bytes(&val_bytes)?;
                     table_def.align_row(&mut row);
 
+                    if table_def.is_cache {
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        if let Some(Value::BigInt(exp)) = row.values.get(0) {
+                            if *exp <= now_ms {
+                                continue;
+                            }
+                        }
+                    }
+
                     let row_id = if key.len() == 8 {
                         u64::from_le_bytes(key.as_slice().try_into().unwrap())
                     } else {
@@ -1003,6 +1067,10 @@ impl SQLEngine {
                                 let new_val = evaluate_expr_context(val_expr, &merged_ctx, &combined_row)?;
                                 let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
                                 row.values[*col_idx] = casted;
+                            }
+
+                            if table_def.is_cache && row.values.len() > 2 {
+                                row.values[2] = Value::Boolean(true);
                             }
 
                             if has_referencing {
@@ -1075,6 +1143,10 @@ impl SQLEngine {
                                 let new_val = evaluate_expr_context(val_expr, &target_ctx, &row)?;
                                 let casted = new_val.cast_to(&table_def.columns[*col_idx].data_type)?;
                                 row.values[*col_idx] = casted;
+                            }
+
+                            if table_def.is_cache && row.values.len() > 2 {
+                                row.values[2] = Value::Boolean(true);
                             }
 
                             if has_referencing {
